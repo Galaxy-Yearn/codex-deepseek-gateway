@@ -44,6 +44,40 @@ That file controls which model IDs the gateway exposes on `GET /v1/models`. You 
 
 By default, the gateway serves the local alias list directly. If you also want to merge DeepSeek's upstream `/models` list, set `"fetchUpstreamModels": true` in `gateway.local.json`. Leaving it `false` keeps `/v1/models` lighter and more predictable.
 
+### Tavily Web Search
+
+Tavily search is off by default. To let Codex's native `web_search` tool work while the active model is DeepSeek, set these fields in `gateway.local.json`:
+
+```json
+"tavilyApiKey": "tvly-REPLACE_ME",
+"tavilyWebSearchEnabled": true
+```
+
+Codex does not need MCP, a different tool name, or any prompt changes. It can keep sending the normal Responses `web_search` or `web_search_preview` tool. The gateway converts that request to an internal `tavily_search` function for DeepSeek, calls Tavily, then maps the result back to Responses-style output.
+
+The compatibility is two-sided:
+
+- Codex sees `web_search_call` items and final assistant messages in the Responses format.
+- DeepSeek sees a normal Chat Completions function tool named `tavily_search`.
+- If Codex replays prior `web_search_call` items as conversation state, the gateway keeps them as Responses search records instead of sending broken, unpaired Chat tool calls upstream.
+
+Codex receives:
+
+- `web_search_call` output items
+- final assistant `message` items
+- streaming `response.output_text.annotation.added` events for URL citations when the final text contains a matching source marker
+- final `url_citation` annotations on matching cited source markers
+- `web_search_call.action.sources` only when the request includes `include: ["web_search_call.action.sources"]`
+
+DeepSeek receives a compact text summary it can read directly:
+
+- the search query
+- an optional Tavily answer summary
+- numbered sources
+- each source's title, URL, optional date, relevance score, and snippet
+
+The gateway does not pass Tavily's raw response object, raw page content, images, or extra Tavily-only fields to DeepSeek. Tavily is called with `include_raw_content: false`. The model is also told not to write Markdown links or raw URLs in the final answer; URL data is carried through Responses citation annotations when the client supports rendering them.
+
 If the key is already configured, `install` also starts the gateway. If this is your first install, run `start` after adding the key:
 
 ```sh
@@ -114,6 +148,7 @@ Important fields:
 - `reasoningDisplayMode` shows whether the gateway will emit `summary`, `disabled`, or `hidden`
 - `gatewayEmitsReasoningSummary` should be `true` when DeepSeek thinking is enabled
 - `codexSummaryConfigured` should be `true` so Codex TUI is configured to show summaries
+- `tavilyWebSearchReady` should be `true` if you want Codex `web_search` to route through Tavily
 
 For example, with:
 
@@ -166,6 +201,8 @@ If `start` returns without visible output on your terminal, run `status`; `"reac
 - image, file, and audio content parts when DeepSeek accepts the corresponding Chat Completions shape
 - function tools and tool-call history
 - conservative schema-based repair for streamed and non-streamed tool arguments where DeepSeek returns stringified JSON values for fields that Codex declared as arrays, objects, booleans, or numbers
+- Codex `web_search` emulation through Tavily when `tavilyWebSearchEnabled` is true and `tavilyApiKey` is configured, with Responses-style `web_search_call` output and compact source snippets for DeepSeek
+- Responses-style URL citation metadata for Tavily-backed answers when the final text contains matching source markers
 - DeepSeek thinking mode and `reasoning_content`
 - lightweight local `previous_response_id` / `conversation` history while the gateway process is running
 - `GET /v1/models` with local DeepSeek V4 aliases and optional upstream discovery
@@ -174,7 +211,9 @@ If `start` returns without visible output on your terminal, run `status`; `"reac
 
 Chat Completions is not a full Responses API replacement. Some Responses features have no equivalent upstream field.
 
-- Hosted tools such as web search, file search, computer use, image generation, and code interpreter are represented as function-tool shims unless Codex executes matching tools locally.
+- Hosted tools such as file search, computer use, image generation, and code interpreter are represented as function-tool shims unless Codex executes matching tools locally. Web search is the only hosted tool the gateway can emulate directly, and only when Tavily is configured.
+- Tavily search emulation is intentionally narrow. It uses Tavily Search results for text web lookup; it does not expose Tavily extract/crawl/map, raw page content, images, or other Tavily-specific capabilities through Codex `web_search`.
+- URL citations are returned in the Responses metadata path. Whether they appear as clickable links in the terminal depends on the Codex client build and how it renders custom-provider citation annotations.
 - OpenAI `file_id` values are passed through; the gateway cannot fetch private OpenAI-hosted files.
 - In-memory conversation history is lost when the gateway restarts.
 - The gateway exposes model aliases on `/v1/models`, including aliases from `config/model-aliases.json`. Whether Codex TUI `/model` actually shows custom provider models depends on the Codex build. `config.toml` remains the reliable fallback.

@@ -29,7 +29,7 @@ function flattenConfig(value, prefix = '') {
 
 export function readLocalConfigFile(path = resolve(PROJECT_ROOT, 'config', 'gateway.local.json')) {
   if (!path || !existsSync(path)) return {};
-  const parsed = safeJsonParse(readFileSync(path, 'utf8'));
+  const parsed = safeJsonParse(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''));
   if (!parsed.ok || !isObject(parsed.value)) {
     throw new Error(`${path} must contain a JSON object`);
   }

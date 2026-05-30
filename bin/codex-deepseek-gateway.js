@@ -343,7 +343,10 @@ async function doctor(options) {
     reasoningDisplayMode,
     gatewayEmitsReasoningSummary: reasoningDisplayMode === 'summary',
     codexSummaryConfigured,
+    tavilyWebSearchEnabled: Boolean(config.tavilyWebSearchEnabled),
+    tavilyWebSearchReady: Boolean(config.tavilyWebSearchEnabled && config.tavilyApiKey),
     reasoningSummaryHint: 'When DeepSeek thinking is enabled, the gateway maps every non-empty reasoning_content chunk into the Responses reasoning summary path. Keep model_supports_reasoning_summaries = true and model_reasoning_summary = "auto" so Codex TUI is configured to show summaries.',
+    tavilyWebSearchHint: 'Set tavilyApiKey in gateway.local.json to route Codex web_search tools through Tavily while using DeepSeek.',
     modelDiscoveryHint: 'The gateway exposes model aliases on /v1/models. Whether Codex TUI /model shows them depends on the Codex build.',
   }, null, 2));
   print('\n');

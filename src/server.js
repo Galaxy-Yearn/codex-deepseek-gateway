@@ -15,6 +15,17 @@ import {
 } from './protocol.js';
 import { SessionStore } from './session-store.js';
 import { callChatCompletions, callModels, readJsonResponse, relayChatCompletionsResponse } from './upstream.js';
+import {
+  applyWebSearchOutputCompatibility,
+  buildWebSearchCallItem,
+  containsWebSearchTool,
+  executeWebSearchCalls,
+  INTERNAL_WEB_SEARCH_TOOL,
+  maxWebSearchRounds,
+  prepareWebSearchRequest,
+  shouldIncludeSearchSources,
+  shouldContinueWebSearchLoop,
+} from './web-search-emulator.js';
 
 function sendJson(res, statusCode, payload, headers = {}) {
   res.writeHead(statusCode, {
@@ -53,6 +64,10 @@ function historyMessagesFromSession(session) {
   if (!session?.history?.length) return [];
   const messages = [];
   for (const turn of session.history) {
+    if (Array.isArray(turn.historyMessages)) {
+      messages.push(...turn.historyMessages);
+      continue;
+    }
     if (Array.isArray(turn.inputMessages)) {
       messages.push(...turn.inputMessages);
     } else if (Array.isArray(turn.chatRequest?.messages)) {
@@ -128,6 +143,253 @@ function resolveReasoningStreamMode(config, upstreamRequest) {
   return { emitReasoningSummary: false, emitReasoningText: false };
 }
 
+function hasTavilyWebSearch(config, normalized) {
+  return Boolean(config.tavilyWebSearchEnabled && config.tavilyApiKey && containsWebSearchTool(normalized));
+}
+
+function disableStreaming(request) {
+  return {
+    ...request,
+    stream: false,
+    stream_options: undefined,
+  };
+}
+
+function addUsage(left, right) {
+  if (!left) return right || null;
+  if (!right) return left;
+  return {
+    prompt_tokens: (left.prompt_tokens || 0) + (right.prompt_tokens || 0),
+    completion_tokens: (left.completion_tokens || 0) + (right.completion_tokens || 0),
+    total_tokens: (left.total_tokens || 0) + (right.total_tokens || 0),
+    reasoning_tokens: (left.reasoning_tokens || 0) + (right.reasoning_tokens || 0),
+    prompt_tokens_details: {
+      cached_tokens: (left.prompt_tokens_details?.cached_tokens || 0) + (right.prompt_tokens_details?.cached_tokens || 0),
+    },
+    completion_tokens_details: {
+      reasoning_tokens:
+        (left.completion_tokens_details?.reasoning_tokens || 0) +
+        (right.completion_tokens_details?.reasoning_tokens || 0),
+    },
+  };
+}
+
+function combineUsage(completions) {
+  return completions.reduce((usage, completion) => addUsage(usage, completion?.usage), null);
+}
+
+function cloneCompletionWithUsage(completion, usage) {
+  if (!usage) return completion;
+  return {
+    ...completion,
+    usage,
+  };
+}
+
+async function callUpstreamJson({ upstreamRequest, config }) {
+  const response = await callChatCompletions({
+    baseUrl: config.upstreamBaseUrl,
+    apiKey: config.upstreamApiKey,
+    request: upstreamRequest,
+    timeoutMs: config.upstreamTimeoutMs,
+  });
+  const data = await readJsonResponse(response);
+  return { response, data };
+}
+
+async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchStart, onSearchDone }) {
+  const effectiveChatRequest = { ...chatRequest, normalized };
+  const state = prepareWebSearchRequest({ normalized, chatRequest: effectiveChatRequest, config });
+  const searchConfig = state.config || config;
+  let currentChatRequest = state.enabled ? state.chatRequest : effectiveChatRequest;
+  const completions = [];
+  const searches = [];
+  let finalCompletion = null;
+  let finalResponse = null;
+
+  for (let round = 0; round <= maxWebSearchRounds(searchConfig); round += 1) {
+    const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
+    if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
+    const { response, data } = await callUpstreamJson({
+      upstreamRequest: disableStreaming(upstreamRequest),
+      config,
+    });
+    finalResponse = response;
+    if (!response.ok) return { ok: false, status: response.status, data };
+    completions.push(data);
+    finalCompletion = data;
+
+    if (!state.enabled || !shouldContinueWebSearchLoop(data) || round >= maxWebSearchRounds(searchConfig)) {
+      break;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), searchConfig.tavilyTimeoutMs || 15000);
+    let toolResult;
+    try {
+      toolResult = await executeWebSearchCalls({
+        completion: data,
+        config: searchConfig,
+        signal: controller.signal,
+        onSearchStart,
+        onSearchDone,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    searches.push(...toolResult.searches);
+    currentChatRequest = {
+      ...currentChatRequest,
+      messages: currentChatRequest.messages.concat(toolResult.messages),
+      tool_choice:
+        currentChatRequest.tool_choice?.function?.name === INTERNAL_WEB_SEARCH_TOOL
+          ? 'auto'
+          : currentChatRequest.tool_choice,
+    };
+  }
+
+  return {
+    ok: true,
+    response: finalResponse,
+    completion: cloneCompletionWithUsage(finalCompletion, combineUsage(completions)),
+    searches,
+    chatRequest: currentChatRequest,
+  };
+}
+
+function responseEventsFromPayload(payload, { responseId, model, previousResponseId, normalized }) {
+  const mapper = new ResponsesStreamMapper({
+    responseId,
+    model,
+    createdAt: payload.created_at || Math.floor(Date.now() / 1000),
+    previousResponseId,
+    normalized,
+    emitReasoningSummary: true,
+    emitReasoningText: false,
+  });
+  const events = [mapper.createdEvent(), mapper.inProgressEvent()];
+  events.push(...outputEventsFromPayload(payload, mapper));
+  events.push(completedEventFromPayload(payload, mapper));
+  return events;
+}
+
+function outputEventsFromPayload(payload, mapper, { skipTypes = new Set() } = {}) {
+  const events = [];
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  for (const [outputIndex, item] of output.entries()) {
+    if (skipTypes.has(item?.type)) continue;
+    mapper.output[outputIndex] = item;
+    events.push({
+      type: 'response.output_item.added',
+      sequence_number: mapper.nextSequence(),
+      output_index: outputIndex,
+      item,
+    });
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      for (const [contentIndex, part] of item.content.entries()) {
+        events.push({
+          type: 'response.content_part.added',
+          sequence_number: mapper.nextSequence(),
+          output_index: outputIndex,
+          content_index: contentIndex,
+          item_id: item.id,
+          part: part.type === 'output_text' ? { ...part, text: '', annotations: [] } : part,
+        });
+        if (part.type === 'output_text' && part.text) {
+          events.push({
+            type: 'response.output_text.delta',
+            sequence_number: mapper.nextSequence(),
+            output_index: outputIndex,
+            content_index: contentIndex,
+            item_id: item.id,
+            delta: part.text,
+            logprobs: [],
+          });
+          for (const [annotationIndex, annotation] of (Array.isArray(part.annotations) ? part.annotations : []).entries()) {
+            events.push({
+              type: 'response.output_text.annotation.added',
+              sequence_number: mapper.nextSequence(),
+              output_index: outputIndex,
+              content_index: contentIndex,
+              item_id: item.id,
+              annotation_index: annotationIndex,
+              annotation,
+            });
+          }
+          events.push({
+            type: 'response.output_text.done',
+            sequence_number: mapper.nextSequence(),
+            output_index: outputIndex,
+            content_index: contentIndex,
+            item_id: item.id,
+            text: part.text,
+            logprobs: [],
+          });
+        }
+        events.push({
+          type: 'response.content_part.done',
+          sequence_number: mapper.nextSequence(),
+          output_index: outputIndex,
+          content_index: contentIndex,
+          item_id: item.id,
+          part,
+        });
+      }
+    }
+    events.push({
+      type: 'response.output_item.done',
+      sequence_number: mapper.nextSequence(),
+      output_index: outputIndex,
+      item,
+    });
+  }
+  return events;
+}
+
+function completedEventFromPayload(payload, mapper) {
+  return {
+    type: payload.status === 'incomplete' ? 'response.incomplete' : 'response.completed',
+    sequence_number: mapper.nextSequence(),
+    response: payload,
+  };
+}
+
+function writeSseEvent(res, event) {
+  res.write(serializeResponsesSseEvent(event));
+}
+
+function writeSseDone(res) {
+  writeSseEvent(res, { done: true });
+}
+
+function webSearchSseWriter({ res, mapper, outputIndexBySearch, includeSources = false }) {
+  return {
+    start(search) {
+      const outputIndex = mapper.output.length;
+      outputIndexBySearch.set(search.id, outputIndex);
+      const item = buildWebSearchCallItem(search, { status: 'in_progress', includeSources });
+      mapper.output.push(item);
+      writeSseEvent(res, {
+        type: 'response.output_item.added',
+        sequence_number: mapper.nextSequence(),
+        output_index: outputIndex,
+        item,
+      });
+    },
+    done(search) {
+      const outputIndex = outputIndexBySearch.get(search.id);
+      const item = buildWebSearchCallItem(search, { includeSources });
+      if (Number.isInteger(outputIndex)) mapper.output[outputIndex] = item;
+      writeSseEvent(res, {
+        type: 'response.output_item.done',
+        sequence_number: mapper.nextSequence(),
+        output_index: Number.isInteger(outputIndex) ? outputIndex : mapper.output.indexOf(item),
+        item,
+      });
+    },
+  };
+}
+
 export function createProxyServer({ config = loadConfig(), sessions = new SessionStore() } = {}) {
   let modelCache = null;
 
@@ -177,9 +439,9 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
     normalized.messages = prependMissingAssistantToolMessages(normalized.messages, sessions);
 
     const chatRequest = toChatCompletionsRequest(normalized);
-    const upstreamRequest = toProviderChatCompletionsRequest(chatRequest, config);
+    const useWebSearchEmulator = hasTavilyWebSearch(config, normalized);
+    let upstreamRequest = toProviderChatCompletionsRequest(chatRequest, config);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || normalized.model;
-    logDebugPayload(config, upstreamRequest);
 
     if (!upstreamRequest.model) {
       sendJson(res, 400, { error: { message: 'Missing model' } });
@@ -192,6 +454,98 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
 
     const responseId = generateId('resp');
     const nextSession = { id: responseId, history: [] };
+
+    if (useWebSearchEmulator) {
+      const streamWebSearch = Boolean(request.stream);
+      let streamMapper = null;
+      let streamSearchWriter = null;
+      if (streamWebSearch) {
+        const createdAt = Math.floor(Date.now() / 1000);
+        streamMapper = new ResponsesStreamMapper({
+          responseId,
+          model: upstreamRequest.model,
+          createdAt,
+          previousResponseId,
+          normalized,
+          emitReasoningSummary: true,
+          emitReasoningText: false,
+        });
+        streamSearchWriter = webSearchSseWriter({
+          res,
+          mapper: streamMapper,
+          outputIndexBySearch: new Map(),
+          includeSources: shouldIncludeSearchSources(normalized),
+        });
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache, no-transform',
+          connection: 'keep-alive',
+          'x-accel-buffering': 'no',
+        });
+        writeSseEvent(res, streamMapper.createdEvent());
+        writeSseEvent(res, streamMapper.inProgressEvent());
+      }
+
+      const loop = await runWebSearchChatLoop({
+        normalized,
+        chatRequest,
+        config,
+        onSearchStart: streamWebSearch ? (search) => streamSearchWriter.start(search) : undefined,
+        onSearchDone: streamWebSearch ? (search) => streamSearchWriter.done(search) : undefined,
+      });
+      if (!loop.ok) {
+        if (streamWebSearch) {
+          writeSseEvent(res, {
+            type: 'response.failed',
+            sequence_number: streamMapper.nextSequence(),
+            response: streamMapper.response('failed'),
+          });
+          writeSseDone(res);
+          res.end();
+          return;
+        }
+        sendJson(res, loop.status || 500, loop.data);
+        return;
+      }
+      upstreamRequest = toProviderChatCompletionsRequest(loop.chatRequest, config);
+      if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || normalized.model;
+      const model = upstreamRequest.model;
+      const payload = applyWebSearchOutputCompatibility(convertChatCompletionToResponses({
+        completion: loop.completion,
+        model,
+        previousResponseId,
+        normalized,
+        responseId,
+      }), loop.searches, normalized);
+      const assistantMessage = assistantMessageFromResponseOutput(payload.output);
+
+      nextSession.history.push({
+        request: normalized,
+        chatRequest: loop.chatRequest,
+        upstreamRequest,
+        inputMessages: currentInputMessages,
+        historyMessages: loop.chatRequest.messages.concat(assistantMessage),
+        assistantMessage,
+        createdAt: Date.now(),
+      });
+      sessions.set(responseId, nextSession);
+      sessions.setConversation(conversationId, responseId);
+
+      if (!streamWebSearch) {
+        sendJson(res, 200, payload);
+        return;
+      }
+
+      for (const event of outputEventsFromPayload(payload, streamMapper, { skipTypes: new Set(['web_search_call']) })) {
+        writeSseEvent(res, event);
+      }
+      writeSseEvent(res, completedEventFromPayload(payload, streamMapper));
+      writeSseDone(res);
+      res.end();
+      return;
+    }
+
+    logDebugPayload(config, upstreamRequest);
 
     const upstreamResponse = await callChatCompletions({
       baseUrl: config.upstreamBaseUrl,
@@ -335,6 +689,20 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
 
       sendJson(res, 404, { error: { message: 'Not found' } });
     } catch (error) {
+      if (res.headersSent) {
+        if (!res.writableEnded) {
+          res.write(serializeResponsesSseEvent({
+            type: 'response.failed',
+            response: {
+              status: 'failed',
+              error: { message: error.message || 'Internal server error' },
+            },
+          }));
+          res.write(serializeResponsesSseEvent({ done: true }));
+          res.end();
+        }
+        return;
+      }
       sendJson(res, 500, { error: { message: error.message || 'Internal server error' } });
     }
   });

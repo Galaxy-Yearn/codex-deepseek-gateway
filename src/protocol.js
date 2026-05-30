@@ -25,6 +25,7 @@ const TOOL_OUTPUT_TYPES = new Set([
   'code_interpreter_call_output',
   'image_generation_call_output',
 ]);
+const CHAT_HISTORY_IGNORED_TOOL_ITEM_TYPES = new Set(['web_search_call', 'web_search_call_output']);
 
 function jsonString(value) {
   if (typeof value === 'string') return value;
@@ -286,6 +287,11 @@ function extractMessagesFromResponsesInput(input) {
           pendingReasoningContent = '';
         }
         if (normalized) messages.push(normalized);
+        continue;
+      }
+      if (CHAT_HISTORY_IGNORED_TOOL_ITEM_TYPES.has(item.type)) {
+        flushPendingUserContent();
+        flushPendingAssistantToolMessage();
         continue;
       }
       if (TOOL_OUTPUT_TYPES.has(item.type) || String(item.type || '').endsWith('_call_output')) {
