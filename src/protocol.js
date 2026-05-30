@@ -26,6 +26,7 @@ const TOOL_OUTPUT_TYPES = new Set([
   'image_generation_call_output',
 ]);
 const CHAT_HISTORY_IGNORED_TOOL_ITEM_TYPES = new Set(['web_search_call', 'web_search_call_output']);
+const EMULATED_HOSTED_TOOL_TYPES = new Set(['web_search', 'web_search_preview']);
 
 function jsonString(value) {
   if (typeof value === 'string') return value;
@@ -345,6 +346,9 @@ function extractMessagesFromResponsesInput(input) {
 
 function normalizeTool(tool) {
   if (!isObject(tool)) return tool;
+  if (typeof tool.type === 'string' && EMULATED_HOSTED_TOOL_TYPES.has(tool.type)) {
+    return null;
+  }
   if (tool.type === 'function' && isObject(tool.function)) {
     return {
       ...tool,
@@ -361,17 +365,6 @@ function normalizeTool(tool) {
       function: omitUndefined({
         name: sanitizeFunctionName(tool.name || tool.type),
         description: tool.description,
-        parameters: normalizeJsonSchemaObject(tool.parameters || tool.input_schema),
-        strict: tool.strict,
-      }),
-    };
-  }
-  if (typeof tool.type === 'string') {
-    return {
-      type: 'function',
-      function: omitUndefined({
-        name: sanitizeFunctionName(tool.name || tool.type),
-        description: tool.description || `Gateway shim for Responses tool type ${tool.type}.`,
         parameters: normalizeJsonSchemaObject(tool.parameters || tool.input_schema),
         strict: tool.strict,
       }),

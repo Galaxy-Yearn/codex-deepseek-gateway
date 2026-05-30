@@ -345,8 +345,12 @@ async function doctor(options) {
     codexSummaryConfigured,
     tavilyWebSearchEnabled: Boolean(config.tavilyWebSearchEnabled),
     tavilyWebSearchReady: Boolean(config.tavilyWebSearchEnabled && config.tavilyApiKey),
+    firecrawlWebFetchEnabled: Boolean(config.firecrawlWebFetchEnabled),
+    firecrawlWebFetchReady: Boolean(config.firecrawlWebFetchEnabled && config.firecrawlApiKey),
+    firecrawlAutoScrapeTopResults: config.firecrawlAutoScrapeTopResults,
     reasoningSummaryHint: 'When DeepSeek thinking is enabled, the gateway maps every non-empty reasoning_content chunk into the Responses reasoning summary path. Keep model_supports_reasoning_summaries = true and model_reasoning_summary = "auto" so Codex TUI is configured to show summaries.',
     tavilyWebSearchHint: 'Set tavilyApiKey in gateway.local.json to route Codex web_search tools through Tavily while using DeepSeek.',
+    firecrawlWebFetchHint: 'Set firecrawlApiKey and firecrawlWebFetchEnabled in gateway.local.json to add opened-page excerpts to Tavily-backed Codex web_search.',
     modelDiscoveryHint: 'The gateway exposes model aliases on /v1/models. Whether Codex TUI /model shows them depends on the Codex build.',
   }, null, 2));
   print('\n');

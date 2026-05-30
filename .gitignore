@@ -1,0 +1,32 @@
+node_modules/
+
+# Local secrets and runtime state
+AGENTS.md
+.env
+.env.*
+!.env.example
+.npmrc
+config/gateway.local.json
+config/model-aliases.json
+gateway.pid
+*.pid
+
+# Logs and generated output
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage/
+.nyc_output/
+*.tgz
+dist/
+tmp/
+temp/
+.cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,6 +1,6 @@
 {
   "name": "@galaxy-yearn/codex-deepseek-gateway",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local Codex Responses API to DeepSeek Chat Completions gateway.",
   "type": "module",
   "main": "src/server.js",
@@ -8,10 +8,12 @@
     "codex-deepseek-gateway": "bin/codex-deepseek-gateway.js"
   },
   "files": [
-    "bin",
-    "config",
+    "bin/codex-deepseek-gateway.js",
+    "config/gateway.example.json",
+    "config/model-aliases.example.json",
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --test"
@@ -28,6 +30,14 @@
     "gateway"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Galaxy-Yearn/codex-deepseek-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Galaxy-Yearn/codex-deepseek-gateway/issues"
+  },
+  "homepage": "https://github.com/Galaxy-Yearn/codex-deepseek-gateway#readme",
   "publishConfig": {
     "access": "public"
   }
