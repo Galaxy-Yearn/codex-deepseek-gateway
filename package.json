@@ -1,0 +1,34 @@
+{
+  "name": "@galaxy-yearn/codex-deepseek-gateway",
+  "version": "0.1.0",
+  "description": "Local Codex Responses API to DeepSeek Chat Completions gateway.",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "codex-deepseek-gateway": "bin/codex-deepseek-gateway.js"
+  },
+  "files": [
+    "bin",
+    "config",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "codex",
+    "deepseek",
+    "openai",
+    "responses-api",
+    "chat-completions",
+    "gateway"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}
