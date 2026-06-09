@@ -4,6 +4,8 @@ A small local gateway for using DeepSeek V4 models from Codex.
 
 Codex sends OpenAI `Responses API` requests to the local gateway. The gateway converts them to DeepSeek-compatible `Chat Completions`, calls DeepSeek, then converts the answer back to Responses objects or streaming `response.*` events.
 
+NPM package: [@galaxy-yearn/codex-deepseek-gateway](https://www.npmjs.com/package/@galaxy-yearn/codex-deepseek-gateway)
+
 The runtime uses only the Node.js standard library. It installs under `~/.codex/deepseek-gateway`, runs as a detached background process, and does not edit your existing Codex config.
 
 Use this if you want Codex to keep its normal Responses API client path while the actual model is DeepSeek, including DeepSeek thinking output and optional web search emulation through Tavily and Firecrawl.
@@ -48,14 +50,16 @@ By default, the gateway serves the local alias list directly. If you also want t
 
 ### Web Search
 
-Web search is off by default. To let Codex's native `web_search` tool work while the active model is DeepSeek, configure Tavily in `gateway.local.json`:
+Web search is off by default. To let Codex's native `web_search` tool work while the active model is DeepSeek, configure the web backends in `gateway.local.json`.
+
+Tavily provides search results:
 
 ```json
 "tavilyApiKey": "tvly-REPLACE_ME",
 "tavilyWebSearchEnabled": true
 ```
 
-To add opened-page reading after search, also configure Firecrawl:
+Firecrawl provides opened-page reading and focused page lookup:
 
 ```json
 "firecrawlApiKey": "fc-REPLACE_ME",
@@ -63,23 +67,25 @@ To add opened-page reading after search, also configure Firecrawl:
 "firecrawlAutoScrapeTopResults": 3
 ```
 
-Codex does not need MCP, a different tool name, or prompt changes. It can keep sending the normal Responses `web_search` or `web_search_preview` tool. The gateway converts that request to internal Chat Completions tools for DeepSeek:
+Tavily and Firecrawl are designed to work together: Tavily finds relevant pages, and Firecrawl reads selected pages so DeepSeek can answer from cleaner page content instead of search snippets alone.
+
+Codex does not need MCP, a different tool name, or prompt changes. It can keep sending the normal Responses `web_search` or `web_search_preview` tool. The gateway converts that request into internal Chat Completions tools for DeepSeek:
 
 - `tavily_search` searches the web and returns citation-ready snippets.
 - `firecrawl_open_page` reads a specific public page.
 - `firecrawl_find_in_page` reads a page with a focused query.
 
-DeepSeek receives a compact text summary it can read directly:
+DeepSeek receives compact text context it can read directly:
 
 - the search query
 - an optional Tavily answer summary
 - numbered sources
 - each source's title, URL, optional date, relevance score, and snippet
-- optional Firecrawl opened-page title, summary, relevant matches, cleaned markdown excerpt, and page links
+- Firecrawl opened-page titles, summaries, relevant matches, cleaned markdown excerpts, and page links
 
-Codex receives Responses-compatible `web_search_call` items, final assistant messages, and URL citation annotations when the final text cites a matching source marker. If Codex replays prior `web_search_call` items as conversation state, the gateway preserves them as search records instead of sending broken Chat tool calls upstream.
+Codex receives Responses-compatible `web_search_call` items, final assistant messages, and URL citation annotations when the final text cites a matching source marker.
 
-The gateway does not pass Tavily's raw response object, images, screenshots, or provider-only fields to DeepSeek. Tavily is called with `include_raw_content: false`. Firecrawl returns cleaned page text, defaults to main content, removes base64 images, rejects local/private URLs, and truncates page text before it reaches the model.
+The gateway keeps the web payload text-focused. Tavily is called with `include_raw_content: false`; Firecrawl defaults to main content, removes base64 images, rejects local/private URLs, and truncates page text before it reaches the model.
 
 If the key is already configured, `install` also starts the gateway. If this is your first install, run `start` after adding the key:
 
@@ -218,29 +224,6 @@ Chat Completions is not a full Responses API replacement. Some Responses feature
 - In-memory conversation history is lost when the gateway restarts.
 - The gateway exposes model aliases on `/v1/models`, including aliases from `config/model-aliases.json`. Whether Codex TUI `/model` actually shows custom provider models depends on the Codex build. `config.toml` remains the reliable fallback.
 
-## Local Testing Before Publish
+## License
 
-From this repository:
-
-```sh
-npm test
-npm pack
-npx --yes --package ./<generated-tarball>.tgz codex-deepseek-gateway install --no-edit
-npx --yes --package ./<generated-tarball>.tgz codex-deepseek-gateway status
-npx --yes --package ./<generated-tarball>.tgz codex-deepseek-gateway doctor
-```
-
-Replace `<generated-tarball>.tgz` with the filename printed by `npm pack`.
-
-For published usage, use the shorter package command shown in the install section.
-
-## Publish
-
-When ready:
-
-```sh
-npm login
-npm test
-npm pack --dry-run
-npm publish
-```
+MIT. See [LICENSE](LICENSE).
