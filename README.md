@@ -2,13 +2,13 @@
 
 A small local gateway for using DeepSeek V4 models from Codex.
 
-Codex sends OpenAI `Responses API` requests to the local gateway. The gateway converts them to DeepSeek-compatible `Chat Completions`, calls DeepSeek, then converts the answer back to Responses objects or streaming `response.*` events.
+Codex keeps sending OpenAI `Responses API` requests to a local endpoint. The gateway converts those requests to DeepSeek-compatible `Chat Completions`, calls DeepSeek, then converts the result back to Responses JSON or streaming `response.*` events.
 
 NPM package: [@galaxy-yearn/codex-deepseek-gateway](https://www.npmjs.com/package/@galaxy-yearn/codex-deepseek-gateway)
 
 The runtime uses only the Node.js standard library. It installs under `~/.codex/deepseek-gateway`, runs as a detached background process, and does not edit your existing Codex config.
 
-Use this if you want Codex to keep its normal Responses API client path while the actual model is DeepSeek, including DeepSeek thinking output and optional web search emulation through Tavily and Firecrawl.
+Use this when you want Codex to stay on its normal Responses API path while the actual model is DeepSeek, including DeepSeek thinking output, function calls, local session resume help, and optional web search emulation through Tavily and Firecrawl.
 
 ## Requirements
 
@@ -24,86 +24,36 @@ Run:
 npx @galaxy-yearn/codex-deepseek-gateway install
 ```
 
-This copies the gateway to:
+This copies the runtime to:
 
 ```text
 ~/.codex/deepseek-gateway
 ```
 
-It also creates:
+It creates two local config files:
 
 ```text
 ~/.codex/deepseek-gateway/config/gateway.local.json
-```
-
-Open that file and replace `sk-REPLACE_ME` with your DeepSeek API key.
-
-The install also creates:
-
-```text
 ~/.codex/deepseek-gateway/config/model-aliases.json
 ```
 
-That file controls which model IDs the gateway exposes on `GET /v1/models`. You only need to edit it if you want to add or rename gateway-facing model aliases.
-
-By default, the gateway serves the local alias list directly. If you also want to merge DeepSeek's upstream `/models` list, set `"fetchUpstreamModels": true` in `gateway.local.json`. Leaving it `false` keeps `/v1/models` lighter and more predictable.
-
-### Web Search
-
-Web search is off by default. To let Codex's native `web_search` tool work while the active model is DeepSeek, configure the web backends in `gateway.local.json`.
-
-Tavily provides search results:
+Put your DeepSeek API key in `gateway.local.json`:
 
 ```json
-"tavilyApiKey": "tvly-REPLACE_ME",
-"tavilyWebSearchEnabled": true
+"upstreamApiKey": "sk-..."
 ```
 
-Firecrawl provides opened-page reading and focused page lookup:
+`model-aliases.json` controls the gateway-facing model IDs exposed on `GET /v1/models` and used by the `sessions` picker. Edit it only if you want to add or rename model aliases.
 
-```json
-"firecrawlApiKey": "fc-REPLACE_ME",
-"firecrawlWebFetchEnabled": true,
-"firecrawlAutoScrapeTopResults": 3
-```
-
-Tavily and Firecrawl are designed to work together: Tavily finds relevant pages, and Firecrawl reads selected pages so DeepSeek can answer from cleaner page content instead of search snippets alone.
-
-Codex does not need MCP, a different tool name, or prompt changes. It can keep sending the normal Responses `web_search` or `web_search_preview` tool. The gateway converts that request into internal Chat Completions tools for DeepSeek:
-
-- `tavily_search` searches the web and returns citation-ready snippets.
-- `firecrawl_open_page` reads a specific public page.
-- `firecrawl_find_in_page` reads a page with a focused query.
-
-DeepSeek receives compact text context it can read directly:
-
-- the search query
-- an optional Tavily answer summary
-- numbered sources
-- each source's title, URL, optional date, relevance score, and snippet
-- Firecrawl opened-page titles, summaries, relevant matches, cleaned markdown excerpts, and page links
-
-Codex receives Responses-compatible `web_search_call` items, final assistant messages, and URL citation annotations when the final text cites a matching source marker.
-
-The gateway keeps the web payload text-focused. Tavily is called with `include_raw_content: false`; Firecrawl defaults to main content, removes base64 images, rejects local/private URLs, and truncates page text before it reaches the model.
-
-If the key is already configured, `install` also starts the gateway. If this is your first install, run `start` after adding the key:
+If the key is already configured, `install` also starts the gateway. If this is your first install, add the key and then run:
 
 ```sh
 npx @galaxy-yearn/codex-deepseek-gateway start
 ```
 
-Check that it is running:
-
-```sh
-npx @galaxy-yearn/codex-deepseek-gateway status
-```
-
-You should see `"reachable": true`.
-
 ## Configure Codex
 
-Edit `~/.codex/config.toml` and set the active provider to the gateway:
+Edit `~/.codex/config.toml`:
 
 ```toml
 model_provider = "deepseek-gateway"
@@ -120,23 +70,21 @@ wire_api = "responses"
 
 Use `deepseek-v4-pro` instead of `deepseek-v4-flash` if you want the pro model.
 
-`config.toml` can change:
-
-- the active provider via `model_provider`
-- the active model ID via `model`
-- the provider label via `[model_providers.<id>].name`
-
-It does not define a separate display name for each model entry inside Codex `/model`. If your Codex build reads custom provider models from `/v1/models`, the visible model names come from the gateway's model IDs in `~/.codex/deepseek-gateway/config/model-aliases.json`.
-
-`model_supports_reasoning_summaries = true` and `model_reasoning_summary = "auto"` tell Codex to use its normal thinking UI path. When DeepSeek returns `reasoning_content`, the gateway keeps the raw text as `reasoning_text` and mirrors it into a display-safe `summary_text` value for Codex.
-
-When DeepSeek thinking is enabled, the gateway buffers visible assistant text and tool-call output until the upstream response completes. It then emits reasoning before the answer or tool calls. The tradeoff is higher first-token latency while thinking is on.
-
 Restart Codex after changing `config.toml`.
 
-## Verify
+## Start And Verify
 
-Run:
+Start, stop, and inspect the local background process:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway start
+npx @galaxy-yearn/codex-deepseek-gateway stop
+npx @galaxy-yearn/codex-deepseek-gateway status
+```
+
+`status` should show `"reachable": true`.
+
+Run `doctor` to check the active Codex config and the DeepSeek request shape the gateway will send:
 
 ```sh
 npx @galaxy-yearn/codex-deepseek-gateway doctor
@@ -145,30 +93,43 @@ npx @galaxy-yearn/codex-deepseek-gateway doctor
 Important fields:
 
 - `codexConfigUsingGateway` should be `true`
-- `codexModel` should be your DeepSeek model, for example `deepseek-v4-pro`
+- `codexModel` should be your gateway model, for example `deepseek-v4-pro`
 - `codexReasoningEffort` should match `model_reasoning_effort`
 - `deepseekThinking` shows the DeepSeek `thinking` payload
 - `deepseekReasoningEffort` shows the DeepSeek effort sent upstream
-- `reasoningDisplayMode` shows whether the gateway will emit `summary`, `disabled`, or `hidden`
 - `gatewayEmitsReasoningSummary` should be `true` when DeepSeek thinking is enabled
-- `codexSummaryConfigured` should be `true` so Codex TUI is configured to show summaries
-- `tavilyWebSearchReady` should be `true` if you want Codex `web_search` to route through Tavily
-- `firecrawlWebFetchReady` should be `true` if you want Tavily search results to include opened-page excerpts
+- `tavilyWebSearchReady` and `firecrawlWebFetchReady` show whether optional web search backends are usable
 
-For example, with:
+Avoid running Codex through a proxy while using the local gateway. Some proxy clients intercept `http://127.0.0.1:3000` and can break local gateway requests.
 
-```toml
-model_reasoning_effort = "xhigh"
-```
+## Models
 
-`doctor` should show:
+The installed `config/model-aliases.json` starts with:
 
 ```json
-"deepseekThinking": { "type": "enabled" },
-"deepseekReasoningEffort": "max"
+{
+  "deepseek-v4-flash": {
+    "model": "deepseek-v4-flash",
+    "thinking": "auto"
+  },
+  "deepseek-v4-pro": {
+    "model": "deepseek-v4-pro",
+    "thinking": "auto"
+  }
+}
 ```
 
-## Reasoning Mapping
+The gateway serves these aliases directly on `GET /v1/models`. If you also want to merge DeepSeek's upstream `/models` list, set this in `gateway.local.json`:
+
+```json
+"fetchUpstreamModels": true
+```
+
+Whether Codex TUI `/model` shows custom provider models depends on the Codex client build. `config.toml` and the `sessions` command remain the reliable ways to choose a model.
+
+## Reasoning
+
+Codex reasoning effort maps to DeepSeek V4 thinking mode:
 
 | Codex `model_reasoning_effort` | DeepSeek request |
 | --- | --- |
@@ -177,11 +138,73 @@ model_reasoning_effort = "xhigh"
 | `high` | `thinking.type = enabled`, `reasoning_effort = high` |
 | `xhigh` | `thinking.type = enabled`, `reasoning_effort = max` |
 
-When thinking is enabled, every non-empty DeepSeek `reasoning_content` value is converted into Responses reasoning output:
+`model_supports_reasoning_summaries = true` and `model_reasoning_summary = "auto"` tell Codex to use its normal thinking UI path. When DeepSeek returns `reasoning_content`, the gateway keeps the raw text as `reasoning_text` and mirrors it into `summary_text` with a `Reasoning` heading for Codex TUI compatibility.
 
-- `reasoning_summary_text.delta` for Codex's native summary-style thinking UI
+When thinking is enabled, the gateway intentionally buffers visible assistant text and tool-call output until the upstream response completes, then emits reasoning first. This improves thinking order in Codex at the cost of higher first-token latency.
 
-The completed response keeps the original DeepSeek text as `reasoning_text`. The visible summary path uses a plain-text rendering of the same text with common Markdown markers removed and a `Reasoning` heading for Codex TUI compatibility. This also applies to Tavily/Firecrawl-backed `web_search` turns.
+## Web Search
+
+Web search is off by default. To let Codex's native `web_search` or `web_search_preview` tool work while DeepSeek is active, configure the optional backends in `gateway.local.json`.
+
+Tavily provides search results:
+
+```json
+"tavilyApiKey": "tvly-...",
+"tavilyWebSearchEnabled": true
+```
+
+Firecrawl provides opened-page reading and focused page lookup:
+
+```json
+"firecrawlApiKey": "fc-...",
+"firecrawlWebFetchEnabled": true,
+"firecrawlAutoScrapeTopResults": 3
+```
+
+Codex does not need MCP, a different tool name, or prompt changes. The gateway converts Codex web search requests into internal Chat Completions tools:
+
+- `tavily_search` searches the web and returns citation-ready snippets.
+- `firecrawl_open_page` reads a specific public page.
+- `firecrawl_find_in_page` reads a page with a focused query.
+
+DeepSeek receives compact text context containing the search query, sources, snippets, and optional opened-page excerpts. Codex receives Responses-compatible `web_search_call` items, final assistant messages, and URL citation annotations when the final text cites a matching source marker.
+
+The web payload is intentionally text-focused. Tavily is called with `include_raw_content: false`; Firecrawl defaults to main content, removes base64 images, rejects local/private URLs, and truncates page text before it reaches the model.
+
+## Sessions
+
+Open a cross-provider session picker from a project:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway sessions
+```
+
+The picker is read-only. It scans Codex local transcript files, lists sessions for the current project across providers, then runs:
+
+```sh
+codex resume <session-id> -c model_provider=deepseek-gateway -c model=<model> -c model_reasoning_effort=<effort>
+```
+
+Flow:
+
+- choose a model from `~/.codex/deepseek-gateway/config/model-aliases.json`
+- choose Codex reasoning effort
+- choose the session to resume
+- use `Up/Down` to select, `Enter` to confirm, `Left` to go back, and `Esc` to quit
+
+Print copyable resume commands instead of opening the picker:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway sessions --print
+```
+
+Include sessions outside the current project:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway sessions --all
+```
+
+The command does not edit session files, change provider ownership, or change Codex's native resume picker filters. It only helps you find the hidden session id and resume it with explicit config overrides.
 
 ## Commands
 
@@ -191,6 +214,7 @@ npx @galaxy-yearn/codex-deepseek-gateway start
 npx @galaxy-yearn/codex-deepseek-gateway stop
 npx @galaxy-yearn/codex-deepseek-gateway status
 npx @galaxy-yearn/codex-deepseek-gateway doctor
+npx @galaxy-yearn/codex-deepseek-gateway sessions
 npx @galaxy-yearn/codex-deepseek-gateway uninstall
 ```
 
@@ -205,20 +229,18 @@ If `start` returns without visible output on your terminal, run `status`; `"reac
 - text input and output
 - image, file, and audio content parts when DeepSeek accepts the corresponding Chat Completions shape
 - function tools and tool-call history
-- conservative schema-based repair for streamed and non-streamed tool arguments where DeepSeek returns stringified JSON values for fields that Codex declared as arrays, objects, booleans, or numbers
-- Codex `web_search` emulation through Tavily when `tavilyWebSearchEnabled` is true and `tavilyApiKey` is configured, with Responses-style `web_search_call` output and compact source snippets for DeepSeek
-- Firecrawl-backed opened-page reading for `web_search` when `firecrawlWebFetchEnabled` is true and `firecrawlApiKey` is configured, including automatic top-result scraping plus explicit `open_page` and `find_in_page` internal tool calls
-- Responses-style URL citation metadata for Tavily-backed answers when the final text contains matching source markers
 - DeepSeek thinking mode and `reasoning_content`
 - lightweight local `previous_response_id` / `conversation` history while the gateway process is running
-- `GET /v1/models` with local DeepSeek V4 aliases and optional upstream discovery
+- `GET /v1/models` with local model aliases and optional upstream discovery
+- optional Tavily/Firecrawl-backed `web_search` emulation
+- read-only cross-provider session picker
 
 ## Limits
 
 Chat Completions is not a full Responses API replacement. Some Responses features have no equivalent upstream field.
 
-- Hosted tools such as file search, computer use, image generation, and code interpreter are represented as function-tool shims unless Codex executes matching tools locally. Web search is the only hosted tool the gateway can emulate directly, and only when Tavily is configured.
-- Tavily and Firecrawl web emulation is intentionally text-focused. It covers search, opened-page excerpts, page links, and find-in-page style matching; it does not expose raw HTML, screenshots, browser actions, crawl/map jobs, cookies, private network access, or provider-specific payloads through Codex `web_search`.
+- Hosted tools such as file search, computer use, image generation, and code interpreter are represented as function-tool shims unless Codex executes matching tools locally. Web search is the only hosted tool the gateway can emulate directly.
+- Tavily and Firecrawl web emulation is text-focused. It does not expose raw HTML, screenshots, browser actions, crawl/map jobs, cookies, private network access, or provider-specific payloads through Codex `web_search`.
 - URL citations are returned in the Responses metadata path. Whether they appear as clickable links in the terminal depends on the Codex client build and how it renders custom-provider citation annotations.
 - OpenAI `file_id` values are passed through; the gateway cannot fetch private OpenAI-hosted files.
 - In-memory conversation history is lost when the gateway restarts.

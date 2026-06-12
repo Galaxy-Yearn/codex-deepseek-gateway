@@ -13,6 +13,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/config.js';
+import { sessions } from '../src/codex-sessions.js';
 import { toProviderChatCompletionsRequest } from '../src/protocol.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -32,16 +33,25 @@ Usage:
   codex-deepseek-gateway stop
   codex-deepseek-gateway status
   codex-deepseek-gateway doctor
+  codex-deepseek-gateway sessions
   codex-deepseek-gateway uninstall
 
 Options:
   --dir <path>     Install directory, defaults to ~/.codex/deepseek-gateway
   --no-edit        Do not open the local config file after install
+  --all            With sessions, include sessions outside the current project
+  --provider <id>  With sessions, target model_provider override
+  --model <id>     With sessions, target model override
+  --reasoning-effort <level>
+                  With sessions, target Codex reasoning effort
+  --exec <id>      With sessions, run the generated codex resume command
+  --limit <n>      With sessions, max rows to print, defaults to 20
+  --print          With sessions, print copyable resume commands instead of picker
 `);
 }
 
 function parseArgs(argv) {
-  const options = { dir: defaultInstallDir(), noEdit: false };
+  const options = { dir: defaultInstallDir(), noEdit: false, all: false };
   const rest = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -52,6 +62,35 @@ function parseArgs(argv) {
       index += 1;
     } else if (arg === '--no-edit' || arg === '-NoEdit') {
       options.noEdit = true;
+    } else if (arg === '--all') {
+      options.all = true;
+    } else if (arg === '--provider') {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`${arg} requires a provider id`);
+      options.provider = value;
+      index += 1;
+    } else if (arg === '--model' || arg === '-m') {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`${arg} requires a model id`);
+      options.model = value;
+      index += 1;
+    } else if (arg === '--reasoning-effort') {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`${arg} requires a reasoning effort`);
+      options.reasoningEffort = value;
+      index += 1;
+    } else if (arg === '--exec') {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`${arg} requires a session id`);
+      options.exec = value;
+      index += 1;
+    } else if (arg === '--limit') {
+      const value = Number(argv[index + 1]);
+      if (!Number.isInteger(value) || value < 1) throw new Error(`${arg} requires a positive integer`);
+      options.limit = value;
+      index += 1;
+    } else if (arg === '--print') {
+      options.print = true;
     } else {
       rest.push(arg);
     }
@@ -348,10 +387,7 @@ async function doctor(options) {
     firecrawlWebFetchEnabled: Boolean(config.firecrawlWebFetchEnabled),
     firecrawlWebFetchReady: Boolean(config.firecrawlWebFetchEnabled && config.firecrawlApiKey),
     firecrawlAutoScrapeTopResults: config.firecrawlAutoScrapeTopResults,
-    reasoningSummaryHint: 'When DeepSeek thinking is enabled, the gateway maps every non-empty reasoning_content chunk into the Responses reasoning summary path. Keep model_supports_reasoning_summaries = true and model_reasoning_summary = "auto" so Codex TUI is configured to show summaries.',
-    tavilyWebSearchHint: 'Set tavilyApiKey in gateway.local.json to route Codex web_search tools through Tavily while using DeepSeek.',
-    firecrawlWebFetchHint: 'Set firecrawlApiKey and firecrawlWebFetchEnabled in gateway.local.json to add opened-page excerpts to Tavily-backed Codex web_search.',
-    modelDiscoveryHint: 'The gateway exposes model aliases on /v1/models. Whether Codex TUI /model shows them depends on the Codex build.',
+    hint: 'The gateway exposes model aliases on /v1/models. Whether Codex TUI /model shows them depends on the Codex build.',
   }, null, 2));
   print('\n');
 }
@@ -368,7 +404,7 @@ async function main() {
     usage();
     return;
   }
-  const commands = { install, start, stop, status, doctor, uninstall };
+  const commands = { install, start, stop, status, doctor, sessions, uninstall };
   const handler = commands[command];
   if (!handler) {
     throw new Error(`Unknown command: ${command}`);
