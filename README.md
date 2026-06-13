@@ -1,6 +1,6 @@
 # Codex DeepSeek Gateway
 
-A small local gateway for using DeepSeek V4 models from Codex.
+A small local gateway for using DeepSeek models from Codex.
 
 Codex keeps sending OpenAI `Responses API` requests to a local endpoint. The gateway converts those requests to DeepSeek-compatible `Chat Completions`, calls DeepSeek, then converts the result back to Responses JSON or streaming `response.*` events.
 
@@ -43,7 +43,7 @@ Put your DeepSeek API key in `gateway.local.json`:
 "upstreamApiKey": "sk-..."
 ```
 
-`model-aliases.json` controls the gateway-facing model IDs exposed on `GET /v1/models` and used by the `sessions` picker. Edit it only if you want to add or rename model aliases.
+`model-aliases.json` controls the gateway-facing model IDs exposed on `GET /v1/models` and used by the `new` and `sessions` pickers. Edit it only if you want to add or rename model aliases.
 
 If the key is already configured, `install` also starts the gateway. If this is your first install, add the key and then run:
 
@@ -97,7 +97,7 @@ Important fields:
 - `codexReasoningEffort` should match `model_reasoning_effort`
 - `deepseekThinking` shows the DeepSeek `thinking` payload
 - `deepseekReasoningEffort` shows the DeepSeek effort sent upstream
-- `gatewayEmitsReasoningSummary` should be `true` when DeepSeek thinking is enabled
+- `reasoningDisplayMode` shows whether reasoning is shown as `summary`, `hidden`, or `disabled`
 - `tavilyWebSearchReady` and `firecrawlWebFetchReady` show whether optional web search backends are usable
 
 Avoid running Codex through a proxy while using the local gateway. Some proxy clients intercept `http://127.0.0.1:3000` and can break local gateway requests.
@@ -125,7 +125,7 @@ The gateway serves these aliases directly on `GET /v1/models`. If you also want 
 "fetchUpstreamModels": true
 ```
 
-Whether Codex TUI `/model` shows custom provider models depends on the Codex client build. `config.toml` and the `sessions` command remain the reliable ways to choose a model.
+Whether Codex TUI `/model` shows custom provider models depends on the Codex client build. `config.toml`, `new`, and `sessions` remain the reliable ways to choose a model.
 
 ## Reasoning
 
@@ -171,6 +171,34 @@ DeepSeek receives compact text context containing the search query, sources, sni
 
 The web payload is intentionally text-focused. Tavily is called with `include_raw_content: false`; Firecrawl defaults to main content, removes base64 images, rejects local/private URLs, and truncates page text before it reaches the model.
 
+## New Conversations
+
+Start a new Codex conversation with a temporary gateway model override:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway new
+```
+
+The command first lets you choose a model from `~/.codex/deepseek-gateway/config/model-aliases.json`, then choose Codex reasoning effort, then runs:
+
+```sh
+codex -c model_provider=deepseek-gateway -c model=<model> -c model_reasoning_effort=<effort>
+```
+
+This does not edit `~/.codex/config.toml`; the `model_providers.deepseek-gateway` provider entry still needs to exist there.
+
+You can skip the picker:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway new --model deepseek-v4-flash --reasoning-effort low
+```
+
+Print the generated launch command instead of running Codex:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway new --print
+```
+
 ## Sessions
 
 Open a cross-provider session picker from a project:
@@ -189,8 +217,8 @@ Flow:
 
 - choose a model from `~/.codex/deepseek-gateway/config/model-aliases.json`
 - choose Codex reasoning effort
-- choose the session to resume
-- use `Up/Down` to select, `Enter` to confirm, `Left` to go back, and `Esc` to quit
+- choose `[New conversation]` or the session to resume
+- use `↑/↓` to select, `Enter` to confirm, `←` to go back, and `Esc` to quit
 
 Print copyable resume commands instead of opening the picker:
 
@@ -204,6 +232,18 @@ Include sessions outside the current project:
 npx @galaxy-yearn/codex-deepseek-gateway sessions --all
 ```
 
+Resume a matching session directly by row number or unique session id prefix:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway sessions --exec <id-or-row>
+```
+
+Limit how many session rows are shown or offered in the picker:
+
+```sh
+npx @galaxy-yearn/codex-deepseek-gateway sessions --limit 50
+```
+
 The command does not edit session files, change provider ownership, or change Codex's native resume picker filters. It only helps you find the hidden session id and resume it with explicit config overrides.
 
 ## Commands
@@ -214,6 +254,7 @@ npx @galaxy-yearn/codex-deepseek-gateway start
 npx @galaxy-yearn/codex-deepseek-gateway stop
 npx @galaxy-yearn/codex-deepseek-gateway status
 npx @galaxy-yearn/codex-deepseek-gateway doctor
+npx @galaxy-yearn/codex-deepseek-gateway new
 npx @galaxy-yearn/codex-deepseek-gateway sessions
 npx @galaxy-yearn/codex-deepseek-gateway uninstall
 ```
@@ -233,6 +274,7 @@ If `start` returns without visible output on your terminal, run `status`; `"reac
 - lightweight local `previous_response_id` / `conversation` history while the gateway process is running
 - `GET /v1/models` with local model aliases and optional upstream discovery
 - optional Tavily/Firecrawl-backed `web_search` emulation
+- new-conversation launcher with per-run Codex config overrides
 - read-only cross-provider session picker
 
 ## Limits
@@ -244,7 +286,7 @@ Chat Completions is not a full Responses API replacement. Some Responses feature
 - URL citations are returned in the Responses metadata path. Whether they appear as clickable links in the terminal depends on the Codex client build and how it renders custom-provider citation annotations.
 - OpenAI `file_id` values are passed through; the gateway cannot fetch private OpenAI-hosted files.
 - In-memory conversation history is lost when the gateway restarts.
-- The gateway exposes model aliases on `/v1/models`, including aliases from `config/model-aliases.json`. Whether Codex TUI `/model` actually shows custom provider models depends on the Codex build. `config.toml` remains the reliable fallback.
+- The gateway exposes model aliases on `/v1/models`, including aliases from `config/model-aliases.json`. Whether Codex TUI `/model` actually shows custom provider models depends on the Codex build. `config.toml`, `new`, and `sessions` remain the reliable ways to choose a model.
 
 ## License
 

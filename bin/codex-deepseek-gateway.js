@@ -13,6 +13,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/config.js';
+import { newConversation } from '../src/codex-launch.js';
 import { sessions } from '../src/codex-sessions.js';
 import { toProviderChatCompletionsRequest } from '../src/protocol.js';
 
@@ -33,6 +34,7 @@ Usage:
   codex-deepseek-gateway stop
   codex-deepseek-gateway status
   codex-deepseek-gateway doctor
+  codex-deepseek-gateway new
   codex-deepseek-gateway sessions
   codex-deepseek-gateway uninstall
 
@@ -40,13 +42,14 @@ Options:
   --dir <path>     Install directory, defaults to ~/.codex/deepseek-gateway
   --no-edit        Do not open the local config file after install
   --all            With sessions, include sessions outside the current project
-  --provider <id>  With sessions, target model_provider override
-  --model <id>     With sessions, target model override
+  --provider <id>  With new/sessions, target model_provider override
+  --model <id>     With new/sessions, target model override
   --reasoning-effort <level>
-                  With sessions, target Codex reasoning effort
+                  With new/sessions, target Codex reasoning effort
   --exec <id>      With sessions, run the generated codex resume command
   --limit <n>      With sessions, max rows to print, defaults to 20
-  --print          With sessions, print copyable resume commands instead of picker
+  --print          With new, print the launch command. With sessions, print
+                  copyable resume commands instead of picker
 `);
 }
 
@@ -363,7 +366,6 @@ async function doctor(options) {
     : thinkingEnabled
     ? 'summary'
     : 'disabled';
-  const codexSummaryConfigured = supportsReasoningSummaries && summaryMode && summaryMode !== 'none';
   print(JSON.stringify({
     packageVersion: packageJson.version,
     installDir: options.dir,
@@ -380,8 +382,6 @@ async function doctor(options) {
     deepseekThinking: upstreamRequest.thinking || null,
     deepseekReasoningEffort: upstreamRequest.reasoning_effort || null,
     reasoningDisplayMode,
-    gatewayEmitsReasoningSummary: reasoningDisplayMode === 'summary',
-    codexSummaryConfigured,
     tavilyWebSearchEnabled: Boolean(config.tavilyWebSearchEnabled),
     tavilyWebSearchReady: Boolean(config.tavilyWebSearchEnabled && config.tavilyApiKey),
     firecrawlWebFetchEnabled: Boolean(config.firecrawlWebFetchEnabled),
@@ -404,7 +404,7 @@ async function main() {
     usage();
     return;
   }
-  const commands = { install, start, stop, status, doctor, sessions, uninstall };
+  const commands = { install, start, stop, status, doctor, new: newConversation, sessions, uninstall };
   const handler = commands[command];
   if (!handler) {
     throw new Error(`Unknown command: ${command}`);
