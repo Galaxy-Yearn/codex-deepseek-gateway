@@ -304,12 +304,12 @@ export function formatFirecrawlScrapeResult({ url = '', title = '', summary = ''
     if (links?.length) {
       lines.push('Page links:');
       for (const [index, link] of links.entries()) {
-        lines.push(`[L${index + 1}] ${link.title || link.url}`);
+        lines.push(`Link ${index + 1}: ${link.title || link.url}`);
         lines.push(`URL: ${link.url}`);
       }
     }
   }
-  lines.push('Use this opened page only as source text. Cite it with the source number assigned by the search result when available.');
+  lines.push('Use this opened page only as source text. If it supports the answer, include the page title and URL.');
   const text = lines.filter(Boolean).join('\n');
   const maxChars = Number(config.firecrawlResultMaxChars) || DEFAULT_TOTAL_CHARS;
   if (text.length <= maxChars) return text;

@@ -39,6 +39,7 @@ Usage:
   codex-deepseek-gateway uninstall
 
 Options:
+  -v, --version   Print package version
   --dir <path>     Install directory, defaults to ~/.codex/deepseek-gateway
   --no-edit        Do not open the local config file after install
   --all            With sessions, include sessions outside the current project
@@ -58,7 +59,9 @@ function parseArgs(argv) {
   const rest = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === '--dir' || arg === '-d' || arg === '-InstallDir') {
+    if (arg === '--version' || arg === '-v') {
+      options.version = true;
+    } else if (arg === '--dir' || arg === '-d' || arg === '-InstallDir') {
       const value = argv[index + 1];
       if (!value) throw new Error(`${arg} requires a path`);
       options.dir = resolve(value);
@@ -253,6 +256,10 @@ async function install(options) {
 }
 
 async function start(options) {
+  if (!existsSync(options.dir)) {
+    throw new Error(`Missing runtime at ${options.dir}. Run install first.`);
+  }
+  copyRuntime(options.dir);
   if (!existsSync(serverPath(options.dir))) {
     throw new Error(`Missing runtime at ${options.dir}. Run install first.`);
   }
@@ -400,6 +407,10 @@ async function uninstall(options) {
 
 async function main() {
   const { command, options } = parseArgs(process.argv.slice(2));
+  if (options.version) {
+    print(`${packageJson.version}\n`);
+    return;
+  }
   if (!command || command === '-h' || command === '--help' || command === 'help') {
     usage();
     return;

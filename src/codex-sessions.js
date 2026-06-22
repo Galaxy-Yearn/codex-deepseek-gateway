@@ -5,6 +5,7 @@ import {
   readFileSync,
   readdirSync,
   readSync,
+  statSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
@@ -57,6 +58,48 @@ function parseJsonLine(line) {
     return JSON.parse(line);
   } catch {
     return null;
+  }
+}
+
+function isSubagentSession(meta) {
+  return meta?.thread_source === 'subagent' || Boolean(meta?.parent_thread_id);
+}
+
+function timestampFromUserMessage(row) {
+  const payload = row?.payload;
+  if (row?.type === 'event_msg' && payload?.type === 'user_message') return row.timestamp || '';
+  if (row?.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') return row.timestamp || '';
+  return '';
+}
+
+function readLastUserMessageTimestamp(file, chunkSize = 256 * 1024) {
+  const handle = openSync(file, 'r');
+  try {
+    let position = statSync(file).size;
+    let suffix = Buffer.alloc(0);
+    while (position > 0) {
+      const length = Math.min(chunkSize, position);
+      position -= length;
+      const buffer = Buffer.alloc(length);
+      const read = readSync(handle, buffer, 0, length, position);
+      let data = buffer.subarray(0, read);
+      if (suffix.length) data = Buffer.concat([data, suffix]);
+
+      let lineEnd = data.length;
+      for (let index = data.length - 1; index >= 0; index -= 1) {
+        if (data[index] !== 10) continue;
+        const row = parseJsonLine(data.subarray(index + 1, lineEnd).toString('utf8').trim());
+        const timestamp = timestampFromUserMessage(row);
+        if (timestamp) return timestamp;
+        lineEnd = index;
+      }
+      suffix = data.subarray(0, lineEnd);
+    }
+
+    const row = parseJsonLine(suffix.toString('utf8').trim());
+    return timestampFromUserMessage(row);
+  } finally {
+    closeSync(handle);
   }
 }
 
@@ -118,16 +161,17 @@ function isInsideProject(cwd, projectRoot) {
   return sessionCwd === root || sessionCwd.startsWith(`${root}${process.platform === 'win32' ? '\\' : '/'}`);
 }
 
-function readSession(file, indexById) {
+export function readSession(file, indexById) {
   const lines = readStart(file).split(/\r?\n/).filter(Boolean);
   const meta = parseJsonLine(lines[0])?.payload;
   if (!meta?.id) return null;
+  if (isSubagentSession(meta)) return null;
   const index = indexById.get(meta.id) || {};
   return {
     id: meta.id,
     provider: meta.model_provider || '',
     cwd: meta.cwd || '',
-    updatedAt: index.updated_at || meta.timestamp || '',
+    updatedAt: readLastUserMessageTimestamp(file) || index.updated_at || meta.timestamp || '',
     title: index.thread_name || firstUserPreview(lines) || '(untitled)',
   };
 }
@@ -180,9 +224,16 @@ async function chooseSessionFlow(allSessions, context, limit) {
   const listed = allSessions.slice(0, limit);
   const header = sessionHeader();
   return await withPickerScreen(async () => {
-    let step = 'model';
+    let step = 'session';
     while (true) {
-      if (step === 'model') {
+      if (step === 'session') {
+        const rows = [NEW_SESSION_ROW, ...sessionRows(listed)];
+        const result = await pick(`Choose Codex session`, rows, header);
+        if (result.action === 'cancel') return null;
+        if (result.action === 'back') return null;
+        context.selectedSession = result.index === 0 ? { newConversation: true } : listed[result.index - 1];
+        step = 'model';
+      } else if (step === 'model') {
         const action = await pickModel(context);
         if (action !== 'select') return null;
         step = 'reasoning';
@@ -190,14 +241,7 @@ async function chooseSessionFlow(allSessions, context, limit) {
         const action = await pickReasoning(context);
         if (action === 'cancel') return null;
         if (action === 'back') step = 'model';
-        else step = 'session';
-      } else {
-        const rows = [NEW_SESSION_ROW, ...sessionRows(listed)];
-        const result = await pick(`Choose Codex session for ${context.provider} / ${context.model} / ${context.reasoningEffort}`, rows, header);
-        if (result.action === 'cancel') return null;
-        if (result.action === 'back') step = 'reasoning';
-        else if (result.index === 0) return { newConversation: true };
-        else return listed[result.index - 1];
+        else return context.selectedSession;
       }
     }
   });

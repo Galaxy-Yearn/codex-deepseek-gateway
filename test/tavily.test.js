@@ -62,7 +62,7 @@ test('formats Tavily results as compact model-readable snippets', () => {
   );
 
   assert.match(response.content, /Search query: query/);
-  assert.match(response.content, /\[1\] Title/);
+  assert.match(response.content, /Source 1: Title/);
   assert.match(response.content, /URL: https:\/\/example\.com\/a/);
   assert.match(response.content, /Date: 2026-05-20/);
   assert.match(response.content, /Score: 0\.9/);

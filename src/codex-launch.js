@@ -66,6 +66,10 @@ function configOverrideArgs(context) {
     `model=${JSON.stringify(context.model)}`,
     '-c',
     `model_reasoning_effort=${JSON.stringify(context.reasoningEffort)}`,
+    '-c',
+    'model_supports_reasoning_summaries=true',
+    '-c',
+    'model_reasoning_summary="auto"',
   ];
 }
 
@@ -77,6 +81,10 @@ function configOverrideCommandParts(context) {
     `model=${context.model}`,
     '-c',
     `model_reasoning_effort=${context.reasoningEffort}`,
+    '-c',
+    'model_supports_reasoning_summaries=true',
+    '-c',
+    'model_reasoning_summary=auto',
   ];
 }
 
@@ -127,7 +135,7 @@ function renderPicker(state) {
     const row = `${index === selected ? '>' : ' '} ${rows[index]}`;
     output += `${index === selected ? `${SELECTED_ROW}${row}${RESET_STYLE}` : row}\n`;
   }
-  output += '\n↑/↓ select  Enter confirm  ← back  Esc quit\n';
+  output += '\nUp/Down select  Enter confirm  Left back  Esc quit\n';
   print(output);
 }
 

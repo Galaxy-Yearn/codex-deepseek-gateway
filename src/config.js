@@ -25,7 +25,7 @@ export function loadConfig(env = process.env) {
     tavilyBaseUrl: mergedEnv.TAVILY_BASE_URL || 'https://api.tavily.com',
     tavilySearchDepth: mergedEnv.TAVILY_SEARCH_DEPTH || 'basic',
     tavilyMaxResults: Number(mergedEnv.TAVILY_MAX_RESULTS || 5),
-    tavilyMaxSearchRounds: Number(mergedEnv.TAVILY_MAX_SEARCH_ROUNDS || 2),
+    tavilyMaxSearchRounds: Number(mergedEnv.TAVILY_MAX_SEARCH_ROUNDS || 10),
     tavilyTimeoutMs: Number(mergedEnv.TAVILY_TIMEOUT_MS || 15000),
     tavilySnippetChars: Number(mergedEnv.TAVILY_SNIPPET_CHARS || 650),
     tavilyResultMaxChars: Number(mergedEnv.TAVILY_RESULT_MAX_CHARS || 6000),

@@ -37,6 +37,7 @@ test('loads local gateway config and lets env override it', async () => {
     assert.equal(config.upstreamApiKey, 'from-file');
     assert.equal(config.upstreamProvider, 'deepseek');
     assert.equal(config.tavilyWebSearchEnabled, false);
+    assert.equal(config.tavilyMaxSearchRounds, 10);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

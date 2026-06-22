@@ -27,6 +27,15 @@ const TOOL_OUTPUT_TYPES = new Set([
 ]);
 const CHAT_HISTORY_IGNORED_TOOL_ITEM_TYPES = new Set(['web_search_call', 'web_search_call_output']);
 const EMULATED_HOSTED_TOOL_TYPES = new Set(['web_search', 'web_search_preview']);
+const DEEPSEEK_TOOL_INSTRUCTIONS_MARKER = 'The tools in this request are real callable functions available now.';
+const DEEPSEEK_TOOL_INSTRUCTIONS = [
+  DEEPSEEK_TOOL_INSTRUCTIONS_MARKER,
+  'When a tool is needed, respond with Chat Completions tool_calls and JSON arguments matching the schema.',
+  'Do not write pseudo XML, DSML, or JSON tool calls in assistant text.',
+  'Do not claim a listed function is unavailable because its name is unfamiliar.',
+].join(' ');
+const DEEPSEEK_TOOL_DESCRIPTION_CHARS = 220;
+const DEEPSEEK_SCHEMA_DESCRIPTION_CHARS = 160;
 
 function jsonString(value) {
   if (typeof value === 'string') return value;
@@ -41,6 +50,30 @@ function sanitizeFunctionName(name, fallback = 'tool_call') {
   return candidate || fallback;
 }
 
+function toolNamespace(tool) {
+  if (!isObject(tool)) return '';
+  return String(tool.namespace || tool.function?.namespace || '').trim();
+}
+
+function toolBaseName(tool, fallback = 'tool_call') {
+  if (!isObject(tool)) return fallback;
+  if (isObject(tool.function) && tool.function.name) return tool.function.name;
+  return tool.name || tool.tool_name || tool.toolName || tool.server_label || fallback;
+}
+
+function encodeToolName(namespace, name, fallback = 'tool_call') {
+  const baseName = sanitizeFunctionName(name, fallback);
+  if (!namespace) return baseName;
+  const encodedNamespace = sanitizeFunctionName(namespace, 'namespace');
+  return sanitizeFunctionName(`${encodedNamespace}__${baseName}`, fallback);
+}
+
+function decodedToolName(name, toolNames) {
+  const value = String(name || '');
+  const known = toolNames?.get(value);
+  return known ? { ...known } : { name: value };
+}
+
 function omitUndefined(value) {
   if (!isObject(value)) return value;
   const result = {};
@@ -48,6 +81,19 @@ function omitUndefined(value) {
     if (child !== undefined) result[key] = child;
   }
   return result;
+}
+
+function compactText(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function shortenText(value, maxChars) {
+  const text = compactText(value);
+  if (!text || text.length <= maxChars) return text;
+  const softLimit = Math.max(24, Math.floor(maxChars * 0.65));
+  const slice = text.slice(0, maxChars - 3);
+  const breakAt = Math.max(slice.lastIndexOf('. '), slice.lastIndexOf('; '), slice.lastIndexOf(', '), slice.lastIndexOf(' '));
+  return `${slice.slice(0, breakAt >= softLimit ? breakAt : slice.length).trimEnd()}...`;
 }
 
 function textPart(text) {
@@ -137,8 +183,9 @@ function toolCallId(item) {
 }
 
 function toolName(item) {
-  return sanitizeFunctionName(
-    item.name ||
+  return encodeToolName(
+    toolNamespace(item),
+      item.name ||
       item.tool_name ||
       item.toolName ||
       item.server_label ||
@@ -170,35 +217,55 @@ function chatToolCallFromResponseItem(item) {
 
 function reasoningTextFromItem(item) {
   if (!isObject(item)) return '';
-  const parts = [];
-  if (typeof item.reasoning_content === 'string') parts.push(item.reasoning_content);
-  if (typeof item.text === 'string') parts.push(item.text);
-  if (typeof item.content === 'string') parts.push(item.content);
+  if (typeof item.reasoning_content === 'string') return normalizeReasoningContent(item.reasoning_content);
+  const rawParts = [];
+  if (typeof item.text === 'string') rawParts.push(item.text);
+  if (typeof item.content === 'string') rawParts.push(item.content);
   if (Array.isArray(item.content)) {
     for (const part of item.content) {
       if (typeof part === 'string') {
-        parts.push(part);
+        rawParts.push(part);
         continue;
       }
       if (!isObject(part)) continue;
       if (part.type === 'reasoning_text' || part.type === 'text' || part.type === 'output_text') {
-        parts.push(String(part.text ?? part.content ?? ''));
+        rawParts.push(String(part.text ?? part.content ?? ''));
       }
     }
   }
-  if (Array.isArray(item.summary)) {
-    for (const part of item.summary) {
-      if (typeof part === 'string') {
-        parts.push(part);
-        continue;
-      }
-      if (!isObject(part)) continue;
-      if (part.type === 'summary_text' || part.type === 'text') {
-        parts.push(String(part.text ?? part.content ?? ''));
-      }
-    }
-  }
-  return parts.filter(Boolean).join('');
+  const rawText = rawParts.filter(Boolean).join('');
+  return normalizeReasoningContent(rawText);
+}
+
+function normalizeReasoningContent(text) {
+  return String(text ?? '').replace(/\r\n?/g, '\n').trimEnd();
+}
+
+function normalizeReasoningDisplayText(text) {
+  const value = normalizeReasoningContent(text);
+  if (!value) return '';
+  const plain = value
+    .split('\n')
+    .map((line) => line
+      .replace(/^[ \t]{0,3}(?:`{3,}|~{3,}).*$/, '')
+      .replace(/^[ \t]{0,3}#{1,6}[ \t]+/, '')
+      .replace(/^[ \t]{0,3}>[ \t]?/, '')
+      .replace(/^[ \t]*[-*+][ \t]+(?:\[[ xX]\][ \t]+)?/, '\u2022 ')
+      .replace(/^[ \t]*(\d+)\.[ \t]+/, '$1) ')
+      .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/`([^`]*)`/g, '$1')
+      .replace(/(\*\*|__)([^*_]+)\1/g, '$2')
+      .replace(/(\*|_)([^*_]+)\1/g, '$2')
+      .replace(/[*_`~]/g, '')
+      .replace(/\\([\\`*_{}[\]()#+\-.!>])/g, '$1')
+      .trimEnd())
+    .join('\n');
+  return plain.replace(/^\n+/, '').trimEnd();
+}
+
+function reasoningDisplayText(text) {
+  return normalizeReasoningDisplayText(text);
 }
 
 function toolOutputContent(item) {
@@ -346,24 +413,28 @@ function extractMessagesFromResponsesInput(input) {
 
 function normalizeTool(tool) {
   if (!isObject(tool)) return tool;
+  if (tool.type === 'namespace') return null;
   if (typeof tool.type === 'string' && EMULATED_HOSTED_TOOL_TYPES.has(tool.type)) {
     return null;
   }
   if (tool.type === 'function' && isObject(tool.function)) {
+    const { namespace, ...fn } = tool.function;
     return {
-      ...tool,
-      function: {
-        ...tool.function,
-        name: sanitizeFunctionName(tool.function.name),
-        parameters: normalizeJsonSchemaObject(tool.function.parameters),
-      },
+      type: 'function',
+      function: omitUndefined({
+        ...fn,
+        name: encodeToolName(toolNamespace(tool), fn.name),
+        description: fn.description ?? tool.description,
+        parameters: normalizeJsonSchemaObject(fn.parameters ?? tool.parameters ?? tool.input_schema),
+        strict: fn.strict ?? tool.strict,
+      }),
     };
   }
   if (tool.type === 'function' || tool.type === 'custom' || tool.name || tool.parameters || tool.input_schema) {
     return {
       type: 'function',
       function: omitUndefined({
-        name: sanitizeFunctionName(tool.name || tool.type),
+        name: encodeToolName(toolNamespace(tool), toolBaseName(tool, tool.type)),
         description: tool.description,
         parameters: normalizeJsonSchemaObject(tool.parameters || tool.input_schema),
         strict: tool.strict,
@@ -371,6 +442,40 @@ function normalizeTool(tool) {
     };
   }
   return null;
+}
+
+function expandNamespaceTool(tool) {
+  if (!isObject(tool) || tool.type !== 'namespace') return [tool];
+  const namespace = tool.name || tool.namespace || tool.server_label;
+  const children = Array.isArray(tool.tools) ? tool.tools : [];
+  return children
+    .filter(isObject)
+    .map((child) => {
+      if (child.type === 'function' && isObject(child.function)) {
+        return {
+          ...child,
+          namespace: child.namespace || namespace,
+          function: {
+            ...child.function,
+            namespace: child.function.namespace || child.namespace || namespace,
+          },
+        };
+      }
+      return {
+        ...child,
+        namespace: child.namespace || namespace,
+      };
+    });
+}
+
+function expandTools(tools) {
+  if (!Array.isArray(tools)) return [];
+  return tools.flatMap(expandNamespaceTool);
+}
+
+function normalizeTools(tools) {
+  const normalized = expandTools(tools).map(normalizeTool).filter(Boolean);
+  return normalized.length ? normalized : undefined;
 }
 
 function normalizeJsonSchemaObject(schema) {
@@ -405,7 +510,7 @@ function normalizeToolChoice(toolChoice) {
   if (toolChoice.type === 'function' && toolChoice.name) {
     return {
       type: 'function',
-      function: { name: sanitizeFunctionName(toolChoice.name) },
+      function: { name: encodeToolName(toolNamespace(toolChoice), toolChoice.name) },
     };
   }
   if (toolChoice.type === 'function' && isObject(toolChoice.function)) {
@@ -413,7 +518,7 @@ function normalizeToolChoice(toolChoice) {
       ...toolChoice,
       function: {
         ...toolChoice.function,
-        name: sanitizeFunctionName(toolChoice.function.name),
+        name: encodeToolName(toolNamespace(toolChoice), toolChoice.function.name),
       },
     };
   }
@@ -424,7 +529,8 @@ function normalizeToolChoice(toolChoice) {
     return {
       type: 'function',
       function: {
-        name: sanitizeFunctionName(
+        name: encodeToolName(
+          toolNamespace(toolChoice),
           toolChoice.name ||
             toolChoice.tool_name ||
             toolChoice.toolName ||
@@ -435,6 +541,45 @@ function normalizeToolChoice(toolChoice) {
     };
   }
   return toolChoice;
+}
+
+function toolChoiceEntryName(entry) {
+  if (!isObject(entry)) return '';
+  if (entry.type === 'function' && entry.name) return encodeToolName(toolNamespace(entry), entry.name);
+  if (entry.type === 'function' && isObject(entry.function)) {
+    return encodeToolName(toolNamespace(entry), entry.function.name);
+  }
+  return encodeToolName(
+    toolNamespace(entry),
+    entry.name ||
+      entry.tool_name ||
+      entry.toolName ||
+      entry.server_label ||
+      entry.type,
+  );
+}
+
+function allowedToolNames(toolChoice) {
+  if (!isObject(toolChoice) || toolChoice.type !== 'allowed_tools') return null;
+  const entries = Array.isArray(toolChoice.tools)
+    ? toolChoice.tools
+    : Array.isArray(toolChoice.allowed_tools)
+    ? toolChoice.allowed_tools
+    : Array.isArray(toolChoice.names)
+    ? toolChoice.names.map((name) => ({ type: 'function', name }))
+    : [];
+  const names = entries.map(toolChoiceEntryName).filter(Boolean);
+  return names.length ? new Set(names) : null;
+}
+
+function applyAllowedTools(tools, toolChoice) {
+  const allowed = allowedToolNames(toolChoice);
+  if (!allowed || !Array.isArray(tools)) return tools;
+  const filtered = tools.filter((tool) => {
+    const name = tool?.type === 'function' ? tool.function?.name : '';
+    return !name || allowed.has(name);
+  });
+  return filtered.length ? filtered : undefined;
 }
 
 function unwrapJsonString(value) {
@@ -471,14 +616,99 @@ function coerceValueForSchema(value, schema) {
 
 function buildToolSchemas(tools) {
   const schemas = new Map();
-  if (!Array.isArray(tools)) return schemas;
-  for (const tool of tools) {
+  for (const tool of expandTools(tools)) {
     const normalizedTool = normalizeTool(tool);
     const fn = normalizedTool?.type === 'function' ? normalizedTool.function : null;
     if (!fn?.name) continue;
     schemas.set(fn.name, normalizeJsonSchemaObject(fn.parameters));
   }
   return schemas;
+}
+
+function buildToolNames(tools) {
+  const names = new Map();
+  for (const tool of expandTools(tools)) {
+    const namespace = toolNamespace(tool);
+    if (!namespace) continue;
+    const normalizedTool = normalizeTool(tool);
+    const fn = normalizedTool?.type === 'function' ? normalizedTool.function : null;
+    if (!fn?.name) continue;
+    names.set(fn.name, {
+      namespace: sanitizeFunctionName(namespace, 'namespace'),
+      name: sanitizeFunctionName(toolBaseName(tool, tool.type)),
+    });
+  }
+  return names;
+}
+
+function simplifyJsonSchemaDescriptions(schema) {
+  if (Array.isArray(schema)) return schema.map(simplifyJsonSchemaDescriptions);
+  if (!isObject(schema)) return schema;
+  const next = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'description' && typeof value === 'string') {
+      const description = shortenText(value, DEEPSEEK_SCHEMA_DESCRIPTION_CHARS);
+      if (description) next.description = description;
+      continue;
+    }
+    next[key] = isObject(value) || Array.isArray(value) ? simplifyJsonSchemaDescriptions(value) : value;
+  }
+  return next;
+}
+
+function readableToolName(name) {
+  return compactText(String(name || '').replace(/[_-]+/g, ' '));
+}
+
+function requiredParametersText(parameters) {
+  const required = Array.isArray(parameters?.required) ? parameters.required.filter((name) => typeof name === 'string') : [];
+  return required.length ? ` Required: ${required.join(', ')}.` : '';
+}
+
+function defaultDeepSeekToolDescription(name) {
+  const readable = readableToolName(name);
+  return compactText(`Call ${readable || name || 'this function'} when needed.`);
+}
+
+function simplifyToolForDeepSeek(tool) {
+  if (tool?.type !== 'function' || !isObject(tool.function)) return tool;
+  const fn = tool.function;
+  const parameters = simplifyJsonSchemaDescriptions(fn.parameters);
+  const requiredText = requiredParametersText(parameters);
+  const descriptionBudget = Math.max(32, DEEPSEEK_TOOL_DESCRIPTION_CHARS - requiredText.length);
+  const baseDescription = shortenText(fn.description, descriptionBudget) || defaultDeepSeekToolDescription(fn.name);
+  const description = shortenText(`${baseDescription}${requiredText}`, DEEPSEEK_TOOL_DESCRIPTION_CHARS);
+  return {
+    ...tool,
+    function: omitUndefined({
+      ...fn,
+      description,
+      parameters,
+    }),
+  };
+}
+
+function hasDeepSeekToolInstructions(messages) {
+  return messages.some((message) => message?.role === 'system' && toText(message.content).includes(DEEPSEEK_TOOL_INSTRUCTIONS_MARKER));
+}
+
+function addDeepSeekToolInstructions(messages, tools) {
+  if (!Array.isArray(tools) || !tools.length || hasDeepSeekToolInstructions(messages)) return messages;
+  if (!messages.length || messages[0]?.role !== 'system') {
+    return [{ role: 'system', content: DEEPSEEK_TOOL_INSTRUCTIONS }, ...messages];
+  }
+  return [
+    {
+      ...messages[0],
+      content: `${toText(messages[0].content)}\n\n${DEEPSEEK_TOOL_INSTRUCTIONS}`,
+    },
+    ...messages.slice(1),
+  ];
+}
+
+function adaptToolsForProvider(tools, provider) {
+  if (provider !== 'deepseek' || !Array.isArray(tools)) return tools;
+  return tools.map(simplifyToolForDeepSeek);
 }
 
 function normalizeToolCallArguments(name, argumentsText, toolSchema) {
@@ -505,7 +735,26 @@ function normalizeToolCallArguments(name, argumentsText, toolSchema) {
 
 function normalizeFunctionCallItemArguments(item, toolSchemas) {
   if (!item || item.type !== 'function_call') return;
-  item.arguments = normalizeToolCallArguments(item.name, item.arguments, toolSchemas?.get(item.name));
+  const encodedName = encodeToolName(item.namespace, item.name);
+  item.arguments = normalizeToolCallArguments(encodedName, item.arguments, toolSchemas?.get(encodedName));
+}
+
+function sanitizeToolCallsForChatCompletion(toolCalls) {
+  return toolCalls.map((toolCall) => {
+    if (!isObject(toolCall)) return toolCall;
+    const fn = isObject(toolCall.function) ? toolCall.function : {};
+    const { namespace, ...functionFields } = fn;
+    const name = fn.name || toolCall.name || 'tool_call';
+    const toolCallNamespace = toolCall.namespace || namespace || '';
+    return {
+      id: toolCall.id,
+      type: toolCall.type || 'function',
+      function: {
+        ...functionFields,
+        name: encodeToolName(toolCallNamespace, name),
+      },
+    };
+  });
 }
 
 function sanitizeMessageForChatCompletion(message, provider = 'generic') {
@@ -515,7 +764,7 @@ function sanitizeMessageForChatCompletion(message, provider = 'generic') {
     content: contentToChatContent(message.content),
   };
   if (message.name !== undefined) sanitized.name = message.name;
-  if (Array.isArray(message.tool_calls)) sanitized.tool_calls = message.tool_calls;
+  if (Array.isArray(message.tool_calls)) sanitized.tool_calls = sanitizeToolCallsForChatCompletion(message.tool_calls);
   if (message.tool_call_id !== undefined) sanitized.tool_call_id = message.tool_call_id;
   if (provider === 'deepseek' && message.role === 'assistant' && typeof message.reasoning_content === 'string') {
     sanitized.reasoning_content = message.reasoning_content;
@@ -543,32 +792,8 @@ function normalizeOutputTextPart(text, annotations = []) {
   };
 }
 
-function normalizeReasoningSummaryText(text) {
-  const value = String(text ?? '').replace(/\r\n?/g, '\n');
-  if (!value) return '';
-  const plain = value
-    .split('\n')
-    .map((line) => line
-      .replace(/^[ \t]{0,3}(?:`{3,}|~{3,}).*$/, '')
-      .replace(/^[ \t]{0,3}#{1,6}[ \t]+/, '')
-      .replace(/^[ \t]{0,3}>[ \t]?/, '')
-      .replace(/^[ \t]*[-*+][ \t]+(?:\[[ xX]\][ \t]+)?/, '\u2022 ')
-      .replace(/^[ \t]*(\d+)\.[ \t]+/, '$1) ')
-      .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-      .replace(/`([^`]*)`/g, '$1')
-      .replace(/(\*\*|__)([^*_]+)\1/g, '$2')
-      .replace(/(\*|_)([^*_]+)\1/g, '$2')
-      .replace(/[*_`~]/g, '')
-      .replace(/\\([\\`*_{}[\]()#+\-.!>])/g, '$1')
-      .trimEnd())
-    .join('\n');
-  return plain.replace(/^\n+/, '').trimEnd();
-}
-
 function reasoningSummaryText(text) {
-  const summary = normalizeReasoningSummaryText(text);
-  return summary ? `**Reasoning**\n\n${summary}` : '';
+  return reasoningDisplayText(text);
 }
 
 function normalizeSummaryTextPart(text) {
@@ -710,7 +935,7 @@ export function toChatCompletionsRequest(normalized, overrides = {}) {
     messages.push({ role: 'system', content: normalized.instructions });
   }
   messages.push(...normalized.messages);
-  const tools = Array.isArray(normalized.tools) ? normalized.tools.map(normalizeTool).filter(Boolean) : undefined;
+  const tools = applyAllowedTools(normalizeTools(normalized.tools), normalized.tool_choice);
   const request = {
     model: overrides.model || normalized.model,
     messages,
@@ -757,16 +982,14 @@ export function assistantMessageFromResponseOutput(output) {
     id: item.call_id || item.id,
     type: 'function',
     function: {
-      name: item.name,
+      name: encodeToolName(item.namespace, item.name),
       arguments: item.arguments || '',
     },
   }));
   if (toolCalls.length) assistant.tool_calls = toolCalls;
   const reasoningContent = reasoningItems
-    .map((item) => item.content || [])
-    .flat()
-    .filter((part) => part.type === 'reasoning_text')
-    .map((part) => part.text)
+    .map((item) => reasoningTextFromItem(item))
+    .filter(Boolean)
     .join('');
   if (reasoningContent) assistant.reasoning_content = reasoningContent;
   return assistant;
@@ -820,6 +1043,8 @@ export function toProviderChatCompletionsRequest(chatRequest, config = {}) {
   if (provider === 'deepseek') {
     delete request.reasoning_effort;
     delete request.parallel_tool_calls;
+    request.tools = adaptToolsForProvider(request.tools, provider);
+    request.messages = addDeepSeekToolInstructions(request.messages, request.tools);
     if (request.user !== undefined) {
       request.user_id = request.user;
       delete request.user;
@@ -955,6 +1180,7 @@ export function convertChatCompletionToResponses({ completion, model, previousRe
   const message = choice?.message || {};
   const content = chatContentToResponseOutputParts(message.content);
   const toolSchemas = buildToolSchemas(normalized?.tools);
+  const toolNames = buildToolNames(normalized?.tools);
   const output = [];
 
   if (content.length || message.tool_calls?.length) {
@@ -971,26 +1197,29 @@ export function convertChatCompletionToResponses({ completion, model, previousRe
   if (Array.isArray(message.tool_calls)) {
     for (const toolCall of message.tool_calls) {
       const callId = toolCall.id || generateId('call');
-      const item = {
+      const decoded = decodedToolName(toolCall.function?.name, toolNames);
+      const item = omitUndefined({
         type: 'function_call',
         id: callId,
         call_id: callId,
-        name: toolCall.function?.name,
+        name: decoded.name,
+        namespace: decoded.namespace,
         arguments: toolCall.function?.arguments || '',
         status: 'completed',
-      };
+      });
       normalizeFunctionCallItemArguments(item, toolSchemas);
       output.push(item);
     }
   }
 
   if (message.reasoning_content) {
-    const reasoningText = String(message.reasoning_content);
+    const reasoningText = normalizeReasoningContent(message.reasoning_content);
     output.unshift({
       type: 'reasoning',
       id: generateId('rs'),
       summary: [normalizeSummaryTextPart(reasoningSummaryText(reasoningText))],
-      content: [normalizeReasoningTextPart(reasoningText)],
+      content: [],
+      reasoning_content: reasoningText,
       encrypted_content: null,
       status: 'completed',
     });
@@ -1048,6 +1277,7 @@ export class ResponsesStreamMapper {
     this.reasoningItemAdded = false;
     this.streamedReasoningSummaryText = '';
     this.toolSchemas = buildToolSchemas(normalized?.tools);
+    this.toolNames = buildToolNames(normalized?.tools);
   }
 
   nextSequence() {
@@ -1114,7 +1344,7 @@ export class ResponsesStreamMapper {
         type: 'reasoning',
         status: 'in_progress',
         summary: [],
-        content: [normalizeReasoningTextPart('')],
+        content: this.emitReasoningText ? [normalizeReasoningTextPart('')] : [],
         encrypted_content: null,
       };
       this.output.push(this.reasoningItem);
@@ -1133,6 +1363,7 @@ export class ResponsesStreamMapper {
 
   ensureReasoningContentPart(events) {
     if (!this.emitReasoningText || this.reasoningContentAdded || !this.reasoningItem) return;
+    if (!this.reasoningItem.content[0]) this.reasoningItem.content[0] = normalizeReasoningTextPart('');
     this.reasoningContentAdded = true;
     events.push({
       type: 'response.content_part.added',
@@ -1142,6 +1373,19 @@ export class ResponsesStreamMapper {
       item_id: this.reasoningItem.id,
       part: snapshotResponsePart(this.reasoningItem.content[0]),
     });
+  }
+
+  syncReasoningItemContent() {
+    if (!this.reasoningItem) return;
+    const reasoningText = normalizeReasoningContent(this.reasoningText);
+    if (this.emitReasoningText) {
+      if (!this.reasoningItem.content[0]) this.reasoningItem.content[0] = normalizeReasoningTextPart('');
+      this.reasoningItem.content[0].text = reasoningText;
+    } else {
+      this.reasoningItem.content = [];
+    }
+    if (reasoningText) this.reasoningItem.reasoning_content = reasoningText;
+    else delete this.reasoningItem.reasoning_content;
   }
 
   appendReasoningSummaryDelta(events) {
@@ -1234,7 +1478,7 @@ export class ResponsesStreamMapper {
       const events = [];
       const added = this.ensureReasoningItem();
       if (added) events.push(added);
-      this.reasoningItem.content[0].text = this.reasoningText;
+      this.syncReasoningItemContent();
       this.appendReasoningSummaryDelta(events);
       return events;
     }
@@ -1245,12 +1489,12 @@ export class ResponsesStreamMapper {
           type: 'reasoning',
           status: 'in_progress',
           summary: [],
-          content: [normalizeReasoningTextPart('')],
+          content: this.emitReasoningText ? [normalizeReasoningTextPart('')] : [],
           encrypted_content: null,
         };
         this.output.push(this.reasoningItem);
       }
-      this.reasoningItem.content[0].text = this.reasoningText;
+      this.syncReasoningItemContent();
       return [];
     }
 
@@ -1258,7 +1502,7 @@ export class ResponsesStreamMapper {
     const added = this.ensureReasoningItem();
     if (added) events.push(added);
     this.ensureReasoningContentPart(events);
-    this.reasoningItem.content[0].text = this.reasoningText;
+    this.syncReasoningItemContent();
     this.appendReasoningSummaryDelta(events);
     if (this.emitReasoningText) {
       events.push({
@@ -1284,13 +1528,13 @@ export class ResponsesStreamMapper {
           type: 'function_call',
           status: 'in_progress',
           call_id: callId,
-          name: toolCall.function?.name || '',
+          ...decodedToolName(toolCall.function?.name, this.toolNames),
           arguments: '',
         };
         this.toolItems.set(index, item);
         this.output.push(item);
       }
-      if (toolCall.function?.name) item.name = toolCall.function.name;
+      if (toolCall.function?.name) Object.assign(item, decodedToolName(toolCall.function.name, this.toolNames));
       item.arguments += toolCall.function?.arguments || '';
       return [];
     }
@@ -1308,7 +1552,7 @@ export class ResponsesStreamMapper {
         type: 'function_call',
         status: 'in_progress',
         call_id: callId,
-        name: toolCall.function?.name || '',
+        ...decodedToolName(toolCall.function?.name, this.toolNames),
         arguments: '',
       };
       this.toolItems.set(index, item);
@@ -1320,7 +1564,7 @@ export class ResponsesStreamMapper {
         item: snapshotResponseItem(item),
       });
     }
-    if (toolCall.function?.name) item.name = toolCall.function.name;
+    if (toolCall.function?.name) Object.assign(item, decodedToolName(toolCall.function.name, this.toolNames));
     const delta = toolCall.function?.arguments || '';
     item.arguments += delta;
     if (delta) {
@@ -1347,7 +1591,7 @@ export class ResponsesStreamMapper {
 
       if (this.reasoningItem) {
         this.reasoningItem.status = status;
-        this.reasoningItem.content[0].text = this.reasoningText;
+        this.syncReasoningItemContent();
       }
       if (this.messageItem) {
         this.messageItem.status = status;
@@ -1421,7 +1665,8 @@ export class ResponsesStreamMapper {
 
       for (const item of this.toolItems.values()) {
         item.status = status;
-        item.arguments = normalizeToolCallArguments(item.name, item.arguments, this.toolSchemas.get(item.name));
+        const encodedName = encodeToolName(item.namespace, item.name);
+        item.arguments = normalizeToolCallArguments(encodedName, item.arguments, this.toolSchemas.get(encodedName));
         const outputIndex = this.output.indexOf(item);
         events.push({
           type: 'response.output_item.added',
@@ -1487,7 +1732,7 @@ export class ResponsesStreamMapper {
         this.reasoningSummaryAdded = true;
         this.reasoningItem.summary.push(normalizeSummaryTextPart(reasoningSummaryText(this.reasoningText)));
       }
-      this.reasoningItem.content[0].text = this.reasoningText;
+      this.syncReasoningItemContent();
       if (this.reasoningItem.summary[0]) {
         this.reasoningItem.summary[0].text = reasoningSummaryText(this.reasoningText);
       }
@@ -1587,7 +1832,7 @@ export class ResponsesStreamMapper {
           ...this.reasoningItem,
           status: 'in_progress',
           summary: [],
-          content: [normalizeReasoningTextPart('')],
+          content: this.emitReasoningText ? [normalizeReasoningTextPart('')] : [],
         }),
       });
     }
@@ -1640,7 +1885,7 @@ export class ResponsesStreamMapper {
       this.reasoningItem.summary[0].text = summaryText;
     }
     this.reasoningItem.status = status;
-    this.reasoningItem.content[0].text = this.reasoningText;
+    this.syncReasoningItemContent();
     return events;
   }
 
@@ -1648,7 +1893,7 @@ export class ResponsesStreamMapper {
     if (!this.reasoningItem || this.reasoningItemDone) return [];
     this.reasoningItemDone = true;
     this.reasoningItem.status = status;
-    this.reasoningItem.content[0].text = this.reasoningText;
+    this.syncReasoningItemContent();
     const summaryText = reasoningSummaryText(this.reasoningText);
     if (this.emitReasoningSummary && this.reasoningText && !this.reasoningSummaryAdded) {
       this.reasoningSummaryAdded = true;

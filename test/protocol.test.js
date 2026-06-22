@@ -76,6 +76,246 @@ test('converts Responses function tools to chat completions tools', () => {
   ]);
 });
 
+test('preserves namespaced multi-agent tools through the Chat bridge', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'delegate work',
+    tools: [
+      {
+        type: 'function',
+        namespace: 'multi_agent_v1',
+        name: 'spawn_agent',
+        description: 'Spawn a sub-agent',
+        parameters: {
+          type: 'object',
+          properties: { message: { type: 'string' } },
+          required: ['message'],
+        },
+      },
+      {
+        type: 'function',
+        namespace: 'multi_agent_v1',
+        name: 'wait_agent',
+        description: 'Wait for agents',
+        parameters: {
+          type: 'object',
+          properties: { targets: { type: 'array', items: { type: 'string' } } },
+          required: ['targets'],
+        },
+      },
+    ],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.deepEqual(chat.tools.map((tool) => tool.function.name), [
+    'multi_agent_v1__spawn_agent',
+    'multi_agent_v1__wait_agent',
+  ]);
+  assert.equal('namespace' in chat.tools[0], false);
+
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_multi_agent',
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_wait',
+                type: 'function',
+                function: {
+                  name: 'multi_agent_v1__wait_agent',
+                  arguments: '{"targets":["agent_1"]}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+  });
+  const toolCall = response.output.find((item) => item.type === 'function_call');
+  assert.equal(toolCall.namespace, 'multi_agent_v1');
+  assert.equal(toolCall.name, 'wait_agent');
+});
+
+test('expands Codex namespace tool groups before sending Chat tools', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'delegate work',
+    tools: [
+      {
+        type: 'namespace',
+        name: 'multi_agent_v1',
+        description: 'Tools for spawning and managing sub-agents.',
+        tools: [
+          {
+            type: 'function',
+            name: 'spawn_agent',
+            description: 'Spawn a sub-agent',
+            parameters: {
+              type: 'object',
+              properties: {
+                agent_type: { type: 'string' },
+                message: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          },
+          {
+            type: 'function',
+            name: 'resume_agent',
+            parameters: {
+              type: 'object',
+              properties: { id: { type: 'string' } },
+              required: ['id'],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: 'function',
+            name: 'close_agent',
+            parameters: {
+              type: 'object',
+              properties: { target: { type: 'string' } },
+              required: ['target'],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: 'function',
+            name: 'wait_agent',
+            parameters: {
+              type: 'object',
+              properties: {
+                targets: { type: 'array', items: { type: 'string' } },
+                timeout_ms: { type: 'number' },
+              },
+              required: ['targets'],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: 'function',
+            name: 'send_input',
+            parameters: {
+              type: 'object',
+              properties: {
+                target: { type: 'string' },
+                message: { type: 'string' },
+                interrupt: { type: 'boolean' },
+              },
+              required: ['target'],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+    ],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.deepEqual(chat.tools.map((tool) => tool.function.name), [
+    'multi_agent_v1__spawn_agent',
+    'multi_agent_v1__resume_agent',
+    'multi_agent_v1__close_agent',
+    'multi_agent_v1__wait_agent',
+    'multi_agent_v1__send_input',
+  ]);
+  assert.equal(chat.tools[0].function.description, 'Spawn a sub-agent');
+  assert.deepEqual(chat.tools[0].function.parameters.properties.message, { type: 'string' });
+  assert.deepEqual(chat.tools[3].function.parameters.required, ['targets']);
+
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_multi_agent_namespace',
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_spawn',
+                type: 'function',
+                function: {
+                  name: 'multi_agent_v1__spawn_agent',
+                  arguments: '{"agent_type":"explorer","message":"inspect protocol conversion"}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+  });
+  const toolCall = response.output.find((item) => item.type === 'function_call');
+  assert.equal(toolCall.namespace, 'multi_agent_v1');
+  assert.equal(toolCall.name, 'spawn_agent');
+  assert.equal(toolCall.arguments, '{"agent_type":"explorer","message":"inspect protocol conversion"}');
+});
+
+test('does not split ordinary double-underscore tool names as namespaces', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'use mcp',
+    tools: [
+      {
+        type: 'function',
+        name: 'mcp__context7__query_docs',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+        },
+      },
+    ],
+  });
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_mcp_name',
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_mcp',
+                type: 'function',
+                function: {
+                  name: 'mcp__context7__query_docs',
+                  arguments: '{"query":"hooks"}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+  });
+  const toolCall = response.output.find((item) => item.type === 'function_call');
+  assert.equal(toolCall.namespace, undefined);
+  assert.equal(toolCall.name, 'mcp__context7__query_docs');
+});
+
 test('converts Responses custom tools and drops unsupported hosted tools', () => {
   const normalized = normalizeResponsesRequest({
     model: 'deepseek-v4-flash',
@@ -181,6 +421,71 @@ test('maps provider request for DeepSeek', () => {
   assert.equal(request.user_id, 'codex-user');
   assert.deepEqual(request.response_format, { type: 'json_object' });
   assert.deepEqual(request.stream_options, { include_usage: true });
+});
+
+test('adapts DeepSeek-facing tools without changing internal tool mapping', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'delegate',
+    tools: [
+      {
+        type: 'namespace',
+        name: 'multi_agent_v1',
+        description: 'Tools for spawning and managing sub-agents.',
+        tools: [
+          {
+            type: 'function',
+            name: 'spawn_agent',
+            description: [
+              'Spawn a sub-agent to work on a task. This original Codex description can be long, detailed, and tailored for native Codex models.',
+              'DeepSeek should receive only a compact function description while the gateway keeps the original schema for Responses mapping.',
+            ].join(' '),
+            parameters: {
+              type: 'object',
+              properties: {
+                message: {
+                  type: 'string',
+                  description: 'The task prompt sent to the sub-agent, including all required context for independent execution.',
+                },
+              },
+              required: ['message'],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+    ],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.match(chat.tools[0].function.description, /original Codex description can be long/);
+
+  const request = toProviderChatCompletionsRequest(chat, { upstreamProvider: 'deepseek' });
+  assert.match(request.messages[0].content, /real callable functions available now/);
+  assert.match(request.messages[0].content, /tool_calls/);
+  assert.equal(request.messages[0].content.includes('pseudo XML'), true);
+  assert.equal(request.tools[0].function.name, 'multi_agent_v1__spawn_agent');
+  assert.ok(request.tools[0].function.description.length < chat.tools[0].function.description.length);
+  assert.match(request.tools[0].function.description, /Required: message/);
+  assert.ok(request.tools[0].function.parameters.properties.message.description.length < 170);
+});
+
+test('filters tools for Codex allowed_tools without forcing a call', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'use a tool',
+    tools: [
+      { type: 'function', name: 'lookup', parameters: { type: 'object', properties: {} } },
+      { type: 'function', namespace: 'multi_agent_v1', name: 'spawn_agent', parameters: { type: 'object', properties: {} } },
+    ],
+    tool_choice: {
+      type: 'allowed_tools',
+      mode: 'auto',
+      tools: [{ type: 'function', namespace: 'multi_agent_v1', name: 'spawn_agent' }],
+    },
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.deepEqual(chat.tools.map((tool) => tool.function.name), ['multi_agent_v1__spawn_agent']);
+  assert.equal(chat.tool_choice, 'auto');
 });
 
 test('normalizes Responses tool choice and DeepSeek stream options', () => {
@@ -438,6 +743,47 @@ test('preserves Responses reasoning items next to tool calls for DeepSeek histor
   assert.equal(request.messages[0].reasoning_content, 'need a lookup');
 });
 
+test('does not feed reasoning summary display text back into DeepSeek history when raw reasoning exists', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-pro',
+    input: [
+      {
+        type: 'reasoning',
+        content: [{ type: 'reasoning_text', text: 'raw thinking' }],
+        summary: [{ type: 'summary_text', text: '**Reasoning**\n\nraw thinking' }],
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_1',
+        name: 'lookup',
+        arguments: '{"q":"x"}',
+      },
+    ],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.equal(chat.messages[0].reasoning_content, 'raw thinking');
+});
+
+test('does not use reasoning summary as DeepSeek history when raw reasoning text is absent', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-pro',
+    input: [
+      {
+        type: 'reasoning',
+        summary: [{ type: 'summary_text', text: '**Reasoning**\n\nsummary fallback' }],
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_1',
+        name: 'lookup',
+        arguments: '{"q":"x"}',
+      },
+    ],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.equal('reasoning_content' in chat.messages[0], false);
+});
+
 test('maps DeepSeek v4 thinking aliases and Codex reasoning effort', () => {
   const noThinking = toProviderChatCompletionsRequest(
     {
@@ -564,13 +910,21 @@ test('maps DeepSeek reasoning content to Responses reasoning summary', () => {
     },
   });
   assert.equal(response.output[0].type, 'reasoning');
-  assert.deepEqual(response.output[0].summary, [{ type: 'summary_text', text: '**Reasoning**\n\nreasoning trace' }]);
-  assert.deepEqual(response.output[0].content, [{ type: 'reasoning_text', text: 'reasoning trace' }]);
+  assert.deepEqual(response.output[0].summary, [{ type: 'summary_text', text: 'reasoning trace' }]);
+  assert.deepEqual(response.output[0].content, []);
+  assert.equal(response.output[0].reasoning_content, 'reasoning trace');
   assert.equal(response.output[0].encrypted_content, null);
+  assert.equal(assistantMessageFromResponseOutput(response.output).reasoning_content, 'reasoning trace');
 });
 
-test('normalizes markdown markers in reasoning summary while preserving raw reasoning text', () => {
-  const reasoningText = '## Plan\n\n*First point*\n\n- **Inspect** files\n\n1. _Report_ findings';
+test('normalizes markdown in Codex summary without changing raw reasoning content', () => {
+  const reasoningText = [
+    'First thought.',
+    '',
+    '**Reasoning**',
+    '',
+    'The upstream model emitted this word itself.',
+  ].join('\n');
   const response = convertChatCompletionToResponses({
     responseId: 'resp_reasoning',
     model: 'deepseek-v4-pro',
@@ -591,8 +945,131 @@ test('normalizes markdown markers in reasoning summary while preserving raw reas
       ],
     },
   });
-  assert.deepEqual(response.output[0].summary, [{ type: 'summary_text', text: '**Reasoning**\n\nPlan\n\nFirst point\n\n\u2022 Inspect files\n\n1) Report findings' }]);
-  assert.deepEqual(response.output[0].content, [{ type: 'reasoning_text', text: reasoningText }]);
+  assert.equal(response.output[0].summary[0].text, 'First thought.\n\nReasoning\n\nThe upstream model emitted this word itself.');
+  assert.deepEqual(response.output[0].content, []);
+  assert.equal(response.output[0].reasoning_content, reasoningText);
+  assert.equal(assistantMessageFromResponseOutput(response.output).reasoning_content, reasoningText);
+});
+
+test('normalizes markdown summary display while preserving raw reasoning history', () => {
+  const reasoningText = '## Plan\n\n*First point*\n\n- **Inspect** files\n\n1. _Report_ findings';
+  const displayText = 'Plan\n\nFirst point\n\n\u2022 Inspect files\n\n1) Report findings';
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_reasoning',
+    model: 'deepseek-v4-pro',
+    previousResponseId: null,
+    normalized: normalizeResponsesRequest({ model: 'deepseek-v4-pro', input: 'think' }),
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            reasoning_content: reasoningText,
+            content: 'answer',
+          },
+          finish_reason: 'stop',
+        },
+      ],
+    },
+  });
+  assert.deepEqual(response.output[0].summary, [{ type: 'summary_text', text: displayText }]);
+  assert.deepEqual(response.output[0].content, []);
+  assert.equal(response.output[0].reasoning_content, reasoningText);
+  assert.equal(assistantMessageFromResponseOutput(response.output).reasoning_content, reasoningText);
+});
+
+test('normalizes numbered and bulleted reasoning markdown only in Codex summary display', () => {
+  const reasoningText = [
+    'From the search results:',
+    '',
+    '1. **Reddit user feedback on V4 creative writing** (r/DeepSeek):',
+    '   - The snippet says: "It relies heavily on abstract emotions."',
+    '',
+    '- **Keep bullet emphasis** unchanged.',
+  ].join('\n');
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_reasoning',
+    model: 'deepseek-v4-pro',
+    previousResponseId: null,
+    normalized: normalizeResponsesRequest({ model: 'deepseek-v4-pro', input: 'think' }),
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            reasoning_content: reasoningText,
+            content: 'answer',
+          },
+          finish_reason: 'stop',
+        },
+      ],
+    },
+  });
+  assert.equal(
+    response.output[0].summary[0].text,
+    [
+      'From the search results:',
+      '',
+      '1) Reddit user feedback on V4 creative writing (r/DeepSeek):',
+      '\u2022 The snippet says: "It relies heavily on abstract emotions."',
+      '',
+      '\u2022 Keep bullet emphasis unchanged.',
+    ].join('\n'),
+  );
+  assert.equal(response.output[0].reasoning_content, reasoningText);
+  assert.equal(assistantMessageFromResponseOutput(response.output).reasoning_content, reasoningText);
+});
+
+test('uses summary only for visible reasoning to avoid duplicate display', () => {
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_reasoning',
+    model: 'deepseek-v4-pro',
+    previousResponseId: null,
+    normalized: normalizeResponsesRequest({ model: 'deepseek-v4-pro', input: 'think' }),
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            reasoning_content: '1. Inspect\n2. Answer',
+            content: 'done',
+          },
+          finish_reason: 'stop',
+        },
+      ],
+    },
+  });
+  assert.equal(response.output[0].summary[0].text, '1) Inspect\n2) Answer');
+  assert.deepEqual(response.output[0].content, []);
+  assert.equal(response.output[0].reasoning_content, '1. Inspect\n2. Answer');
+});
+
+test('default reasoning stream exposes summary only while retaining raw history text', () => {
+  const mapper = new ResponsesStreamMapper({ responseId: 'resp_stream', model: 'deepseek-v4-flash' });
+  const events = [
+    ...mapper.mapChatEvent({
+      data: JSON.stringify({
+        choices: [{ delta: { reasoning_content: '1. Inspect' }, finish_reason: null }],
+      }),
+    }),
+    ...mapper.mapChatEvent({
+      data: JSON.stringify({
+        choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }],
+      }),
+    }),
+  ];
+  assert.equal(events.some((event) => event.type === 'response.reasoning_text.delta'), false);
+  assert.equal(events.some((event) => event.type === 'response.reasoning_text.done'), false);
+  assert.equal(events.at(-1).response.output[0].summary[0].text, '1) Inspect');
+  assert.deepEqual(events.at(-1).response.output[0].content, []);
+  assert.equal(events.at(-1).response.output[0].reasoning_content, '1. Inspect');
+  assert.equal(mapper.assistantMessage().reasoning_content, '1. Inspect');
 });
 
 test('maps chat completion stream chunks to Responses events', () => {
@@ -627,16 +1104,17 @@ test('maps chat completion stream chunks to Responses events', () => {
   assert.deepEqual(messageAdded.item.content, []);
    const reasoningDoneIndex = events.findIndex((event) => event.type === 'response.output_item.done' && event.item.type === 'reasoning');
    const messageAddedIndex = events.findIndex((event) => event.type === 'response.output_item.added' && event.item.type === 'message');
-   assert.ok(reasoningDoneIndex !== -1 && messageAddedIndex !== -1 && reasoningDoneIndex < messageAddedIndex);
+  assert.ok(reasoningDoneIndex !== -1 && messageAddedIndex !== -1 && reasoningDoneIndex < messageAddedIndex);
   assert.equal(events.at(-1).type, 'response.completed');
   assert.equal(events.at(-1).response.output_text, 'hi');
-  assert.equal(events.at(-1).response.output[0].summary[0].text, '**Reasoning**\n\nthink');
-  assert.equal(events.at(-1).response.output[0].content[0].text, 'think');
+  assert.equal(events.at(-1).response.output[0].summary[0].text, 'think');
+  assert.deepEqual(events.at(-1).response.output[0].content, []);
   assert.equal(events.at(-1).response.output[0].encrypted_content, null);
   assert.equal(events.at(-1).response.usage.input_tokens, 2);
   assert.equal(events.at(-1).response.usage.output_tokens, 1);
   assert.equal(events.at(-1).response.usage.total_tokens, 3);
   assert.equal(mapper.assistantMessage().content, 'hi');
+  assert.equal(mapper.assistantMessage().reasoning_content, 'think');
 });
 
 test('can stream raw reasoning text deltas when summary mode is disabled', () => {
@@ -702,8 +1180,9 @@ test('buffers late reasoning deltas instead of streaming them after visible outp
   assert.notEqual(messageDoneIndex, -1);
   assert.notEqual(reasoningDoneIndex, -1);
   assert.ok(messageDoneIndex < reasoningDoneIndex);
-  assert.equal(events.at(-1).response.output[1].summary[0].text, '**Reasoning**\n\nInspecting hidden tail');
-  assert.equal(events.at(-1).response.output[1].content[0].text, '**Inspecting** hidden tail');
+  assert.equal(events.at(-1).response.output[1].summary[0].text, 'Inspecting hidden tail');
+  assert.deepEqual(events.at(-1).response.output[1].content, []);
+  assert.equal(events.at(-1).response.output[1].reasoning_content, '**Inspecting** hidden tail');
 });
 
 test('can buffer assistant output until done so reasoning appears before final answer', () => {
@@ -740,9 +1219,10 @@ test('can buffer assistant output until done so reasoning appears before final a
   assert.notEqual(reasoningDoneIndex, -1);
   assert.notEqual(messageAddedIndex, -1);
   assert.ok(reasoningDoneIndex < messageAddedIndex);
-  assert.equal(events.at(-1).response.output[0].summary[0].text, '**Reasoning**\n\nPlan gather facts. Let me compile the report now.');
-  assert.equal(events.at(-1).response.output[0].content[0].text, '**Plan** gather facts. Let me compile the report now.');
+  assert.equal(events.at(-1).response.output[0].summary[0].text, 'Plan gather facts. Let me compile the report now.');
+  assert.deepEqual(events.at(-1).response.output[0].content, []);
   assert.equal(events.at(-1).response.output_text, 'Now I have enough context. I will write the report.');
+  assert.equal(mapper.assistantMessage().reasoning_content, '**Plan** gather facts. Let me compile the report now.');
 });
 
 test('buffers summary reasoning in one part with ordered deltas before final answer', () => {
@@ -788,11 +1268,11 @@ test('buffers summary reasoning in one part with ordered deltas before final ans
   assert.equal(summaryPartAdded.length, 1);
   assert.equal(summaryPartAdded[0].summary_index, 0);
   assert.ok(summaryDeltaEvents.length > 1);
-  assert.equal(summaryDeltaEvents[0].delta.startsWith('**Reasoning**'), true);
-  assert.equal(summaryDeltaEvents.map((event) => event.delta).join(''), `**Reasoning**\n\n${reasoningText}`);
+  assert.equal(summaryDeltaEvents[0].delta.startsWith('Opening line one.'), true);
+  assert.equal(summaryDeltaEvents.map((event) => event.delta).join(''), reasoningText);
   assert.equal(summaryDoneEvents.length, 1);
-  assert.equal(summaryDoneEvents[0].text, `**Reasoning**\n\n${reasoningText}`);
-  assert.equal(finalSummaryText, `**Reasoning**\n\n${reasoningText}`);
+  assert.equal(summaryDoneEvents[0].text, reasoningText);
+  assert.equal(finalSummaryText, reasoningText);
   assert.notEqual(reasoningDoneIndex, -1);
   assert.notEqual(messageAddedIndex, -1);
   assert.ok(reasoningDoneIndex < messageAddedIndex);
@@ -832,13 +1312,14 @@ test('streams buffered reasoning summary before final completion while holding v
   assert.notEqual(reasoningDoneIndex, -1);
   assert.ok(summaryDeltaIndex < reasoningDoneIndex);
   assert.ok(reasoningDoneIndex < messageAddedIndex);
-  assert.equal(events.at(-1).response.output[0].summary[0].text, '**Reasoning**\n\nFirst thought.');
-  assert.equal(events.at(-1).response.output[0].content[0].text, 'First thought. ');
+  assert.equal(events.at(-1).response.output[0].summary[0].text, 'First thought.');
+  assert.deepEqual(events.at(-1).response.output[0].content, []);
   assert.equal(events.at(-1).response.output_text, 'final answer');
 });
 
-test('streams normalized summary text for markdown-heavy reasoning while keeping raw reasoning content', () => {
+test('streams normalized reasoning summary while keeping raw reasoning content', () => {
   const reasoningText = '## Plan\n\n*First point*\n\n- **Inspect** files\n\n1. _Report_ findings';
+  const displayText = 'Plan\n\nFirst point\n\n\u2022 Inspect files\n\n1) Report findings';
   const mapper = new ResponsesStreamMapper({
     responseId: 'resp_stream',
     model: 'deepseek-v4-flash',
@@ -865,9 +1346,11 @@ test('streams normalized summary text for markdown-heavy reasoning while keeping
     .filter((event) => event.type === 'response.reasoning_summary_text.delta')
     .map((event) => event.delta)
     .join('');
-  assert.equal(summaryText, '**Reasoning**\n\nPlan\n\nFirst point\n\n\u2022 Inspect files\n\n1) Report findings');
-  assert.equal(events.at(-1).response.output[0].summary.map((part) => part.text).join(''), '**Reasoning**\n\nPlan\n\nFirst point\n\n\u2022 Inspect files\n\n1) Report findings');
-  assert.equal(events.at(-1).response.output[0].content[0].text, reasoningText);
+  assert.equal(summaryText, displayText);
+  assert.equal(events.at(-1).response.output[0].summary.map((part) => part.text).join(''), displayText);
+  assert.deepEqual(events.at(-1).response.output[0].content, []);
+  assert.equal(events.at(-1).response.output[0].reasoning_content, reasoningText);
+  assert.equal(mapper.assistantMessage().reasoning_content, reasoningText);
 });
 
 test('flushes buffered raw reasoning completely before final answer', () => {
@@ -979,6 +1462,91 @@ test('normalizes stringified shell command arrays in buffered tool calls', () =>
   ];
   const done = events.find((event) => event.type === 'response.function_call_arguments.done');
   assert.equal(done.arguments, '{"command":["powershell.exe","-Command","Get-Content package.json"]}');
+});
+
+test('streams namespace tool group calls back with namespace restored', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'delegate work',
+    tools: [
+      {
+        type: 'namespace',
+        name: 'multi_agent_v1',
+        tools: [
+          {
+            type: 'function',
+            name: 'send_input',
+            parameters: {
+              type: 'object',
+              properties: {
+                target: { type: 'string' },
+                message: { type: 'string' },
+              },
+              required: ['target'],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+    ],
+  });
+  const mapper = new ResponsesStreamMapper({
+    responseId: 'resp_stream',
+    model: 'deepseek-v4-flash',
+    normalized,
+  });
+  const events = [
+    ...mapper.mapChatEvent({
+      data: JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_send',
+                  type: 'function',
+                  function: {
+                    name: 'multi_agent_v1__send_input',
+                    arguments: '{"target":"agent_1"',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+    }),
+    ...mapper.mapChatEvent({
+      data: JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    arguments: ',"message":"continue"}',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+    }),
+    ...mapper.mapChatEvent({
+      data: JSON.stringify({
+        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      }),
+    }),
+  ];
+  const outputDone = events.find((event) => event.type === 'response.output_item.done' && event.item.type === 'function_call');
+  assert.equal(outputDone.item.namespace, 'multi_agent_v1');
+  assert.equal(outputDone.item.name, 'send_input');
+  assert.equal(outputDone.item.arguments, '{"target":"agent_1","message":"continue"}');
 });
 
 test('normalizes stringified command arrays from Responses input_schema tools', () => {

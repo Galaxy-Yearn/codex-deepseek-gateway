@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
-import { generateId, safeJsonParse } from './common.js';
+import { generateId, safeJsonParse, toText } from './common.js';
 import { listModels, mergeModelLists, normalizeModelList } from './model-map.js';
 import {
   assistantMessageFromResponseOutput,
@@ -21,11 +21,15 @@ import {
   containsWebSearchTool,
   executeWebSearchCalls,
   hasAnyToolCalls,
+  hasKnownExternalToolCalls,
+  hasUnknownExternalToolCalls,
   INTERNAL_WEB_SEARCH_TOOL,
   maxWebSearchRounds,
   prepareWebSearchRequest,
+  removeWebSearchInstructions,
   shouldIncludeSearchSources,
   shouldContinueWebSearchLoop,
+  knownExternalToolCallsCompletion,
   unhandledToolMessagesFromCompletion,
 } from './web-search-emulator.js';
 
@@ -200,16 +204,82 @@ function toolCallsToFinalAnswerRequest(request) {
     ...request,
     tool_choice: 'none',
     tools: undefined,
-    messages: request.messages.concat({
+    messages: removeWebSearchInstructions(request.messages).concat({
       role: 'user',
       content: [
-        'Do not call more tools.',
+        'Web tools are not available now.',
         'Use the completed tool results already provided in this conversation.',
-        'Give the final answer now.',
+        'Give the final answer now as visible assistant message content.',
+        'Do not write tool calls, DSML, XML, or JSON tool-call blocks in the answer.',
         'If the available tool results are incomplete, say what is missing and answer only what the provided context supports.',
       ].join(' '),
     }),
   };
+}
+
+function completionMessage(completion) {
+  const choice = Array.isArray(completion?.choices) ? completion.choices[0] : null;
+  return choice?.message || null;
+}
+
+function hasVisibleAssistantContent(completion) {
+  return Boolean(toText(completionMessage(completion)?.content).trim());
+}
+
+function pseudoToolCallContentReason(completion) {
+  const text = toText(completionMessage(completion)?.content).trim();
+  if (!text) return null;
+  if (/<[^>]*DSML[^>]*tool_calls/i.test(text)) return 'pseudo_tool_call_text_after_web_limit';
+  if (/<[^>]*invoke\s+name\s*=/i.test(text)) return 'pseudo_tool_call_text_after_web_limit';
+  if (/^\s*```(?:json|xml|dsml)?\s*[\s\S]*\btool_calls\b/i.test(text)) return 'pseudo_tool_call_text_after_web_limit';
+  if (/^\s*\{[\s\S]*"tool_calls"\s*:/i.test(text)) return 'pseudo_tool_call_text_after_web_limit';
+  return null;
+}
+
+function finalAnswerIncompleteReason(completion) {
+  if (!hasVisibleAssistantContent(completion)) return 'no_visible_assistant_content';
+  return pseudoToolCallContentReason(completion);
+}
+
+function hasWebSearchContext(searches, openedPages) {
+  return searches.length > 0 || openedPages.length > 0;
+}
+
+function completionWithGatewayIncompleteMessage(completion, reason = 'no_visible_assistant_content') {
+  const next = completion == null ? {} : JSON.parse(JSON.stringify(completion));
+  if (!Array.isArray(next.choices) || !next.choices.length) {
+    next.choices = [{ index: 0, message: { role: 'assistant' }, finish_reason: 'stop' }];
+  }
+  const choice = next.choices[0];
+  const previousMessage = choice.message || {};
+  const content = reason === 'pseudo_tool_call_text_after_web_limit'
+    ? 'Gateway incomplete: after web tools were disabled, the model wrote a tool call as text instead of producing a final answer.'
+    : 'Gateway incomplete: the model did not produce visible assistant content after web tool results and a final-answer request.';
+  choice.message = {
+    role: 'assistant',
+    content,
+  };
+  if (typeof previousMessage.reasoning_content === 'string') {
+    choice.message.reasoning_content = previousMessage.reasoning_content;
+  }
+  choice.finish_reason = 'stop';
+  return next;
+}
+
+function completionWithoutToolCalls(completion) {
+  const message = completionMessage(completion);
+  if (!Array.isArray(message?.tool_calls) || !message.tool_calls.length) return completion;
+  const next = JSON.parse(JSON.stringify(completion));
+  const nextChoice = Array.isArray(next.choices) ? next.choices[0] : null;
+  if (nextChoice?.message) delete nextChoice.message.tool_calls;
+  if (nextChoice?.finish_reason === 'tool_calls') nextChoice.finish_reason = 'stop';
+  return next;
+}
+
+function markPayloadIncomplete(payload, reason) {
+  payload.status = 'incomplete';
+  payload.incomplete_details = { reason };
+  return payload;
 }
 
 async function callUpstreamJson({ upstreamRequest, config }) {
@@ -233,8 +303,28 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
   const openedPages = [];
   let finalCompletion = null;
   let finalResponse = null;
-  let forcedFinalAnswer = false;
+  let incompleteReason = null;
   const maxRounds = maxWebSearchRounds(searchConfig);
+
+  async function requestFinalAnswer(baseRequest) {
+    currentChatRequest = toolCallsToFinalAnswerRequest(baseRequest);
+    const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
+    if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
+    const { response, data } = await callUpstreamJson({
+      upstreamRequest: disableStreaming(upstreamRequest),
+      config,
+    });
+    finalResponse = response;
+    if (!response.ok) return { ok: false, status: response.status, data };
+    finalCompletion = completionWithoutToolCalls(data);
+    const reason = finalAnswerIncompleteReason(finalCompletion);
+    if (reason) {
+      incompleteReason = reason;
+      finalCompletion = completionWithGatewayIncompleteMessage(finalCompletion, reason);
+    }
+    completions.push(finalCompletion);
+    return null;
+  }
 
   for (let round = 0; round <= maxRounds + 1; round += 1) {
     const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
@@ -248,19 +338,37 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
     completions.push(data);
     finalCompletion = data;
 
-    if (!state.enabled || !shouldContinueWebSearchLoop(data) || round >= maxRounds) {
-      if (state.enabled && hasAnyToolCalls(data) && !forcedFinalAnswer) {
-        const unsupportedMessages = unhandledToolMessagesFromCompletion(data);
-        currentChatRequest = toolCallsToFinalAnswerRequest({
+    if (state.enabled && hasKnownExternalToolCalls(data, currentChatRequest.tools)) {
+      finalCompletion = knownExternalToolCallsCompletion(data, currentChatRequest.tools);
+      completions[completions.length - 1] = finalCompletion;
+      break;
+    }
+
+    if (!state.enabled) {
+      break;
+    }
+
+    const wantsInternalWeb = shouldContinueWebSearchLoop(data);
+    const hasToolCalls = hasAnyToolCalls(data);
+
+    if (!wantsInternalWeb || round >= maxRounds) {
+      if (hasToolCalls && hasUnknownExternalToolCalls(data, currentChatRequest.tools)) {
+        const unsupportedMessages = unhandledToolMessagesFromCompletion(data, undefined, {
+          onlyUnknownExternal: true,
+          tools: currentChatRequest.tools,
+        });
+        const finalAnswerError = await requestFinalAnswer({
           ...currentChatRequest,
           messages: currentChatRequest.messages.concat(unsupportedMessages),
         });
-        forcedFinalAnswer = true;
-        if (unsupportedMessages.length) {
-          finalCompletion = null;
-          completions.pop();
-        }
-        continue;
+        if (finalAnswerError) return finalAnswerError;
+        break;
+      }
+
+      if (wantsInternalWeb || (!hasToolCalls && hasWebSearchContext(searches, openedPages) && !hasVisibleAssistantContent(data))) {
+        const finalAnswerError = await requestFinalAnswer(currentChatRequest);
+        if (finalAnswerError) return finalAnswerError;
+        break;
       }
       break;
     }
@@ -298,6 +406,7 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
     searches,
     openedPages,
     chatRequest: currentChatRequest,
+    incompleteReason,
   };
 }
 
@@ -639,6 +748,7 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
         normalized,
         responseId,
       }), loop.searches, normalized, loop.openedPages);
+      if (loop.incompleteReason) markPayloadIncomplete(payload, loop.incompleteReason);
       const assistantMessage = assistantMessageFromResponseOutput(payload.output);
 
       nextSession.history.push({

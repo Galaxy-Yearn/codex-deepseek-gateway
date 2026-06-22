@@ -67,5 +67,8 @@ test('formats Firecrawl response as compact model-readable page text', () => {
   assert.match(response.content, /Find in page query: Firecrawl support/);
   assert.match(response.content, /Relevant page matches:/);
   assert.match(response.content, /Page text excerpt:/);
+  assert.match(response.content, /Link 1: Docs/);
+  assert.match(response.content, /include the page title and URL/);
+  assert.doesNotMatch(response.content, /source number|Assigned source/i);
   assert.doesNotMatch(response.content, /localhost|<b>|\*\*/);
 });

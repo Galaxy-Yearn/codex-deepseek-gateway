@@ -322,7 +322,9 @@ test('emulates Codex web_search with Tavily for non-streaming Responses requests
     assert.equal(upstreamBodies[0].stream, false);
     assert.equal(upstreamBodies[1].messages.at(-1).role, 'tool');
     assert.match(upstreamBodies[1].messages.at(-1).content, /Search query: Codex web search Tavily/);
-    assert.match(upstreamBodies[1].messages.at(-1).content, /\[1\] Tavily Search API/);
+    assert.match(upstreamBodies[1].messages.at(-1).content, /Source 1: Tavily Search API/);
+    assert.match(upstreamBodies[1].messages.at(-1).content, /source title and URL/);
+    assert.doesNotMatch(upstreamBodies[1].messages.at(-1).content, /cite them as \[1\].*Do not write Markdown links or raw source URLs/);
     assert.doesNotMatch(upstreamBodies[1].messages.at(-1).content, /RAW CONTENT SHOULD NOT REACH MODEL|raw_content/);
   } finally {
     await close(proxy);
@@ -438,6 +440,7 @@ test('emulates Codex web_search with progressive Responses SSE when client reque
     assert.match(text, /event: response\.reasoning_summary_part\.added/);
     assert.match(text, /event: response\.reasoning_summary_text\.delta/);
     assert.match(text, /Checked the search result before answering\./);
+    assert.ok(text.indexOf('event: response.reasoning_summary_text.delta') < text.indexOf('event: response.output_text.delta'));
     assert.match(text, /event: response\.output_text\.annotation\.added/);
     assert.match(text, /"type":"url_citation"/);
     assert.match(text, /"url":"https:\/\/example\.com\/source"/);
@@ -635,7 +638,7 @@ test('adds Firecrawl opened page excerpts to Tavily-backed web_search', async ()
     const toolContent = upstreamBodies[1].messages.at(-1).content;
     assert.match(toolContent, /Opened page excerpt:/);
     assert.match(toolContent, /Opened page text for DeepSeek/);
-    assert.match(toolContent, /\[1\.L1\] Nested Link/);
+    assert.match(toolContent, /Source 1 link 1: Nested Link/);
     assert.equal(body.output[0].type, 'web_search_call');
     assert.deepEqual(body.output[1].content[0].annotations, [
       {
@@ -688,6 +691,7 @@ test('lets DeepSeek explicitly open a page through Firecrawl during web_search e
     }
     assert.equal(upstreamBodies[1].messages.at(-1).tool_call_id, 'call_open');
     assert.match(upstreamBodies[1].messages.at(-1).content, /Opened page: https:\/\/example\.com\/page/);
+    assert.doesNotMatch(upstreamBodies[1].messages.at(-1).content, /Assigned source number|source number/i);
     res.end(JSON.stringify({
       choices: [{ message: { role: 'assistant', content: 'The page says pricing changed [1].' }, finish_reason: 'stop' }],
     }));
@@ -1227,9 +1231,215 @@ test('does not pass required web_search tool_choice to DeepSeek', async () => {
   }
 });
 
-test('does not leak internal search function calls when search loop reaches max rounds', async () => {
-  const upstream = http.createServer(async (_req, res) => {
+test('passes through real external tool calls while web search emulation is enabled', async () => {
+  const upstreamBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstreamBodies.push(body);
     res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_search',
+                type: 'function',
+                function: {
+                  name: 'tavily_search',
+                  arguments: '{"query":"OpenAI news"}',
+                },
+              },
+              {
+                id: 'call_spawn',
+                type: 'function',
+                function: {
+                  name: 'multi_agent_v1__spawn_agent',
+                  arguments: '{"message":"Find two current OpenAI news items."}',
+                },
+              },
+              {
+                id: 'call_unknown',
+                type: 'function',
+                function: {
+                  name: 'unknown_local_tool',
+                  arguments: '{"q":"ignored"}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: 'https://tavily.invalid',
+      tavilyWebSearchEnabled: true,
+    },
+    sessions: new SessionStore(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'Assign this to a sub-agent and use web if needed.',
+        tools: [
+          { type: 'web_search' },
+          {
+            type: 'namespace',
+            name: 'multi_agent_v1',
+            tools: [
+              {
+                type: 'function',
+                name: 'spawn_agent',
+                description: 'Spawn a sub-agent for delegated work.',
+                parameters: {
+                  type: 'object',
+                  properties: { message: { type: 'string' } },
+                  required: ['message'],
+                  additionalProperties: false,
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(upstreamBodies.length, 1);
+    assert.equal(upstreamBodies[0].tools.some((tool) => tool.function?.name === 'tavily_search'), true);
+    assert.equal(upstreamBodies[0].tools.some((tool) => tool.function?.name === 'multi_agent_v1__spawn_agent'), true);
+    assert.match(upstreamBodies[0].messages[0].content, /real callable functions available now/);
+    const toolCall = body.output.find((item) => item.type === 'function_call');
+    assert.equal(toolCall.namespace, 'multi_agent_v1');
+    assert.equal(toolCall.name, 'spawn_agent');
+    assert.equal(body.output.some((item) => item.type === 'function_call' && item.name === 'tavily_search'), false);
+    assert.equal(body.output.some((item) => item.type === 'function_call' && item.name === 'unknown_local_tool'), false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('does not enable Tavily when Codex allowed_tools excludes web search', async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    upstreamBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_lookup',
+                type: 'function',
+                function: { name: 'lookup', arguments: '{"q":"docs"}' },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: 'https://tavily.invalid',
+      tavilyWebSearchEnabled: true,
+    },
+    sessions: new SessionStore(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'lookup only',
+        tools: [
+          { type: 'web_search' },
+          {
+            type: 'function',
+            name: 'lookup',
+            parameters: {
+              type: 'object',
+              properties: { q: { type: 'string' } },
+              required: ['q'],
+              additionalProperties: false,
+            },
+          },
+        ],
+        tool_choice: {
+          type: 'allowed_tools',
+          mode: 'auto',
+          tools: [{ type: 'function', name: 'lookup' }],
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamBody.tools.map((tool) => tool.function?.name), ['lookup']);
+    assert.equal(upstreamBody.messages[0].content.includes('For live web information, use tavily_search.'), false);
+    const body = await response.json();
+    const toolCall = body.output.find((item) => item.type === 'function_call');
+    assert.equal(toolCall.name, 'lookup');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('does not leak internal search function calls when search loop reaches max rounds', async () => {
+  const upstreamBodies = [];
+  const upstream = http.createServer(async (_req, res) => {
+    const chunks = [];
+    for await (const chunk of _req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstreamBodies.push(body);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (upstreamBodies.length === 3) {
+      assert.equal(body.tool_choice, 'none');
+      assert.equal(body.tools, undefined);
+      assert.equal(body.messages.some((message) => String(message.content || '').includes('For live web information, use tavily_search.')), false);
+      assert.equal(body.messages.at(-1).role, 'user');
+      assert.match(body.messages.at(-1).content, /Web tools are not available now/);
+      assert.equal(body.messages.some((message) => message.role === 'tool'), true);
+      res.end(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'Final answer from the completed search [1].' }, finish_reason: 'stop' }],
+      }));
+      return;
+    }
     res.end(JSON.stringify({
       choices: [
         {
@@ -1267,7 +1477,7 @@ test('does not leak internal search function calls when search loop reaches max 
       tavilyApiKey: 'tvly-test',
       tavilyBaseUrl: tavilyUrl,
       tavilyWebSearchEnabled: true,
-      tavilyMaxSearchRounds: 0,
+      tavilyMaxSearchRounds: 1,
     },
     sessions: new SessionStore(),
   });
@@ -1285,8 +1495,296 @@ test('does not leak internal search function calls when search loop reaches max 
     });
     assert.equal(response.status, 200);
     const body = await response.json();
+    assert.equal(upstreamBodies.length, 3);
     assert.equal(body.output[0].type, 'web_search_call');
+    assert.equal(body.output[1].type, 'message');
+    assert.equal(body.output[1].content[0].text, 'Final answer from the completed search [1].');
     assert.equal(body.output.some((item) => item.type === 'function_call' && item.name === 'tavily_search'), false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+    await close(tavily);
+  }
+});
+
+test('marks web search response incomplete when final answer turn writes pseudo tool calls', async () => {
+  const upstreamBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstreamBodies.push(body);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (upstreamBodies.length === 3) {
+      assert.equal(body.tool_choice, 'none');
+      assert.equal(body.tools, undefined);
+      assert.match(body.messages.at(-1).content, /Do not write tool calls/);
+      res.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              reasoning_content: 'I need another search, but tools are disabled.',
+              content: [
+                '<｜｜DSML｜｜tool_calls>',
+                '<｜｜DSML｜｜invoke name="tavily_search">',
+                '{"query":"repeat"}',
+                '</｜｜DSML｜｜invoke>',
+              ].join('\n'),
+            },
+            finish_reason: 'stop',
+          },
+        ],
+      }));
+      return;
+    }
+    res.end(JSON.stringify({
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_search',
+                type: 'function',
+                function: { name: 'tavily_search', arguments: '{"query":"repeat"}' },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    }));
+  });
+  const tavily = http.createServer(async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      results: [{ title: 'Source', url: 'https://example.com/source', content: 'Snippet' }],
+    }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const tavilyUrl = await listen(tavily);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: tavilyUrl,
+      tavilyWebSearchEnabled: true,
+      tavilyMaxSearchRounds: 1,
+    },
+    sessions: new SessionStore(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'search',
+        tools: [{ type: 'web_search' }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(upstreamBodies.length, 3);
+    assert.equal(body.status, 'incomplete');
+    assert.equal(body.incomplete_details.reason, 'pseudo_tool_call_text_after_web_limit');
+    assert.match(body.output_text, /Gateway incomplete/);
+    assert.equal(body.output_text.includes('DSML'), false);
+    assert.equal(body.output_text.includes('tavily_search'), false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+    await close(tavily);
+  }
+});
+
+test('allows model-driven multi-round web search before final answer', async () => {
+  const upstreamBodies = [];
+  const searchQueries = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstreamBodies.push(body);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (upstreamBodies.length <= 4) {
+      res.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [
+                {
+                  id: `call_search_${upstreamBodies.length}`,
+                  type: 'function',
+                  function: {
+                    name: 'tavily_search',
+                    arguments: JSON.stringify({ query: `search round ${upstreamBodies.length}` }),
+                  },
+                },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      }));
+      return;
+    }
+    res.end(JSON.stringify({
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: 'Final answer after four searches [1].',
+          },
+          finish_reason: 'stop',
+        },
+      ],
+    }));
+  });
+  const tavily = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    searchQueries.push(body.query);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      results: [{ title: body.query, url: `https://example.com/${searchQueries.length}`, content: `Snippet ${searchQueries.length}` }],
+    }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const tavilyUrl = await listen(tavily);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: tavilyUrl,
+      tavilyWebSearchEnabled: true,
+      tavilyMaxSearchRounds: 8,
+    },
+    sessions: new SessionStore(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'search until you have enough context',
+        tools: [{ type: 'web_search' }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(upstreamBodies.length, 5);
+    assert.deepEqual(searchQueries, ['search round 1', 'search round 2', 'search round 3', 'search round 4']);
+    assert.equal(body.output.filter((item) => item.type === 'web_search_call').length, 4);
+    assert.equal(body.output.at(-1).content[0].text, 'Final answer after four searches [1].');
+    assert.notEqual(upstreamBodies.at(-1).tool_choice, 'none');
+    assert.equal(upstreamBodies.at(-1).tools.some((tool) => tool.function?.name === 'tavily_search'), true);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+    await close(tavily);
+  }
+});
+
+test('marks web search response incomplete when final answer turn has no visible content', async () => {
+  const upstreamBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstreamBodies.push(body);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (upstreamBodies.length === 1) {
+      res.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [
+                {
+                  id: 'call_search',
+                  type: 'function',
+                  function: { name: 'tavily_search', arguments: '{"query":"latest docs"}' },
+                },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      }));
+      return;
+    }
+    if (upstreamBodies.length === 2) {
+      res.end(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: '', reasoning_content: 'Now I can summarize.' }, finish_reason: 'stop' }],
+      }));
+      return;
+    }
+    assert.equal(body.tool_choice, 'none');
+    assert.equal(body.tools, undefined);
+    res.end(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: '', reasoning_content: 'Still only reasoning.' }, finish_reason: 'stop' }],
+    }));
+  });
+  const tavily = http.createServer(async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      results: [{ title: 'Docs', url: 'https://example.com/docs', content: 'Snippet' }],
+    }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const tavilyUrl = await listen(tavily);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: tavilyUrl,
+      tavilyWebSearchEnabled: true,
+      tavilyMaxSearchRounds: 2,
+    },
+    sessions: new SessionStore(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'search then answer',
+        tools: [{ type: 'web_search' }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(upstreamBodies.length, 3);
+    assert.equal(body.status, 'incomplete');
+    assert.equal(body.incomplete_details.reason, 'no_visible_assistant_content');
+    assert.match(body.output_text, /Gateway incomplete/);
   } finally {
     await close(proxy);
     await close(upstream);

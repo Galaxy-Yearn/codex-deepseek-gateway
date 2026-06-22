@@ -153,7 +153,7 @@ export function formatTavilySearchResult({ query, answer = '', results = [], err
   if (results.length) {
     lines.push('Sources:');
     for (const result of results) {
-      lines.push(`[${result.index}] ${result.title}`);
+      lines.push(`Source ${result.index}: ${result.title}`);
       if (result.url) lines.push(`URL: ${result.url}`);
       if (result.publishedDate) lines.push(`Date: ${result.publishedDate}`);
       if (result.score !== undefined) lines.push(`Score: ${result.score}`);
@@ -172,7 +172,7 @@ export function formatTavilySearchResult({ query, answer = '', results = [], err
         if (Array.isArray(result.page.links) && result.page.links.length) {
           lines.push('Opened page links:');
           for (const [linkIndex, link] of result.page.links.entries()) {
-            lines.push(`[${result.index}.L${linkIndex + 1}] ${cleanText(link.title || link.url, 180)}`);
+            lines.push(`Source ${result.index} link ${linkIndex + 1}: ${cleanText(link.title || link.url, 180)}`);
             if (link.url) lines.push(`URL: ${link.url}`);
           }
         }
@@ -182,7 +182,7 @@ export function formatTavilySearchResult({ query, answer = '', results = [], err
     lines.push('No useful search results were returned.');
   }
 
-  lines.push('Use only these sources for web-backed claims and cite them as [1], [2], etc. Do not write Markdown links or raw source URLs in the final answer.');
+  lines.push('Use only these sources for web-backed claims. In the final answer, include each relevant source title and URL so the user can open it.');
   const text = lines.filter(Boolean).join('\n');
   const maxChars = Number(config.tavilyResultMaxChars) || DEFAULT_TOTAL_CHARS;
   if (text.length <= maxChars) return text;
