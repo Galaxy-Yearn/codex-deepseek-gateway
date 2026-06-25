@@ -747,6 +747,7 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
         previousResponseId,
         normalized,
         responseId,
+        config,
       }), loop.searches, normalized, loop.openedPages);
       if (loop.incompleteReason) markPayloadIncomplete(payload, loop.incompleteReason);
       const assistantMessage = assistantMessageFromResponseOutput(payload.output);
@@ -802,6 +803,7 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
         previousResponseId,
         normalized,
         responseId,
+        config,
       });
       nextSession.history.push({
         request: normalized,
@@ -830,6 +832,7 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
       createdAt: Math.floor(Date.now() / 1000),
       previousResponseId,
       normalized,
+      config,
       ...(() => {
         const reasoningMode = resolveReasoningStreamMode(config, upstreamRequest);
         return {

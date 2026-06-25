@@ -14,7 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/config.js';
 import { newConversation } from '../src/codex-launch.js';
-import { sessions } from '../src/codex-sessions.js';
+import { DEFAULT_SESSION_LIMIT, sessions } from '../src/codex-sessions.js';
 import { toProviderChatCompletionsRequest } from '../src/protocol.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -48,9 +48,8 @@ Options:
   --reasoning-effort <level>
                   With new/sessions, target Codex reasoning effort
   --exec <id>      With sessions, run the generated codex resume command
-  --limit <n>      With sessions, max rows to print, defaults to 20
-  --print          With new, print the launch command. With sessions, print
-                  copyable resume commands instead of picker
+  --limit <n>      With sessions, max rows to print or show, defaults to ${DEFAULT_SESSION_LIMIT}
+  --print          With sessions, print resume commands instead of picker
 `);
 }
 
@@ -119,6 +118,12 @@ function pidPath(installDir) {
 
 function serverPath(installDir) {
   return join(installDir, 'src', 'server.js');
+}
+
+function hasRuntimeMarkers(installDir) {
+  return existsSync(join(installDir, 'package.json')) &&
+    existsSync(join(installDir, 'bin', 'codex-deepseek-gateway.js')) &&
+    existsSync(join(installDir, 'src', 'server.js'));
 }
 
 function loadInstalledConfig(installDir) {
@@ -218,10 +223,9 @@ function copyRuntime(installDir) {
   rmSync(join(installDir, 'src'), { recursive: true, force: true });
   cpSync(join(ROOT, 'bin'), join(installDir, 'bin'), { recursive: true });
   cpSync(join(ROOT, 'src'), join(installDir, 'src'), { recursive: true });
-  const modelAliasesConfig = join(installDir, 'config', 'model-aliases.json');
-  if (!existsSync(modelAliasesConfig)) {
-    copyFileSync(join(ROOT, 'config', 'model-aliases.example.json'), modelAliasesConfig);
-  }
+  copyFileSync(join(ROOT, 'config', 'codex-model-catalog.json'), join(installDir, 'config', 'codex-model-catalog.json'));
+  rmSync(join(installDir, 'config', 'codex-model-catalog.base.json'), { force: true });
+  copyFileSync(join(ROOT, 'config', 'model-aliases.example.json'), join(installDir, 'config', 'model-aliases.json'));
   const localConfig = configPath(installDir);
   if (!existsSync(localConfig)) {
     copyFileSync(join(ROOT, 'config', 'gateway.example.json'), localConfig);
@@ -368,10 +372,19 @@ async function doctor(options) {
   const summaryMode = String(config.codexReasoningSummary || '').toLowerCase();
   const hideAgentReasoning = String(config.codexHideAgentReasoning).toLowerCase() === 'true';
   const thinkingEnabled = upstreamRequest.thinking?.type === 'enabled';
+  const summaryEnabled = Boolean(summaryMode) &&
+    summaryMode !== 'none' &&
+    summaryMode !== 'disabled' &&
+    summaryMode !== 'off' &&
+    summaryMode !== 'false';
+  const codexReasoningSummaryEnabled = supportsReasoningSummaries && summaryEnabled;
+  const gatewayStreamingReasoningSummary = !hideAgentReasoning && thinkingEnabled;
   const reasoningDisplayMode = hideAgentReasoning
     ? 'hidden'
-    : thinkingEnabled
+    : thinkingEnabled && codexReasoningSummaryEnabled
     ? 'summary'
+    : thinkingEnabled
+    ? 'upstream-only'
     : 'disabled';
   print(JSON.stringify({
     packageVersion: packageJson.version,
@@ -388,19 +401,35 @@ async function doctor(options) {
     upstreamModel: upstreamRequest.model,
     deepseekThinking: upstreamRequest.thinking || null,
     deepseekReasoningEffort: upstreamRequest.reasoning_effort || null,
+    codexReasoningSummaryEnabled,
+    gatewayStreamingReasoningSummary,
     reasoningDisplayMode,
     tavilyWebSearchEnabled: Boolean(config.tavilyWebSearchEnabled),
     tavilyWebSearchReady: Boolean(config.tavilyWebSearchEnabled && config.tavilyApiKey),
     firecrawlWebFetchEnabled: Boolean(config.firecrawlWebFetchEnabled),
     firecrawlWebFetchReady: Boolean(config.firecrawlWebFetchEnabled && config.firecrawlApiKey),
     firecrawlAutoScrapeTopResults: config.firecrawlAutoScrapeTopResults,
-    hint: 'The gateway exposes model aliases on /v1/models. Whether Codex TUI /model shows them depends on the Codex build.',
+    hint: 'The gateway exposes model aliases on /v1/models. The launcher passes model_catalog_json for Codex multi-agent validation; plain codex commands must pass that override themselves.',
   }, null, 2));
   print('\n');
 }
 
 async function uninstall(options) {
-  await stop(options);
+  if (!existsSync(options.dir)) {
+    print(`No install found at ${options.dir}\n`);
+    return;
+  }
+  if (resolve(options.dir) === ROOT) {
+    throw new Error(`Refusing to remove source checkout ${options.dir}`);
+  }
+  if (!hasRuntimeMarkers(options.dir)) {
+    throw new Error(`Refusing to remove ${options.dir}: it does not look like a codex-deepseek-gateway install directory.`);
+  }
+  try {
+    await stop(options);
+  } catch (error) {
+    process.stderr.write(`Warning: could not stop gateway before uninstall: ${error.message || error}\n`);
+  }
   rmSync(options.dir, { recursive: true, force: true });
   print(`Removed ${options.dir}\n`);
 }

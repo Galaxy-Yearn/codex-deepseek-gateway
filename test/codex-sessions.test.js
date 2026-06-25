@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readSession } from '../src/codex-sessions.js';
+import { readSession, sessionPickerRows } from '../src/codex-sessions.js';
 
 function writeJsonl(file, rows) {
   writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
@@ -81,4 +81,15 @@ test('readSession skips Codex subagent transcripts', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('session picker rows include all sessions instead of truncating to the window size', () => {
+  const rows = sessionPickerRows(Array.from({ length: 25 }, (_, index) => ({
+    id: `session-${String(index + 1).padStart(2, '0')}`,
+    provider: 'deepseek-gateway',
+    updatedAt: `2026-06-${String(index + 1).padStart(2, '0')}T00:00:00.000Z`,
+    title: `session ${index + 1}`,
+  })));
+  assert.equal(rows.length, 25);
+  assert.match(rows.at(-1), /session-25/);
 });

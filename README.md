@@ -10,7 +10,7 @@ Package: [@galaxy-yearn/codex-deepseek-gateway](https://www.npmjs.com/package/@g
 
 - Node.js 22 or newer
 - A DeepSeek API key
-- Codex CLI
+- Codex CLI 0.142.0 or newer is recommended
 
 ## Install
 
@@ -47,8 +47,8 @@ Add this provider to `~/.codex/config.toml`:
 
 ```toml
 model_provider = "deepseek-gateway"
-model = "deepseek-v4-flash"
-model_reasoning_effort = "low"
+model = "deepseek-v4-pro"
+model_reasoning_effort = "xhigh"
 model_supports_reasoning_summaries = true
 model_reasoning_summary = "auto"
 
@@ -58,7 +58,7 @@ base_url = "http://127.0.0.1:3000/v1"
 wire_api = "responses"
 ```
 
-Use `deepseek-v4-pro` if you want the pro model. Restart Codex after editing `config.toml`.
+Restart Codex after editing `config.toml`.
 
 ## Usage
 
@@ -74,14 +74,17 @@ Resume a Codex session from the current project:
 codex-deepseek-gateway sessions
 ```
 
+When using the gateway, prefer these `new` / `sessions` commands over plain `codex` / `codex resume`. The launcher adds the gateway provider, model catalog, model, and reasoning overrides.
+
+In the interactive session picker, use Up/Down to move through a scrolling window of sessions. Press `n` to start a new conversation instead of resuming an existing session.
+
 Useful non-interactive forms:
 
 ```sh
-codex-deepseek-gateway new --model deepseek-v4-flash --reasoning-effort low
-codex-deepseek-gateway new --print
-codex-deepseek-gateway sessions --print
-codex-deepseek-gateway sessions --all
-codex-deepseek-gateway sessions --exec <id-or-row>
+codex-deepseek-gateway new --model deepseek-v4-flash --reasoning-effort low  # start with explicit model and effort
+codex-deepseek-gateway sessions --print                                      # list resume commands
+codex-deepseek-gateway sessions --all                                        # include sessions from all projects
+codex-deepseek-gateway sessions --exec <id-or-row>                           # resume directly by row or session id
 ```
 
 `new` chooses a model, then Codex reasoning effort. `sessions` chooses a session first, then model and reasoning effort. Both launch Codex with:
@@ -90,23 +93,29 @@ codex-deepseek-gateway sessions --exec <id-or-row>
 codex -c model_provider=deepseek-gateway -c model=<model> -c model_reasoning_effort=<effort> -c model_supports_reasoning_summaries=true -c model_reasoning_summary=auto
 ```
 
+The installed launcher also passes `model_catalog_json` pointing at the packaged gateway Codex catalog, so Codex-native multi-agent validation accepts the DeepSeek model aliases and `low|medium|high|xhigh` reasoning efforts. This Codex setting replaces the default model catalog for that Codex process; it is not merged into it.
+
+Inside a launcher-started Codex TUI, `/model` can switch between the packaged DeepSeek models and reasoning efforts.
+
 Model aliases are read from:
 
 ```text
 ~/.codex/deepseek-gateway/config/model-aliases.json
 ```
 
+`model-aliases.json` is managed by this package and is refreshed on install. The packaged Codex catalog currently allows the default aliases `deepseek-v4-flash` and `deepseek-v4-pro` for Codex-native sub-agent validation.
+
 ## Commands
 
 ```sh
-codex-deepseek-gateway install
-codex-deepseek-gateway start
-codex-deepseek-gateway stop
-codex-deepseek-gateway status
-codex-deepseek-gateway doctor
-codex-deepseek-gateway new
-codex-deepseek-gateway sessions
-codex-deepseek-gateway uninstall
+codex-deepseek-gateway install    # copy runtime into ~/.codex/deepseek-gateway
+codex-deepseek-gateway start      # start the local gateway
+codex-deepseek-gateway stop       # stop the local gateway
+codex-deepseek-gateway status     # show process and endpoint status
+codex-deepseek-gateway doctor     # inspect config and request mapping
+codex-deepseek-gateway new        # start a Codex conversation through the launcher
+codex-deepseek-gateway sessions   # pick and resume a Codex session through the launcher
+codex-deepseek-gateway uninstall  # remove the local runtime
 ```
 
 `doctor` checks the active Codex config, DeepSeek request shape, reasoning mode, and optional web-search backend readiness.
@@ -155,16 +164,6 @@ Codex can keep requesting `web_search` / `web_search_preview`. The gateway expos
 
 Final answers should include useful source titles and URLs directly.
 
-## 0.1.5 Updates
-
-- Global CLI usage: install once with `npm install -g`, then run `codex-deepseek-gateway ...` from any directory.
-- `install` preserves `gateway.local.json`; runtime defaults stay in code.
-- `new` and `sessions` launch Codex with reasoning-summary config overrides.
-- `sessions` first chooses the session, hides subagent transcripts, and sorts by the latest user-message date.
-- DeepSeek-facing tool descriptions are compact; namespaced Codex local tools, including multi-agent tools, pass back to Codex with namespace preserved.
-- Web search uses a model-driven loop: internal Tavily/Firecrawl tools run in the gateway, local Codex tools pass through to Codex, and final-answer turns no longer end as empty completions.
-- Reasoning display now uses Codex summary events only, with display-only Markdown cleanup to avoid duplicate or truncated thinking text.
-
 ## Limits
 
 Chat Completions is not a full Responses API replacement.
@@ -173,7 +172,7 @@ Chat Completions is not a full Responses API replacement.
 - Tavily/Firecrawl web emulation is text-focused; it does not provide browser control, screenshots, raw HTML, cookies, crawl jobs, or private-network access.
 - OpenAI `file_id` values are passed through; the gateway cannot fetch private OpenAI-hosted files.
 - In-memory `previous_response_id` / `conversation` history is lost when the gateway process restarts.
-- The gateway exposes model aliases on `/v1/models`; whether Codex TUI `/model` shows them depends on the Codex build. `config.toml`, `new`, and `sessions` are the reliable model-selection paths.
+- Plain `codex` commands do not automatically load the packaged model catalog. Use the launcher when you want TUI `/model` and sub-agent validation to use the DeepSeek catalog.
 
 ## License
 

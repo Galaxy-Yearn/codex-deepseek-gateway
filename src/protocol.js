@@ -1,5 +1,10 @@
 import { generateId, isObject, normalizeRole, toText } from './common.js';
-import { deepseekReasoningPayload, resolveModelAlias } from './model-map.js';
+import {
+  DEFAULT_MODEL_ALIASES,
+  deepseekReasoningPayload,
+  isDeprecatedModel,
+  resolveModelAlias,
+} from './model-map.js';
 
 const TEXT_PART_TYPES = new Set(['input_text', 'output_text', 'text']);
 const INPUT_CONTENT_PART_TYPES = new Set(['input_text', 'input_image', 'input_file', 'input_audio']);
@@ -10,6 +15,7 @@ const TOOL_CALL_TYPES = new Set([
   'computer_call',
   'mcp_call',
   'web_search_call',
+  'tool_search_call',
   'file_search_call',
   'code_interpreter_call',
   'image_generation_call',
@@ -21,11 +27,17 @@ const TOOL_OUTPUT_TYPES = new Set([
   'computer_call_output',
   'mcp_call_output',
   'web_search_call_output',
+  'tool_search_output',
   'file_search_call_output',
   'code_interpreter_call_output',
   'image_generation_call_output',
 ]);
-const CHAT_HISTORY_IGNORED_TOOL_ITEM_TYPES = new Set(['web_search_call', 'web_search_call_output']);
+const CHAT_HISTORY_IGNORED_TOOL_ITEM_TYPES = new Set([
+  'web_search_call',
+  'web_search_call_output',
+  'tool_search_call',
+  'tool_search_output',
+]);
 const EMULATED_HOSTED_TOOL_TYPES = new Set(['web_search', 'web_search_preview']);
 const DEEPSEEK_TOOL_INSTRUCTIONS_MARKER = 'The tools in this request are real callable functions available now.';
 const DEEPSEEK_TOOL_INSTRUCTIONS = [
@@ -36,10 +48,24 @@ const DEEPSEEK_TOOL_INSTRUCTIONS = [
 ].join(' ');
 const DEEPSEEK_TOOL_DESCRIPTION_CHARS = 220;
 const DEEPSEEK_SCHEMA_DESCRIPTION_CHARS = 160;
+const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
+const CODEX_SPAWN_AGENT_TOOL_NAME = 'multi_agent_v1__spawn_agent';
+const CODEX_TOOL_SEARCH_TOOL_NAME = 'tool_search';
 
 function jsonString(value) {
   if (typeof value === 'string') return value;
   return JSON.stringify(value ?? {});
+}
+
+function parseJsonObject(value) {
+  if (isObject(value)) return value;
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return isObject(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 function sanitizeFunctionName(name, fallback = 'tool_call') {
@@ -72,6 +98,10 @@ function decodedToolName(name, toolNames) {
   const value = String(name || '');
   const known = toolNames?.get(value);
   return known ? { ...known } : { name: value };
+}
+
+function isCodexToolSearchTool(name) {
+  return String(name || '') === CODEX_TOOL_SEARCH_TOOL_NAME;
 }
 
 function omitUndefined(value) {
@@ -195,6 +225,7 @@ function toolName(item) {
 
 function toolArguments(item) {
   if (item.type === 'function_call') return jsonString(item.arguments ?? {});
+  if (item.type === 'tool_search_call') return jsonString(item.arguments ?? {});
   if (item.arguments !== undefined) return jsonString(item.arguments);
   if (item.input !== undefined) return jsonString({ input: item.input });
   if (item.action !== undefined) return jsonString({ action: item.action });
@@ -474,8 +505,43 @@ function expandTools(tools) {
 }
 
 function normalizeTools(tools) {
-  const normalized = expandTools(tools).map(normalizeTool).filter(Boolean);
+  const seen = new Set();
+  const normalized = [];
+  for (const tool of expandTools(tools).map(normalizeTool).filter(Boolean)) {
+    const name = tool?.type === 'function' ? tool.function?.name : '';
+    if (name) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+    }
+    normalized.push(tool);
+  }
   return normalized.length ? normalized : undefined;
+}
+
+function collectToolSearchOutputTools(input) {
+  const discovered = [];
+  const scan = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) scan(item);
+      return;
+    }
+    if (!isObject(value)) return;
+    if (value.type === 'tool_search_output' && Array.isArray(value.tools)) {
+      discovered.push(...value.tools.filter(isObject));
+      return;
+    }
+    if (Array.isArray(value.input)) scan(value.input);
+    if (Array.isArray(value.content)) scan(value.content);
+  };
+  scan(input);
+  return discovered;
+}
+
+function mergeToolsWithToolSearchOutput(requestTools, input) {
+  const discovered = collectToolSearchOutputTools(input);
+  if (!discovered.length) return requestTools;
+  const base = Array.isArray(requestTools) ? requestTools : [];
+  return base.concat(discovered);
 }
 
 function normalizeJsonSchemaObject(schema) {
@@ -614,6 +680,60 @@ function coerceValueForSchema(value, schema) {
   return value;
 }
 
+function toolSearchArgumentsFromText(argumentsText) {
+  const parsed = parseJsonObject(argumentsText);
+  const args = {};
+  if (parsed.limit !== undefined) {
+    const limit = Number(parsed.limit);
+    if (Number.isFinite(limit)) args.limit = limit;
+  }
+  if (parsed.query !== undefined) args.query = String(parsed.query);
+  return args;
+}
+
+function finalizeToolSearchCallItemArguments(item) {
+  if (!item || item.type !== 'tool_search_call') return;
+  if (typeof item.arguments === 'string') {
+    item.arguments = toolSearchArgumentsFromText(item.arguments);
+  } else if (!isObject(item.arguments)) {
+    item.arguments = {};
+  }
+}
+
+function convertItemToToolSearchCall(item) {
+  if (!item || item.type === 'tool_search_call') return item;
+  item.type = 'tool_search_call';
+  item.id = generateId('tsc');
+  item.execution = 'client';
+  delete item.name;
+  delete item.namespace;
+  return item;
+}
+
+function responseItemFromChatToolCall(toolCall, toolNames) {
+  const callId = toolCall.id || generateId('call');
+  if (isCodexToolSearchTool(toolCall.function?.name)) {
+    return {
+      type: 'tool_search_call',
+      id: generateId('tsc'),
+      call_id: callId,
+      status: 'completed',
+      execution: 'client',
+      arguments: toolSearchArgumentsFromText(toolCall.function?.arguments || ''),
+    };
+  }
+  const decoded = decodedToolName(toolCall.function?.name, toolNames);
+  return omitUndefined({
+    type: 'function_call',
+    id: callId,
+    call_id: callId,
+    name: decoded.name,
+    namespace: decoded.namespace,
+    arguments: toolCall.function?.arguments || '',
+    status: 'completed',
+  });
+}
+
 function buildToolSchemas(tools) {
   const schemas = new Map();
   for (const tool of expandTools(tools)) {
@@ -670,13 +790,81 @@ function defaultDeepSeekToolDescription(name) {
   return compactText(`Call ${readable || name || 'this function'} when needed.`);
 }
 
-function simplifyToolForDeepSeek(tool) {
+function deepSeekGatewayModelAliases(config = {}) {
+  const aliases = isObject(config.modelAliases) && Object.keys(config.modelAliases).length
+    ? config.modelAliases
+    : DEFAULT_MODEL_ALIASES;
+  const spawnConfig = { ...config, upstreamProvider: 'deepseek', modelAliases: aliases };
+  const names = [];
+  for (const name of Object.keys(aliases)) {
+    if (!name || isDeprecatedModel(name)) continue;
+    const alias = resolveModelAlias(name, spawnConfig);
+    if (isDeprecatedModel(alias.upstreamModel)) continue;
+    names.push(name);
+  }
+  return [...new Set(names)];
+}
+
+function enumStringProperty(property, values, description) {
+  const source = isObject(property) ? property : {};
+  const next = { ...source };
+  delete next.const;
+  delete next.oneOf;
+  delete next.anyOf;
+  delete next.allOf;
+  delete next.examples;
+  if (next.default !== undefined && !values.includes(next.default)) delete next.default;
+  next.type = 'string';
+  next.enum = values;
+  next.description = description;
+  return next;
+}
+
+function deepSeekSpawnAgentParameters(parameters, config = {}) {
+  const next = normalizeJsonSchemaObject(parameters);
+  const properties = isObject(next.properties) ? { ...next.properties } : {};
+  const modelAliases = deepSeekGatewayModelAliases(config);
+  properties.model = enumStringProperty(
+    properties.model,
+    modelAliases,
+    'Model for the sub-agent. Omit to inherit.',
+  );
+  properties.reasoning_effort = enumStringProperty(
+    properties.reasoning_effort,
+    CODEX_REASONING_EFFORTS,
+    'Codex reasoning effort for the sub-agent. Omit to inherit.',
+  );
+  return {
+    ...next,
+    properties,
+  };
+}
+
+function deepSeekSpawnAgentDescription() {
+  const description = [
+    'Spawn a Codex-native sub-agent.',
+    'Omit model/reasoning_effort to inherit.',
+    'Valid values are enforced by the schema.',
+  ].filter(Boolean).join(' ');
+  return shortenText(description, DEEPSEEK_TOOL_DESCRIPTION_CHARS);
+}
+
+function isCodexSpawnAgentTool(name) {
+  return name === CODEX_SPAWN_AGENT_TOOL_NAME || name === 'spawn_agent';
+}
+
+function simplifyToolForDeepSeek(tool, config = {}) {
   if (tool?.type !== 'function' || !isObject(tool.function)) return tool;
   const fn = tool.function;
-  const parameters = simplifyJsonSchemaDescriptions(fn.parameters);
+  let parameters = simplifyJsonSchemaDescriptions(fn.parameters);
+  if (isCodexSpawnAgentTool(fn.name)) {
+    parameters = deepSeekSpawnAgentParameters(parameters, config);
+  }
   const requiredText = requiredParametersText(parameters);
   const descriptionBudget = Math.max(32, DEEPSEEK_TOOL_DESCRIPTION_CHARS - requiredText.length);
-  const baseDescription = shortenText(fn.description, descriptionBudget) || defaultDeepSeekToolDescription(fn.name);
+  const baseDescription = isCodexSpawnAgentTool(fn.name)
+    ? deepSeekSpawnAgentDescription()
+    : shortenText(fn.description, descriptionBudget) || defaultDeepSeekToolDescription(fn.name);
   const description = shortenText(`${baseDescription}${requiredText}`, DEEPSEEK_TOOL_DESCRIPTION_CHARS);
   return {
     ...tool,
@@ -706,9 +894,9 @@ function addDeepSeekToolInstructions(messages, tools) {
   ];
 }
 
-function adaptToolsForProvider(tools, provider) {
+function adaptToolsForProvider(tools, provider, config = {}) {
   if (provider !== 'deepseek' || !Array.isArray(tools)) return tools;
-  return tools.map(simplifyToolForDeepSeek);
+  return tools.map((tool) => simplifyToolForDeepSeek(tool, config));
 }
 
 function normalizeToolCallArguments(name, argumentsText, toolSchema) {
@@ -733,10 +921,48 @@ function normalizeToolCallArguments(name, argumentsText, toolSchema) {
   }
 }
 
-function normalizeFunctionCallItemArguments(item, toolSchemas) {
+function normalizeReasoningEffortName(value) {
+  return value == null ? '' : String(value).toLowerCase().replaceAll('_', '-');
+}
+
+function normalizeCodexSpawnAgentArguments(encodedName, argumentsText, config = {}) {
+  if (!isCodexSpawnAgentTool(encodedName) || !argumentsText) return argumentsText;
+  let parsed;
+  try {
+    parsed = JSON.parse(argumentsText);
+  } catch {
+    return argumentsText;
+  }
+  if (!isObject(parsed)) return argumentsText;
+  const next = { ...parsed };
+  let changed = false;
+  const allowedModels = deepSeekGatewayModelAliases(config);
+
+  if (typeof next.model === 'string') {
+    const requestedModel = next.model;
+    if (allowedModels.length && !allowedModels.includes(requestedModel)) {
+      delete next.model;
+      changed = true;
+    }
+  }
+
+  if (typeof next.reasoning_effort === 'string') {
+    const requestedEffort = normalizeReasoningEffortName(next.reasoning_effort);
+    if (!CODEX_REASONING_EFFORTS.includes(requestedEffort)) {
+      delete next.reasoning_effort;
+      changed = true;
+      return JSON.stringify(next);
+    }
+  }
+
+  return changed ? JSON.stringify(next) : argumentsText;
+}
+
+function normalizeFunctionCallItemArguments(item, toolSchemas, config = {}) {
   if (!item || item.type !== 'function_call') return;
   const encodedName = encodeToolName(item.namespace, item.name);
   item.arguments = normalizeToolCallArguments(encodedName, item.arguments, toolSchemas?.get(encodedName));
+  item.arguments = normalizeCodexSpawnAgentArguments(encodedName, item.arguments, config);
 }
 
 function sanitizeToolCallsForChatCompletion(toolCalls) {
@@ -764,7 +990,9 @@ function sanitizeMessageForChatCompletion(message, provider = 'generic') {
     content: contentToChatContent(message.content),
   };
   if (message.name !== undefined) sanitized.name = message.name;
-  if (Array.isArray(message.tool_calls)) sanitized.tool_calls = sanitizeToolCallsForChatCompletion(message.tool_calls);
+  if (Array.isArray(message.tool_calls)) {
+    sanitized.tool_calls = sanitizeToolCallsForChatCompletion(message.tool_calls);
+  }
   if (message.tool_call_id !== undefined) sanitized.tool_call_id = message.tool_call_id;
   if (provider === 'deepseek' && message.role === 'assistant' && typeof message.reasoning_content === 'string') {
     sanitized.reasoning_content = message.reasoning_content;
@@ -836,6 +1064,16 @@ function snapshotResponsePart(part) {
 
 function snapshotResponseItem(item) {
   if (!isObject(item)) return item;
+  if (item.type === 'tool_search_call') {
+    return omitUndefined({
+      type: item.type,
+      id: item.id,
+      call_id: item.call_id,
+      status: item.status,
+      execution: item.execution,
+      arguments: isObject(item.arguments) ? { ...item.arguments } : toolSearchArgumentsFromText(item.arguments),
+    });
+  }
   return {
     ...item,
     content: Array.isArray(item.content) ? item.content.map(snapshotResponsePart) : item.content,
@@ -901,6 +1139,7 @@ export function normalizeResponsesRequest(request) {
   const model = request.model || request.model_id || request.upstream_model || '';
   const instructions = normalizeInstructions(request.instructions);
   const responseFormat = request.response_format || request.text?.format;
+  const tools = mergeToolsWithToolSearchOutput(request.tools, request.input ?? request);
   return {
     model,
     messages,
@@ -910,7 +1149,7 @@ export function normalizeResponsesRequest(request) {
     max_tokens: request.max_output_tokens ?? request.max_tokens,
     stop: request.stop,
     stream: Boolean(request.stream),
-    tools: request.tools,
+    tools,
     tool_choice: request.tool_choice,
     parallel_tool_calls: request.parallel_tool_calls,
     presence_penalty: request.presence_penalty,
@@ -1043,7 +1282,7 @@ export function toProviderChatCompletionsRequest(chatRequest, config = {}) {
   if (provider === 'deepseek') {
     delete request.reasoning_effort;
     delete request.parallel_tool_calls;
-    request.tools = adaptToolsForProvider(request.tools, provider);
+    request.tools = adaptToolsForProvider(request.tools, provider, config);
     request.messages = addDeepSeekToolInstructions(request.messages, request.tools);
     if (request.user !== undefined) {
       request.user_id = request.user;
@@ -1174,7 +1413,7 @@ export function createResponseEnvelope({
   });
 }
 
-export function convertChatCompletionToResponses({ completion, model, previousResponseId, normalized, responseId = generateId('resp') }) {
+export function convertChatCompletionToResponses({ completion, model, previousResponseId, normalized, responseId = generateId('resp'), config = {} }) {
   const createdAt = completion.created || Date.now() / 1000;
   const choice = Array.isArray(completion.choices) ? completion.choices[0] : null;
   const message = choice?.message || {};
@@ -1196,18 +1435,8 @@ export function convertChatCompletionToResponses({ completion, model, previousRe
 
   if (Array.isArray(message.tool_calls)) {
     for (const toolCall of message.tool_calls) {
-      const callId = toolCall.id || generateId('call');
-      const decoded = decodedToolName(toolCall.function?.name, toolNames);
-      const item = omitUndefined({
-        type: 'function_call',
-        id: callId,
-        call_id: callId,
-        name: decoded.name,
-        namespace: decoded.namespace,
-        arguments: toolCall.function?.arguments || '',
-        status: 'completed',
-      });
-      normalizeFunctionCallItemArguments(item, toolSchemas);
+      const item = responseItemFromChatToolCall(toolCall, toolNames);
+      normalizeFunctionCallItemArguments(item, toolSchemas, config);
       output.push(item);
     }
   }
@@ -1249,6 +1478,7 @@ export class ResponsesStreamMapper {
     bufferOutputUntilDone = false,
     emitReasoningSummary = true,
     emitReasoningText = false,
+    config = {},
   } = {}) {
     this.responseId = responseId;
     this.model = model;
@@ -1278,6 +1508,7 @@ export class ResponsesStreamMapper {
     this.streamedReasoningSummaryText = '';
     this.toolSchemas = buildToolSchemas(normalized?.tools);
     this.toolNames = buildToolNames(normalized?.tools);
+    this.config = config;
   }
 
   nextSequence() {
@@ -1523,18 +1754,31 @@ export class ResponsesStreamMapper {
       let item = this.toolItems.get(index);
       if (!item) {
         const callId = toolCall.id || generateId('call');
-        item = {
-          id: callId,
-          type: 'function_call',
-          status: 'in_progress',
-          call_id: callId,
-          ...decodedToolName(toolCall.function?.name, this.toolNames),
-          arguments: '',
-        };
+        item = isCodexToolSearchTool(toolCall.function?.name)
+          ? {
+              id: generateId('tsc'),
+              type: 'tool_search_call',
+              status: 'in_progress',
+              call_id: callId,
+              execution: 'client',
+              arguments: '',
+            }
+          : {
+              id: callId,
+              type: 'function_call',
+              status: 'in_progress',
+              call_id: callId,
+              ...decodedToolName(toolCall.function?.name, this.toolNames),
+              arguments: '',
+            };
         this.toolItems.set(index, item);
         this.output.push(item);
       }
-      if (toolCall.function?.name) Object.assign(item, decodedToolName(toolCall.function.name, this.toolNames));
+      if (isCodexToolSearchTool(toolCall.function?.name)) {
+        item = convertItemToToolSearchCall(item);
+      } else if (toolCall.function?.name && item.type !== 'tool_search_call') {
+        Object.assign(item, decodedToolName(toolCall.function.name, this.toolNames));
+      }
       item.arguments += toolCall.function?.arguments || '';
       return [];
     }
@@ -1547,14 +1791,23 @@ export class ResponsesStreamMapper {
     let item = this.toolItems.get(index);
     if (!item) {
       const callId = toolCall.id || generateId('call');
-      item = {
-        id: callId,
-        type: 'function_call',
-        status: 'in_progress',
-        call_id: callId,
-        ...decodedToolName(toolCall.function?.name, this.toolNames),
-        arguments: '',
-      };
+      item = isCodexToolSearchTool(toolCall.function?.name)
+        ? {
+            id: generateId('tsc'),
+            type: 'tool_search_call',
+            status: 'in_progress',
+            call_id: callId,
+            execution: 'client',
+            arguments: '',
+          }
+        : {
+            id: callId,
+            type: 'function_call',
+            status: 'in_progress',
+            call_id: callId,
+            ...decodedToolName(toolCall.function?.name, this.toolNames),
+            arguments: '',
+          };
       this.toolItems.set(index, item);
       this.output.push(item);
       events.push({
@@ -1564,10 +1817,14 @@ export class ResponsesStreamMapper {
         item: snapshotResponseItem(item),
       });
     }
-    if (toolCall.function?.name) Object.assign(item, decodedToolName(toolCall.function.name, this.toolNames));
+    if (isCodexToolSearchTool(toolCall.function?.name)) {
+      item = convertItemToToolSearchCall(item);
+    } else if (toolCall.function?.name && item.type !== 'tool_search_call') {
+      Object.assign(item, decodedToolName(toolCall.function.name, this.toolNames));
+    }
     const delta = toolCall.function?.arguments || '';
     item.arguments += delta;
-    if (delta) {
+    if (delta && item.type === 'function_call') {
       events.push({
         type: 'response.function_call_arguments.delta',
         sequence_number: this.nextSequence(),
@@ -1665,20 +1922,23 @@ export class ResponsesStreamMapper {
 
       for (const item of this.toolItems.values()) {
         item.status = status;
-        const encodedName = encodeToolName(item.namespace, item.name);
-        item.arguments = normalizeToolCallArguments(encodedName, item.arguments, this.toolSchemas.get(encodedName));
+        if (item.type === 'tool_search_call') finalizeToolSearchCallItemArguments(item);
+        else normalizeFunctionCallItemArguments(item, this.toolSchemas, this.config);
         const outputIndex = this.output.indexOf(item);
         events.push({
           type: 'response.output_item.added',
           sequence_number: this.nextSequence(),
           output_index: outputIndex,
-          item: snapshotResponseItem({
+          item: snapshotResponseItem(item.type === 'tool_search_call' ? {
+            ...item,
+            status: 'in_progress',
+          } : {
             ...item,
             status: 'in_progress',
             arguments: '',
           }),
         });
-        if (item.arguments) {
+        if (item.type === 'function_call' && item.arguments) {
           events.push({
             type: 'response.function_call_arguments.delta',
             sequence_number: this.nextSequence(),
@@ -1687,13 +1947,15 @@ export class ResponsesStreamMapper {
             delta: item.arguments,
           });
         }
-        events.push({
-          type: 'response.function_call_arguments.done',
-          sequence_number: this.nextSequence(),
-          output_index: outputIndex,
-          item_id: item.id,
-          arguments: item.arguments,
-        });
+        if (item.type === 'function_call') {
+          events.push({
+            type: 'response.function_call_arguments.done',
+            sequence_number: this.nextSequence(),
+            output_index: outputIndex,
+            item_id: item.id,
+            arguments: item.arguments,
+          });
+        }
         events.push({
           type: 'response.output_item.done',
           sequence_number: this.nextSequence(),
@@ -1778,14 +2040,17 @@ export class ResponsesStreamMapper {
     events.push(...this.closeReasoningItem(finishReason === 'length' ? 'incomplete' : 'completed'));
     for (const item of this.toolItems.values()) {
       item.status = finishReason === 'length' ? 'incomplete' : 'completed';
-      normalizeFunctionCallItemArguments(item, this.toolSchemas);
-      events.push({
-        type: 'response.function_call_arguments.done',
-        sequence_number: this.nextSequence(),
-        output_index: this.output.indexOf(item),
-        item_id: item.id,
-        arguments: item.arguments,
-      });
+      if (item.type === 'tool_search_call') finalizeToolSearchCallItemArguments(item);
+      else normalizeFunctionCallItemArguments(item, this.toolSchemas, this.config);
+      if (item.type === 'function_call') {
+        events.push({
+          type: 'response.function_call_arguments.done',
+          sequence_number: this.nextSequence(),
+          output_index: this.output.indexOf(item),
+          item_id: item.id,
+          arguments: item.arguments,
+        });
+      }
       events.push({
         type: 'response.output_item.done',
         sequence_number: this.nextSequence(),

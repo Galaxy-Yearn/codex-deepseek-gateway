@@ -7,6 +7,7 @@ node_modules/
 .npmrc
 config/gateway.local.json
 config/model-aliases.json
+codex-model-catalog.backup.json
 gateway.pid
 *.pid
 
@@ -23,6 +24,7 @@ dist/
 tmp/
 temp/
 .cache/
+.tmp-npm-cache/
 
 # OS/editor noise
 .DS_Store

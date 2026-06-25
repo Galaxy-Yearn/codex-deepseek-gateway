@@ -146,6 +146,121 @@ test('preserves namespaced multi-agent tools through the Chat bridge', () => {
   assert.equal(toolCall.name, 'wait_agent');
 });
 
+test('maps Codex tool_search calls back to native Responses items', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'find sub-agent tools',
+    tools: [
+      {
+        type: 'tool_search',
+        execution: 'client',
+        description: 'Search deferred tools.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' },
+            limit: { type: 'number' },
+          },
+          required: ['query'],
+          additionalProperties: false,
+        },
+      },
+    ],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.equal(chat.tools[0].type, 'function');
+  assert.equal(chat.tools[0].function.name, 'tool_search');
+
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_tool_search',
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    completion: {
+      id: 'chatcmpl_tool_search',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_search',
+                type: 'function',
+                function: {
+                  name: 'tool_search',
+                  arguments: '{"query":"spawn sub agent","limit":8}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+  });
+  const toolSearchCall = response.output.find((item) => item.type === 'tool_search_call');
+  assert.equal(toolSearchCall.call_id, 'call_search');
+  assert.equal(toolSearchCall.execution, 'client');
+  assert.deepEqual(toolSearchCall.arguments, { limit: 8, query: 'spawn sub agent' });
+  assert.equal(response.output.some((item) => item.type === 'function_call' && item.name === 'tool_search'), false);
+});
+
+test('loads tools returned by Codex tool_search_output on the next request', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: [
+      {
+        type: 'tool_search_call',
+        id: 'tsc_1',
+        call_id: 'call_search',
+        status: 'completed',
+        execution: 'client',
+        arguments: { query: 'spawn agent', limit: 8 },
+      },
+      {
+        type: 'tool_search_output',
+        call_id: 'call_search',
+        status: 'completed',
+        execution: 'client',
+        tools: [
+          {
+            type: 'namespace',
+            name: 'multi_agent_v1',
+            tools: [
+              {
+                type: 'function',
+                name: 'spawn_agent',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    message: { type: 'string' },
+                    model: { type: 'string' },
+                    reasoning_effort: { type: 'string' },
+                  },
+                  required: ['message'],
+                  additionalProperties: false,
+                },
+              },
+            ],
+          },
+        ],
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'use the discovered tool' }],
+      },
+    ],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  const names = chat.tools.map((tool) => tool.function.name);
+  assert.deepEqual(names, ['multi_agent_v1__spawn_agent']);
+  assert.equal(chat.messages.some((message) => Array.isArray(message.tool_calls)), false);
+  assert.equal(chat.messages.some((message) => message.role === 'tool'), false);
+});
+
 test('expands Codex namespace tool groups before sending Chat tools', () => {
   const normalized = normalizeResponsesRequest({
     model: 'deepseek-v4-flash',
@@ -265,6 +380,192 @@ test('expands Codex namespace tool groups before sending Chat tools', () => {
   assert.equal(toolCall.namespace, 'multi_agent_v1');
   assert.equal(toolCall.name, 'spawn_agent');
   assert.equal(toolCall.arguments, '{"agent_type":"explorer","message":"inspect protocol conversion"}');
+});
+
+test('keeps DeepSeek spawn_agent model aliases when schema allows them', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-pro',
+    input: 'delegate work',
+    tools: [
+      {
+        type: 'namespace',
+        name: 'multi_agent_v1',
+        tools: [
+          {
+            type: 'function',
+            name: 'spawn_agent',
+            parameters: {
+              type: 'object',
+              properties: {
+                message: { type: 'string' },
+                model: { type: 'string' },
+                reasoning_effort: { type: 'string' },
+              },
+              required: ['message'],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+    ],
+  });
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_spawn_model_alias',
+    model: 'deepseek-v4-pro',
+    previousResponseId: null,
+    normalized,
+    config: { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_spawn',
+                type: 'function',
+                function: {
+                  name: 'multi_agent_v1__spawn_agent',
+                  arguments: '{"message":"say hi","model":"deepseek-v4-flash","reasoning_effort":"low"}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+  });
+  const toolCall = response.output.find((item) => item.type === 'function_call');
+  assert.equal(toolCall.namespace, 'multi_agent_v1');
+  assert.equal(toolCall.name, 'spawn_agent');
+  assert.equal(toolCall.arguments, '{"message":"say hi","model":"deepseek-v4-flash","reasoning_effort":"low"}');
+});
+
+test('keeps explicit spawn_agent DeepSeek model and effort even when the model matches the parent', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-pro',
+    reasoning: { effort: 'xhigh' },
+    input: 'delegate work',
+    tools: [
+      {
+        type: 'namespace',
+        name: 'multi_agent_v1',
+        tools: [
+          {
+            type: 'function',
+            name: 'spawn_agent',
+            parameters: {
+              type: 'object',
+              properties: {
+                message: { type: 'string' },
+                model: { type: 'string' },
+                reasoning_effort: { type: 'string' },
+              },
+              required: ['message'],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+    ],
+  });
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_spawn_inherited_gateway_model',
+    model: 'deepseek-v4-pro',
+    previousResponseId: null,
+    normalized,
+    config: { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_spawn',
+                type: 'function',
+                function: {
+                  name: 'multi_agent_v1__spawn_agent',
+                  arguments: '{"message":"say hi","model":"deepseek-v4-pro","reasoning_effort":"low"}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+  });
+  const toolCall = response.output.find((item) => item.type === 'function_call');
+  assert.equal(toolCall.arguments, '{"message":"say hi","model":"deepseek-v4-pro","reasoning_effort":"low"}');
+});
+
+test('drops non-gateway spawn_agent model overrides before returning to Codex', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-pro',
+    input: 'delegate work',
+    tools: [
+      {
+        type: 'namespace',
+        name: 'multi_agent_v1',
+        tools: [
+          {
+            type: 'function',
+            name: 'spawn_agent',
+            parameters: {
+              type: 'object',
+              properties: {
+                message: { type: 'string' },
+                model: { type: 'string' },
+                reasoning_effort: { type: 'string' },
+              },
+              required: ['message'],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+    ],
+  });
+  const response = convertChatCompletionToResponses({
+    responseId: 'resp_spawn_gpt_model_dropped',
+    model: 'deepseek-v4-pro',
+    previousResponseId: null,
+    normalized,
+    config: { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
+    completion: {
+      id: 'chatcmpl_test',
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_spawn',
+                type: 'function',
+                function: {
+                  name: 'multi_agent_v1__spawn_agent',
+                  arguments: '{"message":"say hi","model":"gpt-5.4-mini","reasoning_effort":"low"}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+  });
+  const toolCall = response.output.find((item) => item.type === 'function_call');
+  assert.equal(toolCall.arguments, '{"message":"say hi","reasoning_effort":"low"}');
 });
 
 test('does not split ordinary double-underscore tool names as namespaces', () => {
@@ -447,6 +748,16 @@ test('adapts DeepSeek-facing tools without changing internal tool mapping', () =
                   type: 'string',
                   description: 'The task prompt sent to the sub-agent, including all required context for independent execution.',
                 },
+                model: {
+                  type: 'string',
+                  enum: ['gpt-5.5'],
+                  description: 'Original Codex model override description.',
+                },
+                reasoning_effort: {
+                  type: 'string',
+                  enum: ['minimal', 'low', 'medium', 'high'],
+                  description: 'Original Codex reasoning effort description.',
+                },
               },
               required: ['message'],
               additionalProperties: false,
@@ -458,15 +769,34 @@ test('adapts DeepSeek-facing tools without changing internal tool mapping', () =
   });
   const chat = toChatCompletionsRequest(normalized);
   assert.match(chat.tools[0].function.description, /original Codex description can be long/);
+  assert.deepEqual(chat.tools[0].function.parameters.properties.model.enum, ['gpt-5.5']);
+  assert.deepEqual(chat.tools[0].function.parameters.properties.reasoning_effort.enum, ['minimal', 'low', 'medium', 'high']);
 
-  const request = toProviderChatCompletionsRequest(chat, { upstreamProvider: 'deepseek' });
+  const request = toProviderChatCompletionsRequest(chat, {
+    upstreamProvider: 'deepseek',
+    modelAliases: {
+      ...DEFAULT_MODEL_ALIASES,
+      'deepseek-v4-pro-analysis': { model: 'deepseek-v4-pro', thinking: 'auto' },
+    },
+  });
   assert.match(request.messages[0].content, /real callable functions available now/);
   assert.match(request.messages[0].content, /tool_calls/);
   assert.equal(request.messages[0].content.includes('pseudo XML'), true);
   assert.equal(request.tools[0].function.name, 'multi_agent_v1__spawn_agent');
   assert.ok(request.tools[0].function.description.length < chat.tools[0].function.description.length);
+  assert.match(request.tools[0].function.description, /Codex-native sub-agent/);
+  assert.match(request.tools[0].function.description, /model\/reasoning_effort to inherit/);
+  assert.equal(request.tools[0].function.description.includes('deepseek-v4-flash'), false);
   assert.match(request.tools[0].function.description, /Required: message/);
   assert.ok(request.tools[0].function.parameters.properties.message.description.length < 170);
+  assert.deepEqual(request.tools[0].function.parameters.properties.model.enum, [
+    'deepseek-v4-flash',
+    'deepseek-v4-pro',
+    'deepseek-v4-pro-analysis',
+  ]);
+  assert.deepEqual(request.tools[0].function.parameters.properties.reasoning_effort.enum, ['low', 'medium', 'high', 'xhigh']);
+  assert.equal(JSON.stringify(request.tools[0]).includes('gpt-5.5'), false);
+  assert.equal(JSON.stringify(request.tools[0]).includes('minimal'), false);
 });
 
 test('filters tools for Codex allowed_tools without forcing a call', () => {
@@ -1462,6 +1792,87 @@ test('normalizes stringified shell command arrays in buffered tool calls', () =>
   ];
   const done = events.find((event) => event.type === 'response.function_call_arguments.done');
   assert.equal(done.arguments, '{"command":["powershell.exe","-Command","Get-Content package.json"]}');
+});
+
+test('buffers native tool_search calls without function argument events', () => {
+  const mapper = new ResponsesStreamMapper({
+    responseId: 'resp_stream',
+    model: 'deepseek-v4-flash',
+    bufferOutputUntilDone: true,
+    normalized: normalizeResponsesRequest({
+      model: 'deepseek-v4-flash',
+      input: 'find sub-agent tools',
+      tools: [
+        {
+          type: 'tool_search',
+          execution: 'client',
+          description: 'Search deferred tools.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string' },
+              limit: { type: 'number' },
+            },
+            required: ['query'],
+            additionalProperties: false,
+          },
+        },
+      ],
+    }),
+  });
+  const events = [
+    ...mapper.mapChatEvent({
+      data: JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_search',
+                  type: 'function',
+                  function: {
+                    name: 'tool_search',
+                    arguments: '{"query":"spawn',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+    }),
+    ...mapper.mapChatEvent({
+      data: JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    arguments: ' agent","limit":8}',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+    }),
+    ...mapper.mapChatEvent({
+      data: JSON.stringify({
+        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+      }),
+    }),
+  ];
+  const outputDone = events.find((event) => event.type === 'response.output_item.done' && event.item.type === 'tool_search_call');
+  assert.equal(outputDone.item.call_id, 'call_search');
+  assert.equal(outputDone.item.execution, 'client');
+  assert.deepEqual(outputDone.item.arguments, { limit: 8, query: 'spawn agent' });
+  assert.equal(events.some((event) => event.type === 'response.function_call_arguments.done'), false);
 });
 
 test('streams namespace tool group calls back with namespace restored', () => {

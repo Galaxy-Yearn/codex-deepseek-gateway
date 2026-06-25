@@ -27,7 +27,7 @@ const ID_WIDTH = 36;
 const TITLE_WIDTH = 16;
 const TABLE_INDENT = '    ';
 const COLUMN_GAP = '  ';
-const NEW_SESSION_ROW = '[New conversation]';
+export const DEFAULT_SESSION_LIMIT = 15;
 
 function print(message = '') {
   process.stdout.write(message);
@@ -186,7 +186,7 @@ function resolveSessionSelection(selection, sessionsList) {
 }
 
 function printSessions(sessionsList, options, context) {
-  const listed = sessionsList.slice(0, options.limit || 20);
+  const listed = sessionsList.slice(0, options.limit || DEFAULT_SESSION_LIMIT);
   print(`Codex sessions ${options.all ? `under ${context.codexHome}` : `for project ${context.projectRoot}`}\n`);
   print(`Target: ${context.provider} / ${context.model} / ${context.reasoningEffort}\n\n`);
   if (!listed.length) {
@@ -215,23 +215,35 @@ function sessionRows(sessionsList) {
   return sessionsList.map((session) => sessionRow(session));
 }
 
+export function sessionPickerRows(allSessions) {
+  return sessionRows(allSessions);
+}
+
 async function chooseSessionFlow(allSessions, context, limit) {
   if (!context.models.length) {
     print(missingModelMessage(context));
     return null;
   }
 
-  const listed = allSessions.slice(0, limit);
   const header = sessionHeader();
+  const windowSize = limit || DEFAULT_SESSION_LIMIT;
   return await withPickerScreen(async () => {
     let step = 'session';
     while (true) {
       if (step === 'session') {
-        const rows = [NEW_SESSION_ROW, ...sessionRows(listed)];
-        const result = await pick(`Choose Codex session`, rows, header);
+        const result = await pick(
+          `Choose Codex session`,
+          sessionPickerRows(allSessions),
+          header,
+          {
+            windowSize,
+            emptyMessage: 'No matching sessions found.',
+            shortcuts: [{ key: 'n', action: 'new', label: 'N new' }],
+          },
+        );
         if (result.action === 'cancel') return null;
         if (result.action === 'back') return null;
-        context.selectedSession = result.index === 0 ? { newConversation: true } : listed[result.index - 1];
+        context.selectedSession = result.action === 'new' ? { newConversation: true } : allSessions[result.index];
         step = 'model';
       } else if (step === 'model') {
         const action = await pickModel(context);
@@ -273,7 +285,7 @@ export async function sessions(options) {
     return;
   }
 
-  const selected = await chooseSessionFlow(allSessions, context, options.limit || 20);
+  const selected = await chooseSessionFlow(allSessions, context, options.limit || DEFAULT_SESSION_LIMIT);
   if (selected?.newConversation) await runCodex(codexNewArgs(context));
   else if (selected) await runCodex(codexResumeArgs(selected.id, context));
 }
