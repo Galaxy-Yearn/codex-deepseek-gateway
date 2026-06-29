@@ -4,10 +4,12 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { clearScreenDown, cursorTo } from 'node:readline';
 import { readCodexConfig } from './codex-config.js';
+import { readLocalConfigFile } from './local-config.js';
+import { catalogFileForPromptLanguage, normalizePromptLanguage } from './prompt-language.js';
 
 export const DEFAULT_PROVIDER = 'deepseek-gateway';
 export const REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const SELECTED_ROW = '\x1b[38;2;91;124;255m';
+const SELECTED_ROW = '\x1b[38;2;57;100;254m';
 const RESET_STYLE = '\x1b[0m';
 const require = createRequire(import.meta.url);
 const CODEX_PLATFORM_PACKAGE_BY_TARGET = {
@@ -47,17 +49,25 @@ export function gatewayModels(installDir) {
   return Object.keys(readJsonObject(join(installDir, 'config', 'model-aliases.json'))).sort();
 }
 
+function readPromptLanguage(installDir) {
+  const configFile = join(installDir, 'config', 'gateway.local.json');
+  const localConfig = readLocalConfigFile(configFile);
+  return normalizePromptLanguage(localConfig.CODEX_PROMPT_LANGUAGE);
+}
+
 export function createLaunchContext(options) {
   const codexHome = defaultCodexHome();
   const models = gatewayModels(options.dir);
   const codexConfig = readCodexConfig();
+  const promptLanguage = readPromptLanguage(options.dir);
   const configModel = codexConfig.modelProvider === DEFAULT_PROVIDER && models.includes(codexConfig.model) ? codexConfig.model : '';
   return {
     all: options.all,
     codexHome,
     installDir: options.dir,
-    modelCatalogPath: join(options.dir, 'config', 'codex-model-catalog.json'),
+    modelCatalogPath: join(options.dir, 'config', catalogFileForPromptLanguage(promptLanguage)),
     models,
+    promptLanguage,
     projectRoot: findProjectRoot(process.cwd()),
     provider: options.provider || DEFAULT_PROVIDER,
     model: options.model || configModel || models[0] || '',

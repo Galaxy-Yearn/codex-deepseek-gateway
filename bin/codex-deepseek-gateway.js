@@ -50,6 +50,8 @@ Options:
   --exec <id>      With sessions, run the generated codex resume command
   --limit <n>      With sessions, max rows to print or show, defaults to ${DEFAULT_SESSION_LIMIT}
   --print          With sessions, print resume commands instead of picker
+
+Prompt language is configured in gateway.local.json with codexPromptLanguage.
 `);
 }
 
@@ -224,6 +226,9 @@ function copyRuntime(installDir) {
   cpSync(join(ROOT, 'bin'), join(installDir, 'bin'), { recursive: true });
   cpSync(join(ROOT, 'src'), join(installDir, 'src'), { recursive: true });
   copyFileSync(join(ROOT, 'config', 'codex-model-catalog.json'), join(installDir, 'config', 'codex-model-catalog.json'));
+  copyFileSync(join(ROOT, 'config', 'codex-model-catalog.zh.json'), join(installDir, 'config', 'codex-model-catalog.zh.json'));
+  rmSync(join(installDir, 'config', 'frontend-design-guidance'), { recursive: true, force: true });
+  cpSync(join(ROOT, 'config', 'frontend-design-guidance'), join(installDir, 'config', 'frontend-design-guidance'), { recursive: true });
   rmSync(join(installDir, 'config', 'codex-model-catalog.base.json'), { force: true });
   copyFileSync(join(ROOT, 'config', 'model-aliases.example.json'), join(installDir, 'config', 'model-aliases.json'));
   const localConfig = configPath(installDir);
@@ -397,6 +402,8 @@ async function doctor(options) {
     codexReasoningSummary: config.codexReasoningSummary || null,
     codexModelSupportsReasoningSummaries: config.codexModelSupportsReasoningSummaries || null,
     codexHideAgentReasoning: config.codexHideAgentReasoning || null,
+    codexPromptLanguage: config.codexPromptLanguage,
+    codexModelCatalog: join(options.dir, 'config', config.codexPromptLanguage === 'zh' ? 'codex-model-catalog.zh.json' : 'codex-model-catalog.json'),
     sampleModel: model,
     upstreamModel: upstreamRequest.model,
     deepseekThinking: upstreamRequest.thinking || null,

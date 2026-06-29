@@ -1,10 +1,12 @@
 import { loadModelAliases } from './model-map.js';
-import { mergeLocalConfig } from './local-config.js';
+import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from './local-config.js';
 import { parseBoolean, parseList } from './common.js';
 import { readCodexConfig } from './codex-config.js';
+import { normalizePromptLanguage } from './prompt-language.js';
 
 export function loadConfig(env = process.env) {
   const mergedEnv = mergeLocalConfig(env);
+  const localConfig = readLocalConfigFile(resolveLocalConfigPath(env));
   const codexConfig = readCodexConfig(mergedEnv);
   return {
     port: Number(mergedEnv.PORT || 3000),
@@ -54,6 +56,7 @@ export function loadConfig(env = process.env) {
     codexReasoningSummary: codexConfig.modelReasoningSummary,
     codexModelSupportsReasoningSummaries: codexConfig.modelSupportsReasoningSummaries,
     codexHideAgentReasoning: codexConfig.hideAgentReasoning,
+    codexPromptLanguage: normalizePromptLanguage(localConfig.CODEX_PROMPT_LANGUAGE),
     modelAliases: loadModelAliases(mergedEnv),
   };
 }

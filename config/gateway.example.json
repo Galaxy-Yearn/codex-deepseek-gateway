@@ -1,5 +1,6 @@
 {
   "upstreamApiKey": "sk-REPLACE_ME",
+  "codexPromptLanguage": "en",
   "tavilyApiKey": "",
   "tavilyWebSearchEnabled": false,
   "firecrawlApiKey": "",

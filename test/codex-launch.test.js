@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   codexNewArgs,
   codexResumeArgs,
   codexResumeCommand,
+  createLaunchContext,
   pickerWindow,
   resolveCodexExecutable,
 } from '../src/codex-launch.js';
@@ -55,6 +59,37 @@ test('non-gateway launches do not force the gateway model catalog', () => {
   assert.equal(codexResumeCommand('session-1', other).includes('model_catalog_json='), false);
 });
 
+test('launch context defaults to the English Codex catalog', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-launch-'));
+  try {
+    mkdirSync(join(dir, 'config'));
+    writeFileSync(join(dir, 'config', 'model-aliases.json'), JSON.stringify({ 'deepseek-v4-flash': 'deepseek-v4-flash' }));
+    writeFileSync(join(dir, 'config', 'gateway.local.json'), JSON.stringify({ upstreamApiKey: 'test-key' }));
+
+    const context = createLaunchContext({ dir });
+    assert.equal(context.promptLanguage, 'en');
+    assert.equal(context.modelCatalogPath.endsWith(join('config', 'codex-model-catalog.json')), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('launch context uses Chinese Codex catalog when configured', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-launch-'));
+  try {
+    mkdirSync(join(dir, 'config'));
+    writeFileSync(join(dir, 'config', 'model-aliases.json'), JSON.stringify({ 'deepseek-v4-flash': 'deepseek-v4-flash' }));
+    writeFileSync(join(dir, 'config', 'gateway.local.json'), JSON.stringify({ upstreamApiKey: 'test-key', codexPromptLanguage: 'zh' }));
+
+    const context = createLaunchContext({ dir });
+    assert.equal(context.promptLanguage, 'zh');
+    assert.equal(context.modelCatalogPath.endsWith(join('config', 'codex-model-catalog.zh.json')), true);
+    assert.ok(codexNewArgs(context).some((arg) => arg.includes('codex-model-catalog.zh.json')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('resolves Codex launcher without shell-only shims when available', () => {
   const executable = resolveCodexExecutable();
   assert.equal(typeof executable, 'string');
@@ -63,20 +98,25 @@ test('resolves Codex launcher without shell-only shims when available', () => {
 });
 
 test('gateway Codex model catalog contains only DeepSeek aliases with Codex-compatible reasoning', () => {
-  const catalog = JSON.parse(readFileSync(new URL('../config/codex-model-catalog.json', import.meta.url), 'utf8'));
-  assert.deepEqual(catalog.models.map((model) => model.slug), ['deepseek-v4-flash', 'deepseek-v4-pro']);
-  for (const model of catalog.models) {
-    assert.equal(typeof model.base_instructions, 'string');
-    assert.match(model.base_instructions, /You are Codex/);
-    assert.equal(model.base_instructions.includes('based on GPT-5'), false);
-    assert.equal(model.model_messages.instructions_template.includes('based on GPT-5'), false);
-    assert.equal(model.description.includes('Gateway alias'), false);
-    assert.equal(model.description.includes('coding'), false);
-    assert.match(model.description, /^DeepSeek V4 /);
-    assert.deepEqual(
-      model.supported_reasoning_levels.map((level) => level.effort),
-      ['low', 'medium', 'high', 'xhigh'],
-    );
+  for (const file of ['codex-model-catalog.json', 'codex-model-catalog.zh.json']) {
+    const catalog = JSON.parse(readFileSync(new URL(`../config/${file}`, import.meta.url), 'utf8'));
+    assert.deepEqual(catalog.models.map((model) => model.slug), ['deepseek-v4-flash', 'deepseek-v4-pro']);
+    for (const model of catalog.models) {
+      assert.equal(typeof model.base_instructions, 'string');
+      assert.match(model.base_instructions, /Codex/);
+      assert.equal(model.base_instructions.includes('based on GPT-5'), false);
+      assert.equal(model.model_messages.instructions_template.includes('based on GPT-5'), false);
+      assert.equal(model.model_messages.instructions_template.includes('{{ personality }}'), true);
+      assert.equal(typeof model.model_messages.instructions_variables.personality_friendly, 'string');
+      assert.equal(typeof model.model_messages.instructions_variables.personality_pragmatic, 'string');
+      assert.equal(model.description.includes('Gateway alias'), false);
+      assert.equal(model.description.includes('coding'), false);
+      assert.match(model.description, /^DeepSeek V4 /);
+      assert.deepEqual(
+        model.supported_reasoning_levels.map((level) => level.effort),
+        ['low', 'medium', 'high', 'xhigh'],
+      );
+    }
   }
 });
 

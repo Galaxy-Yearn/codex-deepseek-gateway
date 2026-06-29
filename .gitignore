@@ -8,6 +8,7 @@ node_modules/
 config/gateway.local.json
 config/model-aliases.json
 codex-model-catalog.backup.json
+system-prompt.md
 gateway.pid
 *.pid
 

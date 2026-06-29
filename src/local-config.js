@@ -36,10 +36,14 @@ export function readLocalConfigFile(path = resolve(PROJECT_ROOT, 'config', 'gate
   return flattenConfig(parsed.value);
 }
 
-export function mergeLocalConfig(env = process.env, cwd = PROJECT_ROOT) {
-  const configPath = env.GATEWAY_CONFIG_FILE
+export function resolveLocalConfigPath(env = process.env, cwd = PROJECT_ROOT) {
+  return env.GATEWAY_CONFIG_FILE
     ? resolve(cwd, env.GATEWAY_CONFIG_FILE)
     : resolve(cwd, 'config', 'gateway.local.json');
+}
+
+export function mergeLocalConfig(env = process.env, cwd = PROJECT_ROOT) {
+  const configPath = resolveLocalConfigPath(env, cwd);
   const fileConfig = readLocalConfigFile(configPath);
   if (fileConfig.UPSTREAM_API_KEY === 'sk-REPLACE_ME') {
     delete fileConfig.UPSTREAM_API_KEY;

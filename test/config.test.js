@@ -38,6 +38,66 @@ test('loads local gateway config and lets env override it', async () => {
     assert.equal(config.upstreamProvider, 'deepseek');
     assert.equal(config.tavilyWebSearchEnabled, false);
     assert.equal(config.tavilyMaxSearchRounds, 10);
+    assert.equal(config.codexPromptLanguage, 'en');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('loads Codex prompt language from local gateway config', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-config-prompt-language-'));
+  try {
+    await mkdir(join(dir, 'config'));
+    await writeFile(
+      join(dir, 'config', 'gateway.local.json'),
+      JSON.stringify({
+        upstreamApiKey: 'from-file',
+        codexPromptLanguage: 'zh',
+      }),
+    );
+
+    const config = loadConfig({
+      GATEWAY_CONFIG_FILE: join(dir, 'config', 'gateway.local.json'),
+    });
+    assert.equal(config.codexPromptLanguage, 'zh');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('falls back to English for invalid Codex prompt language', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-config-prompt-language-'));
+  try {
+    await mkdir(join(dir, 'config'));
+    await writeFile(
+      join(dir, 'config', 'gateway.local.json'),
+      JSON.stringify({
+        upstreamApiKey: 'from-file',
+        codexPromptLanguage: 'fr',
+      }),
+    );
+
+    const config = loadConfig({
+      GATEWAY_CONFIG_FILE: join(dir, 'config', 'gateway.local.json'),
+    });
+    assert.equal(config.codexPromptLanguage, 'en');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('keeps Codex prompt language scoped to gateway.local.json', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-config-prompt-language-'));
+  try {
+    await mkdir(join(dir, 'config'));
+    const file = join(dir, 'config', 'gateway.local.json');
+    await writeFile(file, JSON.stringify({ upstreamApiKey: 'from-file', codexPromptLanguage: 'zh' }));
+
+    const config = loadConfig({
+      GATEWAY_CONFIG_FILE: file,
+      CODEX_PROMPT_LANGUAGE: 'en',
+    });
+    assert.equal(config.codexPromptLanguage, 'zh');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

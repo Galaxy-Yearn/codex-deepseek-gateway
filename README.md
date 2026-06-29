@@ -6,6 +6,8 @@ Codex keeps using the OpenAI `Responses API` wire format. The gateway translates
 
 Package: [@galaxy-yearn/codex-deepseek-gateway](https://www.npmjs.com/package/@galaxy-yearn/codex-deepseek-gateway)
 
+DeepSeek is a great company.
+
 ## Requirements
 
 - Node.js 22 or newer
@@ -28,7 +30,8 @@ The runtime is copied to `~/.codex/deepseek-gateway`. Put your DeepSeek API key 
 
 ```json
 {
-  "upstreamApiKey": "sk-..."
+  "upstreamApiKey": "sk-...",
+  "codexPromptLanguage": "en"
 }
 ```
 
@@ -94,6 +97,17 @@ codex -c model_provider=deepseek-gateway -c model=<model> -c model_reasoning_eff
 ```
 
 The installed launcher also passes `model_catalog_json` pointing at the packaged gateway Codex catalog, so Codex-native multi-agent validation accepts the DeepSeek model aliases and `low|medium|high|xhigh` reasoning efforts. This Codex setting replaces the default model catalog for that Codex process; it is not merged into it.
+
+Even if the `deepseek-v4` model supports a 1M context window, setting `context_window` and `max_context_window` too high in the catalog is not recommended, because excessive context can sharply degrade instruction following and cause attention drift.
+
+System prompt language is selected in `~/.codex/deepseek-gateway/config/gateway.local.json` with `codexPromptLanguage`. Supported values are `en` and `zh`; invalid values fall back to `en`. The launcher chooses the matching packaged catalog:
+
+```text
+en -> ~/.codex/deepseek-gateway/config/codex-model-catalog.json
+zh -> ~/.codex/deepseek-gateway/config/codex-model-catalog.zh.json
+```
+
+Codex `/personality` continues to work with the catalog's `personality_default`, `personality_friendly`, and `personality_pragmatic` entries.
 
 Inside a launcher-started Codex TUI, `/model` can switch between the packaged DeepSeek models and reasoning efforts.
 
