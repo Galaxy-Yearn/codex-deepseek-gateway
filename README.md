@@ -1,5 +1,7 @@
 # Codex DeepSeek Gateway
 
+English | [简体中文](README.zh-CN.md)
+
 A lightweight local gateway for using DeepSeek models in Codex. It performs nearly identically to the native GPT model.
 
 Codex keeps using the OpenAI `Responses API` wire format. The gateway translates requests to DeepSeek-compatible `Chat Completions`, calls DeepSeek, then translates the result back to Responses JSON or `response.*` SSE events.
