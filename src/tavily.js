@@ -1,4 +1,4 @@
-import { isObject, joinUrl, safeJsonParse } from './common.js';
+import { isObject, joinUrl, parseBoolean, safeJsonParse } from './common.js';
 
 const DEFAULT_MAX_RESULTS = 5;
 const HARD_MAX_RESULTS = 10;
@@ -12,15 +12,6 @@ function clampInteger(value, min, max, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(number)));
-}
-
-function booleanValue(value, fallback) {
-  if (typeof value === 'boolean') return value;
-  if (value == null || value === '') return fallback;
-  const normalized = String(value).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
-  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-  return fallback;
 }
 
 function cleanText(value, maxChars = DEFAULT_SNIPPET_CHARS) {
@@ -111,7 +102,7 @@ export function buildTavilySearchRequest(args = {}, config = {}) {
     query: normalized.query,
     search_depth: normalized.searchDepth,
     max_results: normalized.maxResults,
-    include_answer: booleanValue(config.tavilyIncludeAnswer, true),
+    include_answer: parseBoolean(config.tavilyIncludeAnswer, true),
     include_raw_content: false,
   };
   if (normalized.topic) body.topic = normalized.topic;

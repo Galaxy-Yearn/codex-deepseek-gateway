@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { isObject, mapDeepSeekReasoningEffort } from './common.js';
+import { isObject, mapDeepSeekReasoningEffort, parseJsonObject } from './common.js';
 
 const DEEPSEEK_V4_MODELS = ['deepseek-v4-flash', 'deepseek-v4-pro'];
 const DEPRECATED_MODEL_PATTERN = /^deepseek-(?:chat|reasoner)$/;
@@ -15,25 +15,16 @@ function deepseekV4Aliases() {
 
 export const DEFAULT_MODEL_ALIASES = deepseekV4Aliases();
 
-function parseJsonObject(value, source) {
-  if (!value) return {};
-  const parsed = JSON.parse(value);
-  if (!isObject(parsed)) {
-    throw new Error(`${source} must be a JSON object`);
-  }
-  return parsed;
-}
-
 function readJsonFile(filePath) {
   if (!filePath || !existsSync(filePath)) return {};
-  return parseJsonObject(readFileSync(filePath, 'utf8'), filePath);
+  return parseJsonObject(readFileSync(filePath, 'utf8'), { source: filePath, throwOnInvalid: true });
 }
 
 export function loadModelAliases(env = process.env, cwd = process.cwd()) {
   const defaultFile = resolve(cwd, 'config', 'model-aliases.json');
   const filePath = env.MODEL_ALIASES_FILE ? resolve(cwd, env.MODEL_ALIASES_FILE) : defaultFile;
   const fileAliases = readJsonFile(filePath);
-  const envAliases = parseJsonObject(env.MODEL_ALIASES_JSON, 'MODEL_ALIASES_JSON');
+  const envAliases = parseJsonObject(env.MODEL_ALIASES_JSON, { source: 'MODEL_ALIASES_JSON', throwOnInvalid: true });
   return {
     ...DEFAULT_MODEL_ALIASES,
     ...fileAliases,
@@ -94,15 +85,10 @@ export function deepseekReasoningPayload({ alias, reasoning } = {}) {
     return { thinking: { type: 'disabled' } };
   }
 
-  const payload = {};
+  const payload = { thinking: { type: 'enabled' } };
   const effort = aliasEffort ?? (effortDisablesThinking(requestEffort) ? undefined : requestEffort);
-  if (aliasThinking === 'enabled' || effort) {
-    payload.thinking = { type: 'enabled' };
-  }
-  if (effort) {
-    const reasoningEffort = mapDeepSeekReasoningEffort(effort);
-    if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
-  }
+  const reasoningEffort = mapDeepSeekReasoningEffort(effort);
+  if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
   return payload;
 }
 

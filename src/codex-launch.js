@@ -158,7 +158,6 @@ function ancestorCodexPackageRoot(filePath) {
           const parsed = JSON.parse(readFileSync(packageJson, 'utf8'));
           if (parsed?.name === '@openai/codex') return current;
         } catch {
-          // Keep walking; this is only a best-effort executable locator.
         }
       }
       const parent = dirname(current);

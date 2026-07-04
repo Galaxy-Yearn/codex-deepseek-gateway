@@ -8,9 +8,14 @@ node_modules/
 config/gateway.local.json
 config/model-aliases.json
 codex-model-catalog.backup.json
-system-prompt.md
 gateway.pid
 *.pid
+state/*
+!state/sessions.example.json
+CORE_BRIDGE_REVIEW.md
+system-prompt.md
+AGENTS.md
+CLAUDE.md
 
 # Logs and generated output
 *.log

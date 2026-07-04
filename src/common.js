@@ -9,7 +9,7 @@ export function generateId(prefix) {
 }
 
 export function normalizeRole(role, provider = 'generic') {
-  if (role === 'developer') return 'system';
+  if (provider === 'deepseek' && role === 'developer') return 'system';
   return role || 'user';
 }
 
@@ -63,10 +63,10 @@ export function mapDeepSeekReasoningEffort(effort) {
   if (!effort) return undefined;
   const normalized = String(effort).toLowerCase().replaceAll('_', '-');
   if (normalized === 'low') return undefined;
-  if (normalized === 'none' || normalized === 'disabled' || normalized === 'off') return undefined;
+  if (normalized === 'none' || normalized === 'disabled' || normalized === 'off' || normalized === 'false') return undefined;
   if (normalized === 'xhigh' || normalized === 'max') return 'max';
   if (normalized === 'medium' || normalized === 'high') return 'high';
-  return normalized;
+  return undefined;
 }
 
 export function joinUrl(baseUrl, path) {
@@ -138,4 +138,19 @@ export function safeJsonParse(text) {
   } catch (error) {
     return { ok: false, error };
   }
+}
+
+export function parseJsonObject(value, { source = 'JSON value', throwOnInvalid = false } = {}) {
+  if (isObject(value)) return value;
+  if (!value || typeof value !== 'string') {
+    if (throwOnInvalid && value) throw new Error(`${source} must be a JSON object`);
+    return {};
+  }
+  const parsed = safeJsonParse(value);
+  if (parsed.ok && isObject(parsed.value)) return parsed.value;
+  if (throwOnInvalid) {
+    if (parsed.ok) throw new Error(`${source} must be a JSON object`);
+    throw parsed.error;
+  }
+  return {};
 }

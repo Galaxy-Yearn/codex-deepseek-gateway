@@ -1,4 +1,4 @@
-import { generateId, isObject, safeJsonParse, toText } from './common.js';
+import { generateId, isObject, parseJsonObject, toText } from './common.js';
 import { callFirecrawlScrape } from './firecrawl.js';
 import { callTavilySearch, formatTavilySearchResult } from './tavily.js';
 
@@ -14,7 +14,7 @@ const INTERNAL_WEB_TOOL_NAMES = new Set([
   INTERNAL_WEB_OPEN_PAGE_TOOL,
   INTERNAL_WEB_FIND_IN_PAGE_TOOL,
 ]);
-const MAX_SEARCH_ROUNDS = 20;
+const MAX_SEARCH_ROUNDS = 40;
 
 const WEB_SEARCH_INSTRUCTIONS = [
   'For live web information, use tavily_search.',
@@ -133,13 +133,6 @@ const INTERNAL_FIND_IN_PAGE_TOOL = {
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
-}
-
-function parseJsonObject(text) {
-  if (isObject(text)) return text;
-  if (typeof text !== 'string' || !text.trim()) return {};
-  const parsed = safeJsonParse(text);
-  return parsed.ok && isObject(parsed.value) ? parsed.value : {};
 }
 
 function webSearchToolOptions(tools) {
@@ -395,7 +388,7 @@ export function knownExternalToolCallsCompletion(completion, tools) {
 
 export function maxWebSearchRounds(config = {}) {
   const value = Number(config.tavilyMaxSearchRounds);
-  if (!Number.isFinite(value)) return 10;
+  if (!Number.isFinite(value)) return 20;
   return Math.min(MAX_SEARCH_ROUNDS, Math.max(0, Math.trunc(value)));
 }
 
@@ -683,6 +676,14 @@ function buildAnnotations(text, searches = [], openedPages = []) {
   return annotations.sort((a, b) => a.start_index - b.start_index);
 }
 
+export function annotateMessagePartWithWebCitations(part, searches = [], openedPages = []) {
+  if (!part || part.type !== 'output_text' || typeof part.text !== 'string') return;
+  if (!(searches || []).length && !(openedPages || []).length) return;
+  const annotations = buildAnnotations(part.text, searches, openedPages);
+  if (!annotations.length) return;
+  part.annotations = [...(Array.isArray(part.annotations) ? part.annotations : []), ...annotations];
+}
+
 export function applyWebSearchOutputCompatibility(payload, searches = [], normalized = payload?.normalized, openedPages = []) {
   if (!payload || !Array.isArray(payload.output)) return payload;
   const explicitOpenedPages = (openedPages || []).filter((page) => !page.auto);
@@ -732,7 +733,7 @@ export function applyWebSearchOutputCompatibility(payload, searches = [], normal
   }
   payload.output = output;
   payload.output_text = output
-    .filter((item) => item?.type === 'message')
+    .filter((item) => item?.type === 'message' && item.phase !== 'commentary')
     .flatMap((item) => Array.isArray(item.content) ? item.content : [])
     .filter((part) => part?.type === 'output_text' && typeof part.text === 'string')
     .map((part) => part.text)

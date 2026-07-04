@@ -1,4 +1,4 @@
-import { isObject, joinUrl, safeJsonParse } from './common.js';
+import { isObject, joinUrl, parseBoolean, safeJsonParse } from './common.js';
 
 const DEFAULT_TOTAL_CHARS = 12000;
 const DEFAULT_PAGE_CHARS = 5000;
@@ -24,15 +24,6 @@ function clampInteger(value, min, max, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(number)));
-}
-
-function booleanValue(value, fallback) {
-  if (typeof value === 'boolean') return value;
-  if (value == null || value === '') return fallback;
-  const normalized = String(value).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
-  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-  return fallback;
 }
 
 function cleanText(value, maxChars = DEFAULT_PAGE_CHARS) {
@@ -82,7 +73,7 @@ function isPrivateIpv4(hostname) {
 function isBlockedHostname(hostname, config = {}) {
   const host = normalizedHostname(hostname);
   if (!host) return true;
-  const allowLocal = booleanValue(config.firecrawlAllowPrivateUrls, false);
+  const allowLocal = parseBoolean(config.firecrawlAllowPrivateUrls, false);
   if (allowLocal) return false;
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (host === 'metadata.google.internal') return true;
@@ -127,10 +118,10 @@ function normalizeFormats(args = {}, config = {}) {
     .map((format) => format.toLowerCase())
     .filter((format) => ['markdown', 'links', 'summary', 'changeTracking'].includes(format));
   if (!formats.includes('markdown')) formats.unshift('markdown');
-  if (booleanValue(args.include_links ?? args.includeLinks ?? config.firecrawlIncludeLinks, true) && !formats.includes('links')) {
+  if (parseBoolean(args.include_links ?? args.includeLinks ?? config.firecrawlIncludeLinks, true) && !formats.includes('links')) {
     formats.push('links');
   }
-  if (booleanValue(args.include_summary ?? args.includeSummary ?? config.firecrawlIncludeSummary, false) && !formats.includes('summary')) {
+  if (parseBoolean(args.include_summary ?? args.includeSummary ?? config.firecrawlIncludeSummary, false) && !formats.includes('summary')) {
     formats.push('summary');
   }
   return [...new Set(formats)];
@@ -163,14 +154,14 @@ export function buildFirecrawlScrapeRequest(args = {}, config = {}) {
   const body = {
     url: normalizedUrl.url,
     formats: normalizeFormats(source, config),
-    onlyMainContent: booleanValue(source.only_main_content ?? source.onlyMainContent ?? config.firecrawlOnlyMainContent, true),
-    removeBase64Images: booleanValue(source.remove_base64_images ?? source.removeBase64Images ?? config.firecrawlRemoveBase64Images, true),
+    onlyMainContent: parseBoolean(source.only_main_content ?? source.onlyMainContent ?? config.firecrawlOnlyMainContent, true),
+    removeBase64Images: parseBoolean(source.remove_base64_images ?? source.removeBase64Images ?? config.firecrawlRemoveBase64Images, true),
     waitFor: clampInteger(source.wait_for ?? source.waitFor ?? config.firecrawlWaitForMs, 0, 10000, 0),
     timeout: clampInteger(source.timeout ?? config.firecrawlTimeoutMs, 1000, 120000, 30000),
   };
   if (!body.waitFor) delete body.waitFor;
   const mobile = source.mobile ?? config.firecrawlMobile;
-  if (mobile !== undefined && mobile !== '') body.mobile = booleanValue(mobile, false);
+  if (mobile !== undefined && mobile !== '') body.mobile = parseBoolean(mobile, false);
 
   return {
     ok: true,

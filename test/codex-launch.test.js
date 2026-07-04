@@ -105,8 +105,29 @@ test('gateway Codex model catalog contains only DeepSeek aliases with Codex-comp
       assert.equal(typeof model.base_instructions, 'string');
       assert.match(model.base_instructions, /Codex/);
       assert.equal(model.base_instructions.includes('based on GPT-5'), false);
+      assert.equal(model.base_instructions.includes('multi_tool_use'), false);
+      assert.match(model.base_instructions, /tool_search/);
+      assert.equal(model.base_instructions.includes('rg --files'), false);
+      assert.equal(model.base_instructions.includes('Get-ChildItem'), false);
+      assert.match(model.base_instructions, /commentary\(text:/);
       assert.equal(model.model_messages.instructions_template.includes('based on GPT-5'), false);
       assert.equal(model.model_messages.instructions_template.includes('{{ personality }}'), true);
+      assert.equal(model.model_messages.instructions_template.includes('multi_tool_use'), false);
+      assert.match(model.model_messages.instructions_template, /tool_search/);
+      assert.equal(model.model_messages.instructions_template.includes('rg --files'), false);
+      assert.equal(model.model_messages.instructions_template.includes('Get-ChildItem'), false);
+      assert.match(model.model_messages.instructions_template, /commentary\(text:/);
+      assert.equal(model.base_instructions.includes('????????'), false);
+      assert.equal(model.model_messages.instructions_template.includes('????????'), false);
+      assert.equal(model.base_instructions.includes('\uFFFD'), false);
+      assert.equal(model.model_messages.instructions_template.includes('\uFFFD'), false);
+      if (file.endsWith('.zh.json')) {
+        assert.match(model.model_messages.instructions_template, /在同一条回复里同时发出多个工具调用/);
+        assert.match(model.model_messages.instructions_template, /先调用 `tool_search` 检索/);
+      } else {
+        assert.match(model.model_messages.instructions_template, /emit them together in one reply as multiple parallel tool calls/);
+        assert.match(model.model_messages.instructions_template, /call `tool_search` first/);
+      }
       assert.equal(typeof model.model_messages.instructions_variables.personality_friendly, 'string');
       assert.equal(typeof model.model_messages.instructions_variables.personality_pragmatic, 'string');
       assert.equal(model.description.includes('Gateway alias'), false);

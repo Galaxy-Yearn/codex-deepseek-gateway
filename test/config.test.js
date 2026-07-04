@@ -37,8 +37,43 @@ test('loads local gateway config and lets env override it', async () => {
     assert.equal(config.upstreamApiKey, 'from-file');
     assert.equal(config.upstreamProvider, 'deepseek');
     assert.equal(config.tavilyWebSearchEnabled, false);
-    assert.equal(config.tavilyMaxSearchRounds, 10);
+    assert.equal(config.tavilyMaxSearchRounds, 20);
     assert.equal(config.codexPromptLanguage, 'en');
+    assert.equal(config.sessionStoreEnabled, true);
+    assert.equal(config.sessionStorePath, join(dir, 'state', 'sessions.json'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('lets local config and env override persisted session store settings', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-session-config-'));
+  try {
+    await mkdir(join(dir, 'config'));
+    const file = join(dir, 'config', 'gateway.local.json');
+    await writeFile(
+      file,
+      JSON.stringify({
+        sessionStoreEnabled: false,
+        sessionStorePath: join(dir, 'custom', 'sessions.json'),
+        sessionStoreMaxSessions: 42,
+      }),
+    );
+
+    const localConfig = loadConfig({ GATEWAY_CONFIG_FILE: file });
+    assert.equal(localConfig.sessionStoreEnabled, false);
+    assert.equal(localConfig.sessionStorePath, join(dir, 'custom', 'sessions.json'));
+    assert.equal(localConfig.sessionStoreMaxSessions, 42);
+
+    const envConfig = loadConfig({
+      GATEWAY_CONFIG_FILE: file,
+      SESSION_STORE_ENABLED: 'true',
+      SESSION_STORE_PATH: join(dir, 'env', 'sessions.json'),
+      SESSION_STORE_MAX_SESSIONS: '7',
+    });
+    assert.equal(envConfig.sessionStoreEnabled, true);
+    assert.equal(envConfig.sessionStorePath, join(dir, 'env', 'sessions.json'));
+    assert.equal(envConfig.sessionStoreMaxSessions, 7);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

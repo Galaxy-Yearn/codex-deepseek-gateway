@@ -1,3 +1,4 @@
+import { dirname, resolve } from 'node:path';
 import { loadModelAliases } from './model-map.js';
 import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from './local-config.js';
 import { parseBoolean, parseList } from './common.js';
@@ -5,8 +6,10 @@ import { readCodexConfig } from './codex-config.js';
 import { normalizePromptLanguage } from './prompt-language.js';
 
 export function loadConfig(env = process.env) {
+  const localConfigPath = resolveLocalConfigPath(env);
+  const stateDir = resolve(dirname(localConfigPath), '..', 'state');
   const mergedEnv = mergeLocalConfig(env);
-  const localConfig = readLocalConfigFile(resolveLocalConfigPath(env));
+  const localConfig = readLocalConfigFile(localConfigPath);
   const codexConfig = readCodexConfig(mergedEnv);
   return {
     port: Number(mergedEnv.PORT || 3000),
@@ -16,18 +19,25 @@ export function loadConfig(env = process.env) {
     upstreamModel: mergedEnv.UPSTREAM_MODEL || '',
     upstreamProvider: mergedEnv.UPSTREAM_PROVIDER || 'deepseek',
     upstreamTimeoutMs: Number(mergedEnv.UPSTREAM_TIMEOUT_MS || 120000),
+    upstreamMaxTokens: Number(mergedEnv.UPSTREAM_MAX_TOKENS || mergedEnv.DEEPSEEK_MAX_TOKENS || 0),
     upstreamModels: parseList(mergedEnv.UPSTREAM_MODELS || mergedEnv.MODELS),
     fetchUpstreamModels: parseBoolean(mergedEnv.FETCH_UPSTREAM_MODELS, false),
     modelsTimeoutMs: Number(mergedEnv.MODELS_TIMEOUT_MS || 5000),
     modelsCacheMs: Number(mergedEnv.MODELS_CACHE_MS || 60000),
     proxyApiKey: mergedEnv.PROXY_API_KEY || '',
     debugPayload: parseBoolean(mergedEnv.DEBUG_PAYLOAD || mergedEnv.DEBUG_DEEPSEEK_PAYLOAD, false),
+    debugPayloadLogPath: mergedEnv.DEBUG_PAYLOAD_LOG_PATH || 'gateway.debug.log',
+    sessionStoreEnabled: parseBoolean(mergedEnv.SESSION_STORE_ENABLED, true),
+    sessionStorePath: mergedEnv.SESSION_STORE_PATH || resolve(stateDir, 'sessions.json'),
+    sessionStoreMaxSessions: Number(mergedEnv.SESSION_STORE_MAX_SESSIONS || 500),
+    sessionStoreMaxBytes: Number(mergedEnv.SESSION_STORE_MAX_BYTES || 0),
+    debugPayloadLogMaxBytes: Number(mergedEnv.DEBUG_PAYLOAD_LOG_MAX_BYTES || 0),
     tavilyWebSearchEnabled: parseBoolean(mergedEnv.TAVILY_WEB_SEARCH_ENABLED ?? mergedEnv.ENABLE_TAVILY_WEB_SEARCH, false),
     tavilyApiKey: mergedEnv.TAVILY_API_KEY || '',
     tavilyBaseUrl: mergedEnv.TAVILY_BASE_URL || 'https://api.tavily.com',
     tavilySearchDepth: mergedEnv.TAVILY_SEARCH_DEPTH || 'basic',
     tavilyMaxResults: Number(mergedEnv.TAVILY_MAX_RESULTS || 5),
-    tavilyMaxSearchRounds: Number(mergedEnv.TAVILY_MAX_SEARCH_ROUNDS || 10),
+    tavilyMaxSearchRounds: Number(mergedEnv.TAVILY_MAX_SEARCH_ROUNDS || 20),
     tavilyTimeoutMs: Number(mergedEnv.TAVILY_TIMEOUT_MS || 15000),
     tavilySnippetChars: Number(mergedEnv.TAVILY_SNIPPET_CHARS || 650),
     tavilyResultMaxChars: Number(mergedEnv.TAVILY_RESULT_MAX_CHARS || 6000),

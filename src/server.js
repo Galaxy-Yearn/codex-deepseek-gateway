@@ -1,21 +1,30 @@
 import http from 'node:http';
+import { appendFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { generateId, safeJsonParse, toText } from './common.js';
 import { listModels, mergeModelLists, normalizeModelList } from './model-map.js';
 import {
   assistantMessageFromResponseOutput,
+  bridgedCommentaryToolCallsFromMessage,
+  chatToolNamesFromTools,
   convertChatCompletionToResponses,
+  expandParallelToolCallsInCompletion,
   extractToolCallIdsFromMessages,
   normalizeResponsesRequest,
+  resolveEmittedToolCallNamesInCompletion,
   ResponsesStreamMapper,
   serializeResponsesSseEvent,
+  stripBridgedCommentaryFromCompletion,
   toChatCompletionsRequest,
   toProviderChatCompletionsRequest,
+  unavailableWebSearchToolShims,
 } from './protocol.js';
 import { SessionStore } from './session-store.js';
 import { callChatCompletions, callModels, readJsonResponse, relayChatCompletionsResponse } from './upstream.js';
 import {
+  annotateMessagePartWithWebCitations,
   applyWebSearchOutputCompatibility,
   buildWebSearchCallItem,
   containsWebSearchTool,
@@ -34,6 +43,7 @@ import {
 } from './web-search-emulator.js';
 
 function sendJson(res, statusCode, payload, headers = {}) {
+  if (res.destroyed || res.writableEnded) return;
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     ...headers,
@@ -67,23 +77,18 @@ function conversationIdFromRequest(request, normalized) {
 }
 
 function historyMessagesFromSession(session) {
-  if (!session?.history?.length) return [];
-  const messages = [];
-  for (const turn of session.history) {
-    if (Array.isArray(turn.historyMessages)) {
-      messages.push(...turn.historyMessages);
-      continue;
-    }
-    if (Array.isArray(turn.inputMessages)) {
-      messages.push(...turn.inputMessages);
-    } else if (Array.isArray(turn.chatRequest?.messages)) {
-      messages.push(...turn.chatRequest.messages);
-    }
-    if (turn.assistantMessage) {
-      messages.push(turn.assistantMessage);
-    }
-  }
+  return Array.isArray(session?.messages) ? session.messages : [];
+}
+
+function sessionMessages(chatMessages, assistantMessage) {
+  const messages = Array.isArray(chatMessages) ? chatMessages.slice() : [];
+  if (assistantMessage) messages.push(assistantMessage);
   return messages;
+}
+
+function shouldPersistSession(normalized, request, conversationId) {
+  if (conversationId) return true;
+  return (normalized.store ?? request.store) !== false;
 }
 
 function prependMissingAssistantToolMessages(messages, sessions) {
@@ -114,6 +119,22 @@ function prependMissingAssistantToolMessages(messages, sessions) {
   return prefix.length ? prefix.concat(messages) : messages;
 }
 
+function restoreAssistantReasoningContent(messages, sessions) {
+  return messages.map((message) => {
+    if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls) || !message.tool_calls.length) {
+      return message;
+    }
+    if (typeof message.reasoning_content === 'string' && message.reasoning_content) return message;
+    for (const toolCall of message.tool_calls) {
+      const stored = sessions.getAssistantMessageForToolCall(toolCall?.id);
+      if (typeof stored?.reasoning_content === 'string' && stored.reasoning_content) {
+        return { ...message, reasoning_content: stored.reasoning_content };
+      }
+    }
+    return message;
+  });
+}
+
 function summarizeMessage(message, index) {
   return {
     index,
@@ -126,16 +147,66 @@ function summarizeMessage(message, index) {
   };
 }
 
-function logDebugPayload(config, request) {
+function summarizeTool(tool, index) {
+  if (!tool || typeof tool !== 'object') {
+    return { index, type: typeof tool };
+  }
+  const fn = tool.type === 'function' && tool.function && typeof tool.function === 'object'
+    ? tool.function
+    : null;
+  return {
+    index,
+    type: tool.type,
+    name: fn?.name || tool.name || tool.tool_name || tool.server_label,
+    namespace: fn?.namespace || tool.namespace,
+    child_tools: Array.isArray(tool.tools) ? tool.tools.length : undefined,
+    has_parameters: Boolean(fn?.parameters || tool.parameters || tool.input_schema),
+  };
+}
+
+function summarizeTools(tools) {
+  return Array.isArray(tools) ? tools.map(summarizeTool) : [];
+}
+
+const DEBUG_PAYLOAD_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+function rotateDebugPayloadLog(logPath, maxBytes) {
+  try {
+    if (statSync(logPath).size < maxBytes) return;
+    rmSync(`${logPath}.1`, { force: true });
+    renameSync(logPath, `${logPath}.1`);
+  } catch {
+  }
+}
+
+function writeDebugPayloadLine(config, line) {
+  process.stderr.write(line);
+  if (!config.debugPayloadLogPath) return;
+  try {
+    const logPath = resolve(config.debugPayloadLogPath);
+    rotateDebugPayloadLog(logPath, config.debugPayloadLogMaxBytes || DEBUG_PAYLOAD_LOG_MAX_BYTES);
+    appendFileSync(logPath, line, 'utf8');
+  } catch (error) {
+    process.stderr.write(`[codex-deepseek-gateway] failed to write debug payload log: ${error.message || error}\n`);
+  }
+}
+
+function logDebugPayload(config, request, context = {}) {
   if (!config.debugPayload) return;
   const summary = {
+    stage: context.stage || 'upstream',
     model: request.model,
     stream: request.stream,
     thinking: request.thinking,
     reasoning_effort: request.reasoning_effort,
+    codex_tools: summarizeTools(context.rawRequest?.tools),
+    normalized_tools: summarizeTools(context.normalized?.tools),
+    chat_tools: summarizeTools(context.chatRequest?.tools),
+    upstream_tools: summarizeTools(request.tools),
+    tool_choice: request.tool_choice,
     messages: Array.isArray(request.messages) ? request.messages.map(summarizeMessage) : [],
   };
-  process.stderr.write(`[codex-deepseek-gateway] upstream request ${JSON.stringify(summary)}\n`);
+  writeDebugPayloadLine(config, `[codex-deepseek-gateway] upstream request ${JSON.stringify(summary)}\n`);
 }
 
 function resolveReasoningStreamMode(config, upstreamRequest) {
@@ -168,27 +239,24 @@ function webToolTimeoutMs(config = {}) {
   return Math.max(tavilyTimeout, firecrawlTimeout);
 }
 
-function addUsage(left, right) {
-  if (!left) return right || null;
-  if (!right) return left;
+function combineUsage(completions) {
+  const usages = completions.map((completion) => completion?.usage).filter(Boolean);
+  if (!usages.length) return null;
+  const last = usages[usages.length - 1];
+  const sum = (pick) => usages.reduce((total, usage) => total + (Number(pick(usage)) || 0), 0);
+  const promptTokens = Number(last.prompt_tokens) || 0;
+  const completionTokens = sum((usage) => usage.completion_tokens);
   return {
-    prompt_tokens: (left.prompt_tokens || 0) + (right.prompt_tokens || 0),
-    completion_tokens: (left.completion_tokens || 0) + (right.completion_tokens || 0),
-    total_tokens: (left.total_tokens || 0) + (right.total_tokens || 0),
-    reasoning_tokens: (left.reasoning_tokens || 0) + (right.reasoning_tokens || 0),
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
     prompt_tokens_details: {
-      cached_tokens: (left.prompt_tokens_details?.cached_tokens || 0) + (right.prompt_tokens_details?.cached_tokens || 0),
+      cached_tokens: last.prompt_tokens_details?.cached_tokens ?? last.prompt_cache_hit_tokens ?? 0,
     },
     completion_tokens_details: {
-      reasoning_tokens:
-        (left.completion_tokens_details?.reasoning_tokens || 0) +
-        (right.completion_tokens_details?.reasoning_tokens || 0),
+      reasoning_tokens: sum((usage) => usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens),
     },
   };
-}
-
-function combineUsage(completions) {
-  return completions.reduce((usage, completion) => addUsage(usage, completion?.usage), null);
 }
 
 function cloneCompletionWithUsage(completion, usage) {
@@ -202,7 +270,7 @@ function cloneCompletionWithUsage(completion, usage) {
 function toolCallsToFinalAnswerRequest(request) {
   return {
     ...request,
-    tool_choice: 'none',
+    tool_choice: undefined,
     tools: undefined,
     messages: removeWebSearchInstructions(request.messages).concat({
       role: 'user',
@@ -245,6 +313,12 @@ function hasWebSearchContext(searches, openedPages) {
   return searches.length > 0 || openedPages.length > 0;
 }
 
+function gatewayIncompleteMessageContent(reason) {
+  return reason === 'pseudo_tool_call_text_after_web_limit'
+    ? 'Gateway incomplete: after web tools were disabled, the model wrote a tool call as text instead of producing a final answer.'
+    : 'Gateway incomplete: the model did not produce visible assistant content after web tool results and a final-answer request.';
+}
+
 function completionWithGatewayIncompleteMessage(completion, reason = 'no_visible_assistant_content') {
   const next = completion == null ? {} : JSON.parse(JSON.stringify(completion));
   if (!Array.isArray(next.choices) || !next.choices.length) {
@@ -252,9 +326,7 @@ function completionWithGatewayIncompleteMessage(completion, reason = 'no_visible
   }
   const choice = next.choices[0];
   const previousMessage = choice.message || {};
-  const content = reason === 'pseudo_tool_call_text_after_web_limit'
-    ? 'Gateway incomplete: after web tools were disabled, the model wrote a tool call as text instead of producing a final answer.'
-    : 'Gateway incomplete: the model did not produce visible assistant content after web tool results and a final-answer request.';
+  const content = gatewayIncompleteMessageContent(reason);
   choice.message = {
     role: 'assistant',
     content,
@@ -276,24 +348,62 @@ function completionWithoutToolCalls(completion) {
   return next;
 }
 
-function markPayloadIncomplete(payload, reason) {
-  payload.status = 'incomplete';
-  payload.incomplete_details = { reason };
-  return payload;
-}
-
-async function callUpstreamJson({ upstreamRequest, config }) {
+async function callUpstreamJson({ upstreamRequest, config, signal }) {
   const response = await callChatCompletions({
     baseUrl: config.upstreamBaseUrl,
     apiKey: config.upstreamApiKey,
     request: upstreamRequest,
     timeoutMs: config.upstreamTimeoutMs,
+    signal,
   });
   const data = await readJsonResponse(response);
-  return { response, data };
+  return {
+    response,
+    data: resolveEmittedToolCallNamesInCompletion(
+      expandParallelToolCallsInCompletion(data),
+      chatToolNamesFromTools(upstreamRequest.tools),
+    ),
+  };
 }
 
-async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchStart, onSearchDone }) {
+function clientAbortControllerFor(res) {
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) controller.abort();
+  });
+  return controller;
+}
+
+function mergeAbortSignals(signals) {
+  const active = signals.filter(Boolean);
+  if (!active.length) return undefined;
+  if (active.length === 1) return active[0];
+  return AbortSignal.any(active);
+}
+
+function commentaryToolMessages(commentaryCalls) {
+  return (Array.isArray(commentaryCalls) ? commentaryCalls : []).map((toolCall) => ({
+    role: 'tool',
+    tool_call_id: toolCall.id || generateId('call'),
+    content: 'Delivered to the user.',
+  }));
+}
+
+function restoreCommentaryToolCalls(completion, commentaryCalls) {
+  if (!Array.isArray(commentaryCalls) || !commentaryCalls.length) return completion;
+  const choice = Array.isArray(completion?.choices) ? completion.choices[0] : null;
+  if (!choice?.message) return completion;
+  const existing = Array.isArray(choice.message.tool_calls) ? choice.message.tool_calls : [];
+  return {
+    ...completion,
+    choices: [
+      { ...choice, message: { ...choice.message, tool_calls: [...commentaryCalls, ...existing] } },
+      ...completion.choices.slice(1),
+    ],
+  };
+}
+
+async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, config, clientSignal, onSearchStart, onSearchDone }) {
   const effectiveChatRequest = { ...chatRequest, normalized };
   const state = prepareWebSearchRequest({ normalized, chatRequest: effectiveChatRequest, config });
   const searchConfig = state.config || config;
@@ -310,9 +420,16 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
     currentChatRequest = toolCallsToFinalAnswerRequest(baseRequest);
     const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
+    logDebugPayload(config, upstreamRequest, {
+      stage: 'web_search_final_answer',
+      rawRequest,
+      normalized,
+      chatRequest: currentChatRequest,
+    });
     const { response, data } = await callUpstreamJson({
       upstreamRequest: disableStreaming(upstreamRequest),
       config,
+      signal: clientSignal,
     });
     finalResponse = response;
     if (!response.ok) return { ok: false, status: response.status, data };
@@ -329,17 +446,30 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
   for (let round = 0; round <= maxRounds + 1; round += 1) {
     const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
+    logDebugPayload(config, upstreamRequest, {
+      stage: `web_search_round_${round}`,
+      rawRequest,
+      normalized,
+      chatRequest: currentChatRequest,
+    });
     const { response, data } = await callUpstreamJson({
       upstreamRequest: disableStreaming(upstreamRequest),
       config,
+      signal: clientSignal,
     });
     finalResponse = response;
     if (!response.ok) return { ok: false, status: response.status, data };
     completions.push(data);
     finalCompletion = data;
+    const roundChatMessage = Array.isArray(data?.choices) ? data.choices[0]?.message : null;
+    const commentaryCalls = bridgedCommentaryToolCallsFromMessage(roundChatMessage, currentChatRequest.tools);
+    const routingData = stripBridgedCommentaryFromCompletion(data, currentChatRequest.tools);
 
-    if (state.enabled && hasKnownExternalToolCalls(data, currentChatRequest.tools)) {
-      finalCompletion = knownExternalToolCallsCompletion(data, currentChatRequest.tools);
+    if (state.enabled && hasKnownExternalToolCalls(routingData, currentChatRequest.tools)) {
+      finalCompletion = restoreCommentaryToolCalls(
+        knownExternalToolCallsCompletion(routingData, currentChatRequest.tools),
+        commentaryCalls,
+      );
       completions[completions.length - 1] = finalCompletion;
       break;
     }
@@ -348,12 +478,13 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
       break;
     }
 
-    const wantsInternalWeb = shouldContinueWebSearchLoop(data);
-    const hasToolCalls = hasAnyToolCalls(data);
+    const wantsInternalWeb = shouldContinueWebSearchLoop(routingData);
+    const wantsInternalRound = wantsInternalWeb || commentaryCalls.length > 0;
+    const hasToolCalls = hasAnyToolCalls(routingData);
 
-    if (!wantsInternalWeb || round >= maxRounds) {
-      if (hasToolCalls && hasUnknownExternalToolCalls(data, currentChatRequest.tools)) {
-        const unsupportedMessages = unhandledToolMessagesFromCompletion(data, undefined, {
+    if (!wantsInternalRound || round >= maxRounds) {
+      if (hasToolCalls && hasUnknownExternalToolCalls(routingData, currentChatRequest.tools)) {
+        const unsupportedMessages = unhandledToolMessagesFromCompletion(routingData, undefined, {
           onlyUnknownExternal: true,
           tools: currentChatRequest.tools,
         });
@@ -365,7 +496,7 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
         break;
       }
 
-      if (wantsInternalWeb || (!hasToolCalls && hasWebSearchContext(searches, openedPages) && !hasVisibleAssistantContent(data))) {
+      if (wantsInternalRound || (!hasToolCalls && hasWebSearchContext(searches, openedPages) && !hasVisibleAssistantContent(routingData))) {
         const finalAnswerError = await requestFinalAnswer(currentChatRequest);
         if (finalAnswerError) return finalAnswerError;
         break;
@@ -380,7 +511,7 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
       toolResult = await executeWebSearchCalls({
         completion: data,
         config: searchConfig,
-        signal: controller.signal,
+        signal: mergeAbortSignals([controller.signal, clientSignal]),
         onSearchStart,
         onSearchDone,
       });
@@ -391,7 +522,7 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
     openedPages.push(...(toolResult.openedPages || []));
     currentChatRequest = {
       ...currentChatRequest,
-      messages: currentChatRequest.messages.concat(toolResult.messages),
+      messages: currentChatRequest.messages.concat(toolResult.messages, commentaryToolMessages(commentaryCalls)),
       tool_choice:
         currentChatRequest.tool_choice?.function?.name === INTERNAL_WEB_SEARCH_TOOL
           ? 'auto'
@@ -410,170 +541,10 @@ async function runWebSearchChatLoop({ normalized, chatRequest, config, onSearchS
   };
 }
 
-const REPLAY_REASONING_DELTA_CHARS = 1200;
-
-function splitReplayText(text, maxChars = REPLAY_REASONING_DELTA_CHARS) {
-  const value = String(text ?? '');
-  if (!value) return [];
-  const chunks = [];
-  for (let index = 0; index < value.length; index += maxChars) {
-    chunks.push(value.slice(index, index + maxChars));
-  }
-  return chunks;
-}
-
-function replayReasoningItemEvents({ item, outputIndex, mapper }) {
-  const events = [];
-  const summaries = Array.isArray(item.summary) ? item.summary : [];
-  const content = Array.isArray(item.content) ? item.content : [];
-  const addedItem = {
-    ...item,
-    status: 'in_progress',
-    summary: [],
-    content: content.map((part) => (part?.type === 'reasoning_text' ? { ...part, text: '' } : part)),
-  };
-
-  events.push({
-    type: 'response.output_item.added',
-    sequence_number: mapper.nextSequence(),
-    output_index: outputIndex,
-    item: addedItem,
-  });
-
-  for (const [summaryIndex, part] of summaries.entries()) {
-    if (part?.type !== 'summary_text') continue;
-    const text = String(part.text ?? '');
-    events.push({
-      type: 'response.reasoning_summary_part.added',
-      sequence_number: mapper.nextSequence(),
-      output_index: outputIndex,
-      item_id: item.id,
-      summary_index: summaryIndex,
-      part: { ...part, text: '' },
-    });
-    for (const delta of splitReplayText(text)) {
-      events.push({
-        type: 'response.reasoning_summary_text.delta',
-        sequence_number: mapper.nextSequence(),
-        output_index: outputIndex,
-        item_id: item.id,
-        summary_index: summaryIndex,
-        delta,
-      });
-    }
-    events.push({
-      type: 'response.reasoning_summary_text.done',
-      sequence_number: mapper.nextSequence(),
-      output_index: outputIndex,
-      item_id: item.id,
-      summary_index: summaryIndex,
-      text,
-    });
-    events.push({
-      type: 'response.reasoning_summary_part.done',
-      sequence_number: mapper.nextSequence(),
-      output_index: outputIndex,
-      item_id: item.id,
-      summary_index: summaryIndex,
-      part,
-    });
-  }
-
-  events.push({
-    type: 'response.output_item.done',
-    sequence_number: mapper.nextSequence(),
-    output_index: outputIndex,
-    item,
-  });
-  return events;
-}
-
-function outputEventsFromPayload(payload, mapper, { skipTypes = new Set() } = {}) {
-  const events = [];
-  const output = Array.isArray(payload.output) ? payload.output : [];
-  for (const [outputIndex, item] of output.entries()) {
-    if (skipTypes.has(item?.type)) continue;
-    mapper.output[outputIndex] = item;
-    if (item?.type === 'reasoning') {
-      events.push(...replayReasoningItemEvents({ item, outputIndex, mapper }));
-      continue;
-    }
-    events.push({
-      type: 'response.output_item.added',
-      sequence_number: mapper.nextSequence(),
-      output_index: outputIndex,
-      item,
-    });
-    if (item.type === 'message' && Array.isArray(item.content)) {
-      for (const [contentIndex, part] of item.content.entries()) {
-        events.push({
-          type: 'response.content_part.added',
-          sequence_number: mapper.nextSequence(),
-          output_index: outputIndex,
-          content_index: contentIndex,
-          item_id: item.id,
-          part: part.type === 'output_text' ? { ...part, text: '', annotations: [] } : part,
-        });
-        if (part.type === 'output_text' && part.text) {
-          events.push({
-            type: 'response.output_text.delta',
-            sequence_number: mapper.nextSequence(),
-            output_index: outputIndex,
-            content_index: contentIndex,
-            item_id: item.id,
-            delta: part.text,
-            logprobs: [],
-          });
-          for (const [annotationIndex, annotation] of (Array.isArray(part.annotations) ? part.annotations : []).entries()) {
-            events.push({
-              type: 'response.output_text.annotation.added',
-              sequence_number: mapper.nextSequence(),
-              output_index: outputIndex,
-              content_index: contentIndex,
-              item_id: item.id,
-              annotation_index: annotationIndex,
-              annotation,
-            });
-          }
-          events.push({
-            type: 'response.output_text.done',
-            sequence_number: mapper.nextSequence(),
-            output_index: outputIndex,
-            content_index: contentIndex,
-            item_id: item.id,
-            text: part.text,
-            logprobs: [],
-          });
-        }
-        events.push({
-          type: 'response.content_part.done',
-          sequence_number: mapper.nextSequence(),
-          output_index: outputIndex,
-          content_index: contentIndex,
-          item_id: item.id,
-          part,
-        });
-      }
-    }
-    events.push({
-      type: 'response.output_item.done',
-      sequence_number: mapper.nextSequence(),
-      output_index: outputIndex,
-      item,
-    });
-  }
-  return events;
-}
-
-function completedEventFromPayload(payload, mapper) {
-  return {
-    type: payload.status === 'incomplete' ? 'response.incomplete' : 'response.completed',
-    sequence_number: mapper.nextSequence(),
-    response: payload,
-  };
-}
+const STREAM_HEARTBEAT_MS = 10000;
 
 function writeSseEvent(res, event) {
+  if (res.writableEnded || res.destroyed) return;
   res.write(serializeResponsesSseEvent(event));
 }
 
@@ -609,7 +580,242 @@ function webSearchSseWriter({ res, mapper, outputIndexBySearch, includeSources =
   };
 }
 
-export function createProxyServer({ config = loadConfig(), sessions = new SessionStore() } = {}) {
+async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, config, res, responseId, previousResponseId, clientSignal }) {
+  const effectiveChatRequest = { ...chatRequest, normalized };
+  const state = prepareWebSearchRequest({ normalized, chatRequest: effectiveChatRequest, config });
+  if (!state.enabled) return { handled: false };
+
+  const searchConfig = state.config || config;
+  const maxRounds = maxWebSearchRounds(searchConfig);
+  let currentChatRequest = state.chatRequest;
+
+  const buildUpstreamRequest = (stage) => {
+    const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
+    if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
+    logDebugPayload(config, upstreamRequest, { stage, rawRequest, normalized, chatRequest: currentChatRequest });
+    return upstreamRequest;
+  };
+
+  const firstUpstreamRequest = buildUpstreamRequest('web_search_stream_round_0');
+  let upstreamResponse = await callChatCompletions({
+    baseUrl: config.upstreamBaseUrl,
+    apiKey: config.upstreamApiKey,
+    request: firstUpstreamRequest,
+    timeoutMs: config.upstreamTimeoutMs,
+    signal: clientSignal,
+  });
+  if (!upstreamResponse.ok) {
+    sendJson(res, upstreamResponse.status, await readJsonResponse(upstreamResponse));
+    return { handled: true };
+  }
+
+  const mapper = new ResponsesStreamMapper({
+    responseId,
+    model: firstUpstreamRequest.model,
+    createdAt: Math.floor(Date.now() / 1000),
+    previousResponseId,
+    normalized,
+    config,
+    ...resolveReasoningStreamMode(config, firstUpstreamRequest),
+    holdToolItemEvents: true,
+    knownToolNames: chatToolNamesFromTools(firstUpstreamRequest.tools),
+  });
+  const searchWriter = webSearchSseWriter({
+    res,
+    mapper,
+    outputIndexBySearch: new Map(),
+    includeSources: shouldIncludeSearchSources(normalized),
+  });
+  const streamSearchItems = new Set();
+  const roundUsages = [];
+  const searches = [];
+  const openedPages = [];
+  let finalAnswerForced = false;
+  let roundEnd = null;
+
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+  });
+  writeSseEvent(res, mapper.createdEvent());
+  writeSseEvent(res, mapper.inProgressEvent());
+  const heartbeat = setInterval(() => {
+    writeSseEvent(res, mapper.inProgressEvent());
+  }, STREAM_HEARTBEAT_MS);
+
+  const endStream = () => {
+    writeSseDone(res);
+    res.end();
+  };
+  const failStream = (message) => {
+    for (const event of mapper.streamFailed(message)) writeSseEvent(res, event);
+    endStream();
+    return { handled: true };
+  };
+  const finishTurn = () => {
+    if (mapper.messageItem?.content?.length) {
+      annotateMessagePartWithWebCitations(mapper.messageItem.content[0], searches, openedPages);
+    }
+    const combinedUsage = combineUsage(roundUsages.concat([{ usage: mapper.pendingUsage }]));
+    for (const event of mapper.finalize(mapper.pendingFinishReason || 'stop', combinedUsage)) {
+      writeSseEvent(res, event);
+    }
+    endStream();
+    return { handled: true, chatRequest: currentChatRequest, assistantMessage: mapper.roundAssistantMessage() };
+  };
+  const relayRound = async () => {
+    roundEnd = null;
+    mapper.markRoundStart();
+    await relayChatCompletionsResponse({
+      upstreamResponse,
+      res,
+      passThrough: false,
+      writeHeaders: false,
+      endResponse: false,
+      onStreamChunk(event) {
+        if (event?.done) {
+          roundEnd = { eof: Boolean(event.eof) };
+          return;
+        }
+        for (const responseEvent of mapper.mapChatEvent(event)) {
+          writeSseEvent(res, responseEvent);
+        }
+      },
+    });
+  };
+
+  try {
+    await relayRound();
+    for (let round = 0; ; round += 1) {
+      if (clientSignal?.aborted) {
+        return { handled: true };
+      }
+      if (!mapper.pendingFinishReason && roundEnd?.eof) {
+        return failStream('upstream stream ended before completion');
+      }
+      mapper.expandParallelToolItems();
+      const roundMessage = mapper.roundAssistantMessage();
+      const commentaryCalls = bridgedCommentaryToolCallsFromMessage(roundMessage, currentChatRequest.tools);
+      for (const event of mapper.convertBridgedCommentaryItems()) writeSseEvent(res, event);
+      const completionLike = {
+        choices: [{ index: 0, message: roundMessage, finish_reason: mapper.pendingFinishReason || 'stop' }],
+      };
+      const routingCompletion = stripBridgedCommentaryFromCompletion(completionLike, currentChatRequest.tools);
+
+      if (finalAnswerForced) {
+        mapper.removeToolItems();
+        const reason = finalAnswerIncompleteReason(routingCompletion);
+        if (reason) {
+          const events = mapper.replaceBufferedAssistantText(gatewayIncompleteMessageContent(reason));
+          for (const event of events || []) writeSseEvent(res, event);
+        }
+        return finishTurn();
+      }
+
+      if (hasKnownExternalToolCalls(routingCompletion, currentChatRequest.tools)) {
+        const kept = knownExternalToolCallsCompletion(routingCompletion, currentChatRequest.tools);
+        const keptIds = new Set(
+          (kept.choices?.[0]?.message?.tool_calls || []).map((toolCall) => toolCall.id).filter(Boolean),
+        );
+        mapper.removeToolItems((item) => !keptIds.has(item.call_id));
+        return finishTurn();
+      }
+
+      const wantsInternalWeb = shouldContinueWebSearchLoop(routingCompletion);
+      const wantsInternalRound = wantsInternalWeb || commentaryCalls.length > 0;
+      const hasToolCallsRound = hasAnyToolCalls(routingCompletion);
+
+      if (!wantsInternalRound || round >= maxRounds) {
+        if (hasToolCallsRound && hasUnknownExternalToolCalls(routingCompletion, currentChatRequest.tools)) {
+          const unsupportedMessages = unhandledToolMessagesFromCompletion(routingCompletion, undefined, {
+            onlyUnknownExternal: true,
+            tools: currentChatRequest.tools,
+          });
+          currentChatRequest = toolCallsToFinalAnswerRequest({
+            ...currentChatRequest,
+            messages: currentChatRequest.messages.concat(unsupportedMessages),
+          });
+        } else if (wantsInternalRound || (!hasToolCallsRound && hasWebSearchContext(searches, openedPages) && !hasVisibleAssistantContent(routingCompletion))) {
+          currentChatRequest = toolCallsToFinalAnswerRequest(currentChatRequest);
+        } else {
+          return finishTurn();
+        }
+        finalAnswerForced = true;
+        roundUsages.push({ usage: mapper.pendingUsage });
+        mapper.removeToolItems();
+        for (const event of mapper.beginNextRound()) writeSseEvent(res, event);
+        mapper.holdVisibleTextUntilDone();
+      } else {
+        roundUsages.push({ usage: mapper.pendingUsage });
+        for (const event of mapper.beginNextRound()) writeSseEvent(res, event);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), webToolTimeoutMs(searchConfig));
+        let toolResult;
+        try {
+          toolResult = await executeWebSearchCalls({
+            completion: completionLike,
+            config: searchConfig,
+            signal: mergeAbortSignals([controller.signal, clientSignal]),
+            onSearchStart(search) {
+              if (search.action && search.auto) return;
+              streamSearchItems.add(search);
+              searchWriter.start(search);
+            },
+            onSearchDone(search) {
+              if (!streamSearchItems.has(search)) return;
+              searchWriter.done(search);
+            },
+          });
+        } finally {
+          clearTimeout(timeout);
+        }
+        searches.push(...toolResult.searches);
+        openedPages.push(...(toolResult.openedPages || []));
+        currentChatRequest = {
+          ...currentChatRequest,
+          messages: currentChatRequest.messages.concat(toolResult.messages, commentaryToolMessages(commentaryCalls)),
+          tool_choice:
+            currentChatRequest.tool_choice?.function?.name === INTERNAL_WEB_SEARCH_TOOL
+              ? 'auto'
+              : currentChatRequest.tool_choice,
+        };
+      }
+
+      if (clientSignal?.aborted) {
+        return { handled: true };
+      }
+      const upstreamRequest = buildUpstreamRequest(`web_search_stream_round_${round + 1}`);
+      upstreamResponse = await callChatCompletions({
+        baseUrl: config.upstreamBaseUrl,
+        apiKey: config.upstreamApiKey,
+        request: upstreamRequest,
+        timeoutMs: config.upstreamTimeoutMs,
+        signal: clientSignal,
+      });
+      if (!upstreamResponse.ok) {
+        const data = await readJsonResponse(upstreamResponse);
+        return failStream(data?.error?.message || `upstream error ${upstreamResponse.status}`);
+      }
+      await relayRound();
+    }
+  } catch (error) {
+    if (clientSignal?.aborted) {
+      return { handled: true };
+    }
+    throw error;
+  } finally {
+    clearInterval(heartbeat);
+  }
+}
+
+export function createProxyServer({ config = loadConfig(), sessions } = {}) {
+  sessions ||= new SessionStore({
+    persistPath: config.sessionStoreEnabled === false ? '' : config.sessionStorePath,
+    maxSessions: config.sessionStoreMaxSessions,
+    maxBytes: config.sessionStoreMaxBytes,
+  });
   let modelCache = null;
 
   async function getModelList() {
@@ -647,18 +853,26 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
 
     const request = parsed.value;
     const normalized = normalizeResponsesRequest(request);
-    const currentInputMessages = normalized.messages.slice();
     const previousResponseId = normalized.previous_response_id || request.previous_response_id || null;
     const conversationId = conversationIdFromRequest(request, normalized);
     const priorSession = previousResponseId ? sessions.get(previousResponseId) : conversationId ? sessions.getConversation(conversationId) : null;
-    if (priorSession?.history?.length) {
-      const priorMessages = historyMessagesFromSession(priorSession);
+    const priorMessages = historyMessagesFromSession(priorSession);
+    if (priorMessages.length) {
       normalized.messages = priorMessages.concat(normalized.messages);
     }
     normalized.messages = prependMissingAssistantToolMessages(normalized.messages, sessions);
+    normalized.messages = restoreAssistantReasoningContent(normalized.messages, sessions);
 
     const chatRequest = toChatCompletionsRequest(normalized);
     const useWebSearchEmulator = hasTavilyWebSearch(config, normalized);
+    if (!useWebSearchEmulator) {
+      const existingToolNames = new Set(chatToolNamesFromTools(chatRequest.tools));
+      const webShims = unavailableWebSearchToolShims(normalized.tools)
+        .filter((tool) => !existingToolNames.has(tool.function.name));
+      if (webShims.length) chatRequest.tools = [...(chatRequest.tools ?? []), ...webShims];
+    }
+    const clientAbort = clientAbortControllerFor(res);
+    const clientSignal = clientAbort.signal;
     let upstreamRequest = toProviderChatCompletionsRequest(chatRequest, config);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || normalized.model;
 
@@ -672,119 +886,74 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
     }
 
     const responseId = generateId('resp');
-    const nextSession = { id: responseId, history: [] };
-
-    if (useWebSearchEmulator) {
-      const streamWebSearch = Boolean(request.stream);
-      let streamMapper = null;
-      let streamSearchWriter = null;
-      const streamSearchItems = new Set();
-      if (streamWebSearch) {
-        const createdAt = Math.floor(Date.now() / 1000);
-        streamMapper = new ResponsesStreamMapper({
-          responseId,
-          model: upstreamRequest.model,
-          createdAt,
-          previousResponseId,
-          normalized,
-          emitReasoningSummary: true,
-          emitReasoningText: false,
-        });
-        streamSearchWriter = webSearchSseWriter({
-          res,
-          mapper: streamMapper,
-          outputIndexBySearch: new Map(),
-          includeSources: shouldIncludeSearchSources(normalized),
-        });
-        res.writeHead(200, {
-          'content-type': 'text/event-stream; charset=utf-8',
-          'cache-control': 'no-cache, no-transform',
-          connection: 'keep-alive',
-          'x-accel-buffering': 'no',
-        });
-        writeSseEvent(res, streamMapper.createdEvent());
-        writeSseEvent(res, streamMapper.inProgressEvent());
+    const nextSession = { id: responseId, messages: [] };
+    const persistSession = shouldPersistSession(normalized, request, conversationId);
+    const persistTurn = (chatMessages, assistantMessage) => {
+      if (persistSession) {
+        nextSession.messages = sessionMessages(chatMessages, assistantMessage);
+        sessions.set(responseId, nextSession);
+        sessions.setConversation(conversationId, responseId);
+      } else {
+        sessions.rememberAssistantMessage(assistantMessage);
       }
+    };
 
-      const loop = await runWebSearchChatLoop({
+    if (useWebSearchEmulator && request.stream) {
+      const result = await runStreamingWebSearchTurn({
+        rawRequest: request,
         normalized,
         chatRequest,
         config,
-        onSearchStart: streamWebSearch
-          ? (search) => {
-              if (search.action && search.auto) return;
-              streamSearchItems.add(search);
-              streamSearchWriter.start(search);
-            }
-          : undefined,
-        onSearchDone: streamWebSearch
-          ? (search) => {
-              if (!streamSearchItems.has(search)) return;
-              streamSearchWriter.done(search);
-            }
-          : undefined,
+        res,
+        responseId,
+        previousResponseId,
+        clientSignal,
+      });
+      if (result.handled) {
+        if (result.assistantMessage) persistTurn(result.chatRequest.messages, result.assistantMessage);
+        return;
+      }
+    } else if (useWebSearchEmulator) {
+      const loop = await runWebSearchChatLoop({
+        rawRequest: request,
+        normalized,
+        chatRequest,
+        config,
+        clientSignal,
       });
       if (!loop.ok) {
-        if (streamWebSearch) {
-          writeSseEvent(res, {
-            type: 'response.failed',
-            sequence_number: streamMapper.nextSequence(),
-            response: streamMapper.response('failed'),
-          });
-          writeSseDone(res);
-          res.end();
-          return;
-        }
         sendJson(res, loop.status || 500, loop.data);
         return;
       }
       upstreamRequest = toProviderChatCompletionsRequest(loop.chatRequest, config);
       if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || normalized.model;
-      const model = upstreamRequest.model;
+      logDebugPayload(config, upstreamRequest, {
+        stage: 'web_search_compatibility_payload',
+        rawRequest: request,
+        normalized,
+        chatRequest: loop.chatRequest,
+      });
       const payload = applyWebSearchOutputCompatibility(convertChatCompletionToResponses({
         completion: loop.completion,
-        model,
+        model: upstreamRequest.model,
         previousResponseId,
         normalized,
         responseId,
         config,
       }), loop.searches, normalized, loop.openedPages);
-      if (loop.incompleteReason) markPayloadIncomplete(payload, loop.incompleteReason);
-      const assistantMessage = assistantMessageFromResponseOutput(payload.output);
-
-      nextSession.history.push({
-        request: normalized,
-        chatRequest: loop.chatRequest,
-        upstreamRequest,
-        inputMessages: currentInputMessages,
-        historyMessages: loop.chatRequest.messages.concat(assistantMessage),
-        assistantMessage,
-        createdAt: Date.now(),
-      });
-      sessions.set(responseId, nextSession);
-      sessions.setConversation(conversationId, responseId);
-
-      if (!streamWebSearch) {
-        sendJson(res, 200, payload);
-        return;
-      }
-
-      for (const event of outputEventsFromPayload(payload, streamMapper, { skipTypes: new Set(['web_search_call']) })) {
-        writeSseEvent(res, event);
-      }
-      writeSseEvent(res, completedEventFromPayload(payload, streamMapper));
-      writeSseDone(res);
-      res.end();
+      persistTurn(loop.chatRequest.messages, assistantMessageFromResponseOutput(payload.output));
+      sendJson(res, 200, payload);
       return;
     }
 
-    logDebugPayload(config, upstreamRequest);
+    logDebugPayload(config, upstreamRequest, { rawRequest: request, normalized, chatRequest });
 
     const upstreamResponse = await callChatCompletions({
       baseUrl: config.upstreamBaseUrl,
       apiKey: config.upstreamApiKey,
       request: upstreamRequest,
       timeoutMs: config.upstreamTimeoutMs,
+      signal: clientSignal,
     });
 
     const model = upstreamRequest.model;
@@ -805,16 +974,7 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
         responseId,
         config,
       });
-      nextSession.history.push({
-        request: normalized,
-        chatRequest,
-        upstreamRequest,
-        inputMessages: currentInputMessages,
-        assistantMessage: assistantMessageFromResponseOutput(payload.output),
-        createdAt: Date.now(),
-      });
-      sessions.set(responseId, nextSession);
-      sessions.setConversation(conversationId, responseId);
+      persistTurn(chatRequest.messages, assistantMessageFromResponseOutput(payload.output));
       sendJson(res, 200, payload);
       return;
     }
@@ -833,48 +993,46 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
       previousResponseId,
       normalized,
       config,
-      ...(() => {
-        const reasoningMode = resolveReasoningStreamMode(config, upstreamRequest);
-        return {
-          bufferOutputUntilDone: upstreamRequest?.thinking?.type === 'enabled',
-          ...reasoningMode,
-        };
-      })(),
+      ...resolveReasoningStreamMode(config, upstreamRequest),
+      knownToolNames: chatToolNamesFromTools(upstreamRequest.tools),
     });
     let doneSent = false;
     const writeResponsesDone = () => {
       if (doneSent) return;
       doneSent = true;
-      res.write(serializeResponsesSseEvent({ done: true }));
+      writeSseEvent(res, { done: true });
     };
 
-    res.write(serializeResponsesSseEvent(mapper.createdEvent()));
-    res.write(serializeResponsesSseEvent(mapper.inProgressEvent()));
+    writeSseEvent(res, mapper.createdEvent());
+    writeSseEvent(res, mapper.inProgressEvent());
+    let lastEventWriteAt = Date.now();
 
-    await relayChatCompletionsResponse({
-      upstreamResponse,
-      res,
-      passThrough: false,
-      writeHeaders: false,
-      onStreamChunk(event) {
-        const events = mapper.mapChatEvent(event);
-        for (const responseEvent of events) {
-          res.write(serializeResponsesSseEvent(responseEvent));
-        }
-        if (event?.done) writeResponsesDone();
-      },
-    });
+    try {
+      await relayChatCompletionsResponse({
+        upstreamResponse,
+        res,
+        passThrough: false,
+        writeHeaders: false,
+        onStreamChunk(event) {
+          const events = mapper.mapChatEvent(event);
+          for (const responseEvent of events) {
+            writeSseEvent(res, responseEvent);
+          }
+          if (events.length) {
+            lastEventWriteAt = Date.now();
+          } else if (!event?.done && Date.now() - lastEventWriteAt >= STREAM_HEARTBEAT_MS) {
+            writeSseEvent(res, mapper.inProgressEvent());
+            lastEventWriteAt = Date.now();
+          }
+          if (event?.done) writeResponsesDone();
+        },
+      });
+    } catch (error) {
+      if (clientSignal.aborted) return;
+      throw error;
+    }
 
-    nextSession.history.push({
-      request: normalized,
-      chatRequest,
-      upstreamRequest,
-      inputMessages: currentInputMessages,
-      assistantMessage: mapper.assistantMessage(),
-      createdAt: Date.now(),
-    });
-    sessions.set(responseId, nextSession);
-    sessions.setConversation(conversationId, responseId);
+    persistTurn(chatRequest.messages, mapper.assistantMessage());
   }
 
   return http.createServer(async (req, res) => {
@@ -917,6 +1075,7 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
           apiKey: config.upstreamApiKey,
           request: upstreamRequest,
           timeoutMs: config.upstreamTimeoutMs,
+          signal: clientAbortControllerFor(res).signal,
         });
         await relayChatCompletionsResponse({ upstreamResponse, res, passThrough: true });
         return;
@@ -924,6 +1083,7 @@ export function createProxyServer({ config = loadConfig(), sessions = new Sessio
 
       sendJson(res, 404, { error: { message: 'Not found' } });
     } catch (error) {
+      if (res.destroyed) return;
       if (res.headersSent) {
         if (!res.writableEnded) {
           res.write(serializeResponsesSseEvent({

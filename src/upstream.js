@@ -82,9 +82,11 @@ export async function relayChatCompletionsResponse({
   onStreamChunk,
   passThrough = true,
   writeHeaders = true,
+  endResponse = true,
 }) {
   const contentType = upstreamResponse.headers.get('content-type') || '';
   const isStream = contentType.includes('text/event-stream');
+  const writable = () => !res.destroyed && !res.writableEnded;
 
   if (!isStream) {
     const data = await readJsonResponse(upstreamResponse);
@@ -92,18 +94,18 @@ export async function relayChatCompletionsResponse({
       onStreamChunk({ data });
       onStreamChunk({ done: true });
     }
-    if (passThrough) {
+    if (passThrough && writable()) {
       res.writeHead(upstreamResponse.status, {
         'content-type': 'application/json; charset=utf-8',
       });
       res.end(JSON.stringify(data));
-    } else {
+    } else if (endResponse && writable()) {
       res.end();
     }
     return;
   }
 
-  if (writeHeaders) {
+  if (writeHeaders && writable()) {
     res.writeHead(upstreamResponse.status, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
@@ -114,17 +116,17 @@ export async function relayChatCompletionsResponse({
 
   const reader = upstreamResponse.body?.getReader?.();
   if (!reader) {
-    res.end();
+    if (endResponse && writable()) res.end();
     return;
   }
 
   const parser = new SseParser();
   let sawDone = false;
-  const emitDone = () => {
+  const emitDone = ({ eof = false } = {}) => {
     if (sawDone) return;
     sawDone = true;
-    if (typeof onStreamChunk === 'function') onStreamChunk({ done: true });
-    if (passThrough) res.write(`data: [DONE]\n\n`);
+    if (typeof onStreamChunk === 'function') onStreamChunk(eof ? { done: true, eof: true } : { done: true });
+    if (passThrough && writable()) res.write(`data: [DONE]\n\n`);
   };
 
   while (true) {
@@ -134,11 +136,11 @@ export async function relayChatCompletionsResponse({
     for (const event of events) {
       if (event.done) {
         emitDone();
-        res.end();
+        if (endResponse && writable()) res.end();
         return;
       }
       if (typeof onStreamChunk === 'function') onStreamChunk(event);
-      if (passThrough) res.write(`data: ${event.data}\n\n`);
+      if (passThrough && writable()) res.write(`data: ${event.data}\n\n`);
     }
   }
 
@@ -148,8 +150,8 @@ export async function relayChatCompletionsResponse({
       break;
     }
     if (typeof onStreamChunk === 'function') onStreamChunk(event);
-    if (passThrough) res.write(`data: ${event.data}\n\n`);
+    if (passThrough && writable()) res.write(`data: ${event.data}\n\n`);
   }
-  emitDone();
-  res.end();
+  emitDone({ eof: true });
+  if (endResponse && writable()) res.end();
 }
