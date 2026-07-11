@@ -8,8 +8,9 @@ import { readLocalConfigFile } from './local-config.js';
 import { catalogFileForPromptLanguage, normalizePromptLanguage } from './prompt-language.js';
 
 export const DEFAULT_PROVIDER = 'deepseek-gateway';
-export const REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
+export const REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const SELECTED_ROW = '\x1b[38;2;57;100;254m';
+const MUTED_TEXT = '\x1b[90m';
 const RESET_STYLE = '\x1b[0m';
 const require = createRequire(import.meta.url);
 const CODEX_PLATFORM_PACKAGE_BY_TARGET = {
@@ -60,7 +61,9 @@ export function createLaunchContext(options) {
   const models = gatewayModels(options.dir);
   const codexConfig = readCodexConfig();
   const promptLanguage = readPromptLanguage(options.dir);
+  const provider = options.provider || DEFAULT_PROVIDER;
   const configModel = codexConfig.modelProvider === DEFAULT_PROVIDER && models.includes(codexConfig.model) ? codexConfig.model : '';
+  const configReasoningEffort = codexConfig.modelProvider === provider ? codexConfig.modelReasoningEffort : '';
   return {
     all: options.all,
     codexHome,
@@ -69,9 +72,9 @@ export function createLaunchContext(options) {
     models,
     promptLanguage,
     projectRoot: findProjectRoot(process.cwd()),
-    provider: options.provider || DEFAULT_PROVIDER,
+    provider,
     model: options.model || configModel || models[0] || '',
-    reasoningEffort: options.reasoningEffort || codexConfig.modelReasoningEffort || 'low',
+    reasoningEffort: options.reasoningEffort || configReasoningEffort || 'low',
   };
 }
 
@@ -80,6 +83,11 @@ export function missingModelMessage(context) {
 }
 
 function configOverrideArgs(context) {
+  if (context.provider === DEFAULT_PROVIDER && !REASONING_EFFORTS.includes(context.reasoningEffort)) {
+    throw new Error(
+      `Unsupported DeepSeek reasoning effort ${JSON.stringify(context.reasoningEffort)}. Expected one of: ${REASONING_EFFORTS.join(', ')}`,
+    );
+  }
   const args = [
     '-c',
     `model_provider=${JSON.stringify(context.provider)}`,
@@ -270,9 +278,24 @@ export function pickerWindow(rows, selected, windowSize, currentOffset = 0) {
   };
 }
 
+function pickerControl(key, label) {
+  const control = String(key || '').trim();
+  const description = String(label || '').trim();
+  if (!control) return '';
+  return description ? `${control} ${MUTED_TEXT}${description}${RESET_STYLE}` : control;
+}
+
 function pickerControls(shortcuts = []) {
-  const labels = shortcuts.map((shortcut) => shortcut.label).filter(Boolean);
-  return [...labels, '↑/↓ select', '← back', 'Enter confirm', 'Esc quit'].join('  ');
+  const labels = shortcuts
+    .map((shortcut) => pickerControl(shortcut.displayKey || shortcut.key, shortcut.label))
+    .filter(Boolean);
+  return [
+    ...labels,
+    pickerControl('↑/↓', 'browse'),
+    pickerControl('←', 'back'),
+    pickerControl('Enter', 'confirm'),
+    pickerControl('Esc', 'quit'),
+  ].join('    ');
 }
 
 function renderRow(state, absoluteIndex) {
@@ -290,13 +313,13 @@ function pickerLines(state) {
   state.offset = window.offset;
   state.visibleRows = window.rows;
   const lines = [title, ''];
-  if (header) lines.push(`  ${header}`, `  ${'-'.repeat(header.length)}`);
+  if (header) lines.push(`  ${header}`, `  ${MUTED_TEXT}${'─'.repeat(header.length)}${RESET_STYLE}`);
   for (const [visibleIndex, rowText] of state.visibleRows.entries()) {
     const absoluteIndex = state.offset + visibleIndex;
     const row = `${absoluteIndex === selected ? '>' : ' '} ${rowText}`;
     lines.push(absoluteIndex === selected ? `${SELECTED_ROW}${row}${RESET_STYLE}` : row);
   }
-  if (!rows.length && emptyMessage) lines.push(emptyMessage);
+  if (!rows.length && emptyMessage) lines.push(`  ${emptyMessage}`);
   if (rows.length > state.visibleRows.length) {
     lines.push('', `  Showing ${state.offset + 1}-${state.offset + state.visibleRows.length} of ${rows.length}`);
   }

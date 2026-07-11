@@ -31,7 +31,14 @@ test('rejects private Firecrawl URLs by default', () => {
   assert.equal(normalizeFirecrawlUrl('http://127.0.0.1:8080/a').ok, false);
   assert.equal(normalizeFirecrawlUrl('http://localhost/a').ok, false);
   assert.equal(normalizeFirecrawlUrl('http://169.254.169.254/latest/meta-data').ok, false);
+  assert.equal(normalizeFirecrawlUrl('http://[fc00::1]/a').ok, false);
+  assert.equal(normalizeFirecrawlUrl('http://[fd12::1]/a').ok, false);
   assert.equal(normalizeFirecrawlUrl('file:///etc/passwd').ok, false);
+});
+
+test('allows public hostnames that begin with IPv6 private-range text', () => {
+  assert.equal(normalizeFirecrawlUrl('https://fda.gov/a').ok, true);
+  assert.equal(normalizeFirecrawlUrl('https://fc.example.com/a').ok, true);
 });
 
 test('formats Firecrawl response as compact model-readable page text', () => {

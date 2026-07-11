@@ -93,15 +93,15 @@ Model aliases are read from:
 
 `model-aliases.json` is managed by this package and refreshed on install. The packaged Codex catalog currently allows the default aliases `deepseek-v4-flash` and `deepseek-v4-pro` for Codex-native sub-agent validation.
 
-### Session State
+### Reasoning Cache
 
-The gateway persists its Responses-side `previous_response_id` / `conversation` graph under:
+The gateway keeps a bounded DeepSeek reasoning cache under:
 
 ```text
-~/.codex/deepseek-gateway/state/sessions.json
+~/.codex/deepseek-gateway/state/reasoning-cache.jsonl
 ```
 
-That state lets DeepSeek receive reconstructed Chat history — including raw reasoning for thinking-mode tool turns — after a gateway restart. Codex sends `store: false`, so its turns persist only a compact per-`call_id` reasoning cache; full history snapshots are kept only for clients that use `previous_response_id` / `conversation` with storage enabled. The file is human-readable JSON (`state/sessions.example.json` shows the shape) and safe to delete at any time. Tune it with `sessionStorePath`, `sessionStoreMaxSessions` (default 500), `sessionStoreMaxBytes` (default 16 MB), or `sessionStoreEnabled: false`; the matching `SESSION_STORE_*` environment variables work too.
+Each JSONL record maps tool `call_id` values to the assistant message containing raw `reasoning_content`, so DeepSeek thinking-mode tool turns can be replayed after a gateway restart. Codex owns conversation history in its rollout and sends that history in `input`; the gateway does not persist `previous_response_id`, `conversation`, or full message history. The cache is append-only between bounded compactions, is preserved by `install`, and can be deleted safely. Tune it with `reasoningCachePath`, `reasoningCacheMaxMessages` (default 1000), `reasoningCacheMaxBytes` (default 16 MB), or `reasoningCacheEnabled: false`; matching `REASONING_CACHE_*` environment variables also work. An existing `sessions.json` cache is migrated once and removed.
 
 ## Usage
 
@@ -117,7 +117,7 @@ Resume a Codex session from the current project:
 codex-deepseek-gateway sessions
 ```
 
-Prefer these `new` / `sessions` commands over plain `codex` / `codex resume`. The launcher adds the gateway provider, model catalog, model, and reasoning overrides.
+Use only these `new` / `sessions` commands for the intended DeepSeek-backed Codex experience. Plain `codex` / `codex resume` do not load the packaged model catalog; the launcher adds the gateway provider, model catalog, model, and reasoning overrides.
 
 In the interactive session picker, use Up/Down to move through a scrolling window of sessions. Press `n` to start a new conversation instead of resuming an existing session.
 
@@ -136,7 +136,7 @@ codex-deepseek-gateway sessions --exec <id-or-row>                           # r
 codex -c model_provider=deepseek-gateway -c model=<model> -c model_reasoning_effort=<effort> -c model_supports_reasoning_summaries=true -c model_reasoning_summary=auto
 ```
 
-The launcher also passes `model_catalog_json` pointing at the packaged catalog, so Codex-native multi-agent validation accepts the DeepSeek model aliases and `low|medium|high|xhigh` reasoning efforts. This setting replaces the default model catalog for that Codex process; it is not merged into it. The default context window is expanded to 1M since both `deepseek-v4-flash` and `deepseek-v4-pro` model supports that. `context_window` and `max_context_window` can be customized.
+The launcher also passes `model_catalog_json` pointing at the packaged catalog, so Codex-native multi-agent validation accepts the DeepSeek model aliases and `low|medium|high|xhigh|max` reasoning efforts. This setting replaces the default model catalog for that Codex process; it is not merged into it. The default context window is expanded to 1M since both `deepseek-v4-flash` and `deepseek-v4-pro` model supports that. `context_window` and `max_context_window` can be customized.
 
 Inside a launcher-started Codex TUI, `/model` switches between the packaged DeepSeek models and reasoning efforts, and `/personality` works with the catalog's `personality_default`, `personality_friendly`, and `personality_pragmatic` entries.
 
@@ -167,6 +167,7 @@ Codex effort maps to DeepSeek V4 thinking mode:
 | `medium` | `thinking.type = enabled`, `reasoning_effort = high` |
 | `high` | `thinking.type = enabled`, `reasoning_effort = high` |
 | `xhigh` | `thinking.type = enabled`, `reasoning_effort = max` |
+| `max` | `thinking.type = enabled`, `reasoning_effort = max` |
 
 When DeepSeek returns `reasoning_content`, the raw text is preserved for DeepSeek history, while Codex receives a display summary: Markdown-cleaned, with a leading bold `**Reasoning**` header. The header drives the Codex status line while the model thinks.
 
@@ -205,8 +206,7 @@ Chat Completions is not a full Responses API replacement.
 - Hosted tools without a local Codex executor are represented as function shims. Web search is the only hosted tool the gateway emulates directly.
 - Tavily/Firecrawl web emulation is text-focused; it does not provide browser control, screenshots, raw HTML, cookies, crawl jobs, or private-network access.
 - OpenAI `file_id` values are passed through; the gateway cannot fetch private OpenAI-hosted files.
-- Plain `codex` commands do not automatically load the packaged model catalog. Use the launcher when you want TUI `/model` and sub-agent validation to use the DeepSeek catalog.
-- Resumed sessions may hide parts of earlier assistant replies that contain Markdown tables. This is a Codex TUI replay bug ([openai/codex#29218](https://github.com/openai/codex/issues/29218)); the session data itself is intact.
+- Plain `codex` commands do not automatically load the packaged model catalog. Use only `codex-deepseek-gateway new` / `sessions` for the supported DeepSeek workflow, including TUI `/model` and sub-agent validation.
 
 ## License
 

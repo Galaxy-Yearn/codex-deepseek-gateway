@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { isObject, joinUrl, parseBoolean, safeJsonParse } from './common.js';
 
 const DEFAULT_TOTAL_CHARS = 12000;
@@ -70,6 +71,12 @@ function isPrivateIpv4(hostname) {
   return PRIVATE_IPV4_RANGES.some(([start, end]) => number >= start && number <= end);
 }
 
+function isPrivateIpv6(hostname) {
+  const host = normalizedHostname(hostname);
+  if (isIP(host) !== 6) return false;
+  return host === '::1' || host === '0:0:0:0:0:0:0:1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd');
+}
+
 function isBlockedHostname(hostname, config = {}) {
   const host = normalizedHostname(hostname);
   if (!host) return true;
@@ -77,9 +84,7 @@ function isBlockedHostname(hostname, config = {}) {
   if (allowLocal) return false;
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (host === 'metadata.google.internal') return true;
-  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
-  if (host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return true;
-  return isPrivateIpv4(host);
+  return isPrivateIpv4(host) || isPrivateIpv6(host);
 }
 
 export function normalizeFirecrawlUrl(value, config = {}) {

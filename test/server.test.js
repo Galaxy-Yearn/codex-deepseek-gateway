@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createProxyServer } from '../src/server.js';
-import { SessionStore } from '../src/session-store.js';
+import { ReasoningCache } from '../src/reasoning-cache.js';
 import { DEFAULT_MODEL_ALIASES } from '../src/model-map.js';
 
 const legacyChatModel = ['deepseek', 'chat'].join('-');
@@ -26,6 +26,23 @@ function close(server) {
   });
 }
 
+function parseResponsesSse(text) {
+  const frames = [];
+  for (const block of String(text).split(/\r?\n\r?\n/)) {
+    if (!block.trim()) continue;
+    let event = null;
+    const dataLines = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('event:')) event = line.slice('event:'.length).trim();
+      if (line.startsWith('data:')) dataLines.push(line.slice('data:'.length).replace(/^ /, ''));
+    }
+    if (!dataLines.length) continue;
+    const rawData = dataLines.join('\n');
+    frames.push({ event, data: rawData === '[DONE]' ? rawData : JSON.parse(rawData) });
+  }
+  return frames;
+}
+
 test('exposes configured model aliases on /v1/models', async () => {
   const proxy = createProxyServer({
     config: {
@@ -33,14 +50,14 @@ test('exposes configured model aliases on /v1/models', async () => {
       upstreamProvider: 'deepseek',
       modelAliases: DEFAULT_MODEL_ALIASES,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
   try {
     const response = await fetch(`${proxyUrl}/v1/models`);
-    assert.equal(response.status, 200);
     const body = await response.json();
+    assert.equal(response.status, 200);
     assert.equal(body.object, 'list');
     assert.equal(body.data.some((model) => model.id === 'deepseek-v4-flash'), true);
     assert.equal(body.data.some((model) => model.id === 'deepseek-v4-pro'), true);
@@ -57,7 +74,7 @@ test('returns minimal health payload', async () => {
       upstreamProvider: 'deepseek',
       modelAliases: DEFAULT_MODEL_ALIASES,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -96,7 +113,7 @@ test('merges upstream models and filters deprecated DeepSeek model names', async
       modelsTimeoutMs: 5000,
       modelsCacheMs: 60000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -120,7 +137,7 @@ test('requires configured proxy API key for v1 routes', async () => {
       proxyApiKey: 'local-key',
       modelAliases: DEFAULT_MODEL_ALIASES,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -164,7 +181,7 @@ test('proxies non-streaming Responses request to chat completions upstream', asy
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -193,176 +210,65 @@ test('proxies non-streaming Responses request to chat completions upstream', asy
   }
 });
 
-test('keeps full previous_response_id history across multiple follow-ups', async () => {
-  const upstreamBodies = [];
+test('does not restore historically discovered tools for Codex compaction requests', async () => {
+  let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    upstreamBodies.push(body);
+    upstreamBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
-      id: `chatcmpl_${upstreamBodies.length}`,
-      object: 'chat.completion',
-      created: 123 + upstreamBodies.length,
-      model: body.model,
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: `answer ${upstreamBodies.length}` },
-          finish_reason: 'stop',
-        },
-      ],
+      id: 'chatcmpl_compaction',
+      created: 123,
+      choices: [{ message: { role: 'assistant', content: 'compact summary' }, finish_reason: 'stop' }],
     }));
   });
   const upstreamUrl = await listen(upstream);
   const proxy = createProxyServer({
     config: {
-      serverName: 'test',
       upstreamBaseUrl: upstreamUrl,
       upstreamApiKey: 'test-key',
       upstreamModel: 'deepseek-v4-flash',
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
   try {
-    const first = await fetch(`${proxyUrl}/v1/responses`, {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'codex', input: 'first user' }),
-    });
-    const firstBody = await first.json();
-    const second = await fetch(`${proxyUrl}/v1/responses`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'codex', previous_response_id: firstBody.id, input: 'second user' }),
-    });
-    const secondBody = await second.json();
-    const third = await fetch(`${proxyUrl}/v1/responses`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'codex', previous_response_id: secondBody.id, input: 'third user' }),
-    });
-    assert.equal(third.status, 200);
-    await third.json();
-
-    assert.deepEqual(upstreamBodies[2].messages.map((message) => message.content), [
-      'first user',
-      'answer 1',
-      'second user',
-      'answer 2',
-      'third user',
-    ]);
-  } finally {
-    await close(proxy);
-    await close(upstream);
-  }
-});
-
-test('resumes previous_response_id and conversation history after gateway restart', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'gateway-server-sessions-'));
-  const persistPath = join(dir, 'sessions.json');
-  const upstreamBodies = [];
-  const upstream = http.createServer(async (req, res) => {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    upstreamBodies.push(body);
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
-      id: `chatcmpl_restart_${upstreamBodies.length}`,
-      object: 'chat.completion',
-      created: 123 + upstreamBodies.length,
-      model: body.model,
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: `restart answer ${upstreamBodies.length}` },
-          finish_reason: 'stop',
-        },
-      ],
-    }));
-  });
-  const upstreamUrl = await listen(upstream);
-  const config = {
-    serverName: 'test',
-    upstreamBaseUrl: upstreamUrl,
-    upstreamApiKey: 'test-key',
-    upstreamModel: 'deepseek-v4-flash',
-    upstreamProvider: 'deepseek',
-    upstreamTimeoutMs: 5000,
-    sessionStoreEnabled: true,
-    sessionStorePath: persistPath,
-    sessionStoreMaxSessions: 10,
-  };
-
-  let proxy = null;
-  try {
-    proxy = createProxyServer({ config });
-    let proxyUrl = await listen(proxy);
-    const first = await fetch(`${proxyUrl}/v1/responses`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'codex', conversation: 'conv_restart', input: 'first user' }),
-    });
-    assert.equal(first.status, 200);
-    const firstBody = await first.json();
-    await close(proxy);
-    proxy = null;
-
-    proxy = createProxyServer({ config });
-    proxyUrl = await listen(proxy);
-    const second = await fetch(`${proxyUrl}/v1/responses`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-codex-turn-metadata': JSON.stringify({ request_kind: 'compaction', turn_id: 'turn_compact' }),
+      },
       body: JSON.stringify({
-        model: 'codex',
-        conversation: 'conv_restart',
-        previous_response_id: firstBody.id,
-        input: 'second user',
+        model: 'deepseek-v4-flash',
+        input: [
+          {
+            type: 'tool_search_output',
+            call_id: 'call_search',
+            status: 'completed',
+            tools: [{ type: 'function', name: 'discovered_tool', parameters: { type: 'object', properties: {} } }],
+          },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compact this conversation' }] },
+        ],
       }),
     });
-    assert.equal(second.status, 200);
-    await second.json();
-    await close(proxy);
-    proxy = null;
-
-    proxy = createProxyServer({ config });
-    proxyUrl = await listen(proxy);
-    const third = await fetch(`${proxyUrl}/v1/responses`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'codex', conversation: 'conv_restart', input: 'third user' }),
-    });
-    assert.equal(third.status, 200);
-    await third.json();
-
-    assert.deepEqual(upstreamBodies[1].messages.map((message) => message.content), [
-      'first user',
-      'restart answer 1',
-      'second user',
-    ]);
-    assert.deepEqual(upstreamBodies[2].messages.map((message) => message.content), [
-      'first user',
-      'restart answer 1',
-      'second user',
-      'restart answer 2',
-      'third user',
-    ]);
+    assert.equal(response.status, 200);
+    assert.equal(upstreamBody.tools, undefined);
+    assert.equal(upstreamBody.messages[0].content.includes('real callable functions available now'), false);
   } finally {
-    if (proxy) await close(proxy);
+    await close(proxy);
     await close(upstream);
-    await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('store:false persists only the tool-call cache and still restores reasoning after restart', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'gateway-server-store-false-'));
-  const persistPath = join(dir, 'sessions.json');
+
+test('restores reasoning_content from the persistent call-id cache after restart', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-server-reasoning-cache-'));
+  const persistPath = join(dir, 'reasoning-cache.jsonl');
   const upstreamBodies = [];
   const upstream = http.createServer(async (req, res) => {
     const chunks = [];
@@ -396,9 +302,9 @@ test('store:false persists only the tool-call cache and still restores reasoning
     upstreamModel: 'deepseek-v4-flash',
     upstreamProvider: 'deepseek',
     upstreamTimeoutMs: 5000,
-    sessionStoreEnabled: true,
-    sessionStorePath: persistPath,
-    sessionStoreMaxSessions: 10,
+    reasoningCacheEnabled: true,
+    reasoningCachePath: persistPath,
+    reasoningCacheMaxMessages: 10,
   };
   const tools = [{ type: 'function', name: 'lookup', parameters: { type: 'object', properties: {} } }];
 
@@ -416,12 +322,9 @@ test('store:false persists only the tool-call cache and still restores reasoning
     const functionCall = firstBody.output.find((item) => item.type === 'function_call');
     assert.equal(functionCall.call_id, 'call_store_1');
 
-    const persisted = JSON.parse(await readFile(persistPath, 'utf8'));
-    assert.deepEqual(persisted.sessions, []);
-    assert.deepEqual(persisted.conversations, []);
-    assert.equal(persisted.toolCallMessages.length, 1);
-    assert.equal(persisted.assistantMessages.length, 1);
-    assert.equal(persisted.assistantMessages[persisted.toolCallMessages[0][1]].reasoning_content, 'store-false thinking');
+    const persisted = JSON.parse((await readFile(persistPath, 'utf8')).trim());
+    assert.deepEqual(persisted.callIds, ['call_store_1']);
+    assert.equal(persisted.message.reasoning_content, 'store-false thinking');
 
     await close(proxy);
     proxy = null;
@@ -436,8 +339,6 @@ test('store:false persists only the tool-call cache and still restores reasoning
         store: false,
         tools,
         input: [
-          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'first user' }] },
-          { type: 'function_call', call_id: 'call_store_1', name: 'lookup', arguments: '{"query":"codex"}' },
           { type: 'function_call_output', call_id: 'call_store_1', output: 'lookup result' },
         ],
       }),
@@ -449,10 +350,9 @@ test('store:false persists only the tool-call cache and still restores reasoning
       (message) => message.role === 'assistant' && Array.isArray(message.tool_calls),
     );
     assert.equal(replayedAssistant.reasoning_content, 'store-false thinking');
+    assert.equal(upstreamBodies[1].messages.at(-1).tool_call_id, 'call_store_1');
 
-    const persistedAfter = JSON.parse(await readFile(persistPath, 'utf8'));
-    assert.deepEqual(persistedAfter.sessions, []);
-    assert.equal(persistedAfter.toolCallMessages.length, 1);
+    assert.equal((await readFile(persistPath, 'utf8')).trim().split('\n').length, 1);
   } finally {
     if (proxy) await close(proxy);
     await close(upstream);
@@ -555,7 +455,7 @@ test('emulates Codex web_search with Tavily for non-streaming Responses requests
       tavilyMaxResults: 5,
       tavilySearchDepth: 'basic',
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -669,7 +569,7 @@ test('emulates Codex web_search with progressive Responses SSE when client reque
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -705,19 +605,26 @@ test('emulates Codex web_search with progressive Responses SSE when client reque
       remainingText += Buffer.from(value).toString('utf8');
     }
     const text = earlyText + remainingText;
-    assert.match(text, /event: response\.completed/);
-    assert.match(text, /"type":"web_search_call"/);
-    assert.match(text, /"status":"completed"/);
-    assert.doesNotMatch(text, /"sources":/);
-    assert.match(text, /event: response\.reasoning_summary_part\.added/);
-    assert.match(text, /event: response\.reasoning_summary_text\.delta/);
-    assert.match(text, /Checked the search result before answering\./);
-    assert.ok(text.indexOf('event: response.reasoning_summary_text.delta') < text.indexOf('event: response.output_text.delta'));
-    assert.doesNotMatch(text, /event: response\.output_text\.annotation\.added/);
-    assert.match(text, /"type":"url_citation"/);
-    assert.match(text, /"url":"https:\/\/example\.com\/source"/);
-    assert.match(text, /"text":"Answer \[1\]\."/);
-    assert.match(text, /data: \[DONE\]/);
+    const frames = parseResponsesSse(text);
+    const completed = frames.find((frame) => frame.event === 'response.completed').data.response;
+    const webSearch = completed.output.find((item) => item.type === 'web_search_call');
+    assert.equal(webSearch.status, 'completed');
+    assert.equal('sources' in webSearch, false);
+    assert.equal(frames.some((frame) => frame.event === 'response.reasoning_summary_part.added'), true);
+    const reasoningText = frames
+      .filter((frame) => frame.event === 'response.reasoning_summary_text.delta')
+      .map((frame) => frame.data.delta)
+      .join('');
+    assert.match(reasoningText, /Checked the search result before answering\./);
+    const summaryDeltaIndex = frames.findIndex((frame) => frame.event === 'response.reasoning_summary_text.delta');
+    const outputDeltaIndex = frames.findIndex((frame) => frame.event === 'response.output_text.delta');
+    assert.ok(summaryDeltaIndex !== -1 && summaryDeltaIndex < outputDeltaIndex);
+    assert.equal(frames.some((frame) => frame.event === 'response.output_text.annotation.added'), false);
+    const outputPart = completed.output.find((item) => item.type === 'message').content[0];
+    assert.equal(outputPart.text, 'Answer [1].');
+    assert.equal(outputPart.annotations[0].type, 'url_citation');
+    assert.equal(outputPart.annotations[0].url, 'https://example.com/source');
+    assert.equal(frames.at(-1).data, '[DONE]');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -766,7 +673,7 @@ test('streams reasoning live across web-search rounds and merges usage', async (
   });
   const upstreamUrl = await listen(upstream);
   const tavilyUrl = await listen(tavily);
-  const sessions = new SessionStore();
+  const reasoningCache = new ReasoningCache();
   const proxy = createProxyServer({
     config: {
       upstreamBaseUrl: upstreamUrl,
@@ -779,7 +686,7 @@ test('streams reasoning live across web-search rounds and merges usage', async (
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions,
+    reasoningCache,
   });
   const proxyUrl = await listen(proxy);
 
@@ -812,28 +719,26 @@ test('streams reasoning live across web-search rounds and merges usage', async (
       if (done) break;
       text += Buffer.from(value).toString('utf8');
     }
-    const reasoningAdded = [...text.matchAll(/"type":"response\.output_item\.added".*"type":"reasoning"/g)];
+    const frames = parseResponsesSse(text);
+    const reasoningAdded = frames.filter(
+      (frame) => frame.event === 'response.output_item.added' && frame.data.item.type === 'reasoning',
+    );
     assert.equal(reasoningAdded.length, 2);
-    assert.match(text, /Results are in\./);
-    assert.match(text, /"text":"Fresh answer\."/);
-    assert.doesNotMatch(text, /"type":"function_call"/);
-    assert.doesNotMatch(text, /tavily_search/);
-    const completedMatches = [...text.matchAll(/event: response\.completed\r?\ndata: ([^\n]+)/g)];
-    assert.equal(completedMatches.length, 1);
-    const completed = JSON.parse(completedMatches[0][1]);
+    const reasoningText = frames
+      .filter((frame) => frame.event === 'response.reasoning_summary_text.delta')
+      .map((frame) => frame.data.delta)
+      .join('');
+    assert.match(reasoningText, /Results are in\./);
+    const completedFrames = frames.filter((frame) => frame.event === 'response.completed');
+    assert.equal(completedFrames.length, 1);
+    const completed = completedFrames[0].data;
+    assert.equal(completed.response.output_text, 'Fresh answer.');
+    assert.equal(completed.response.output.some((item) => item.type === 'function_call'), false);
+    assert.equal(completed.response.output.some((item) => item.name === 'tavily_search'), false);
     assert.equal(completed.response.usage.output_tokens, 12);
     assert.equal(completed.response.usage.input_tokens, 60);
-    assert.match(text, /data: \[DONE\]/);
+    assert.equal(frames.at(-1).data, '[DONE]');
 
-    const session = sessions.get(completed.response.id);
-    const assistantWithTools = session.messages.find((message) => message.role === 'assistant' && Array.isArray(message.tool_calls));
-    assert.equal(assistantWithTools.tool_calls[0].function.name, 'tavily_search');
-    assert.equal(assistantWithTools.reasoning_content, 'Need fresh data.');
-    const toolMessage = session.messages.find((message) => message.role === 'tool');
-    assert.equal(toolMessage.tool_call_id, 'call_search');
-    const finalAssistant = session.messages.at(-1);
-    assert.equal(finalAssistant.content, 'Fresh answer.');
-    assert.equal(finalAssistant.reasoning_content, 'Results are in.');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -881,7 +786,7 @@ test('replaces pseudo tool-call text with the gateway incomplete answer in the s
       tavilyTimeoutMs: 5000,
       tavilyMaxSearchRounds: 0,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -898,12 +803,13 @@ test('replaces pseudo tool-call text with the gateway incomplete answer in the s
     });
     assert.equal(response.status, 200);
     const text = await response.text();
-    assert.match(text, /event: response\.completed/);
-    assert.match(text, /Gateway incomplete: after web tools were disabled/);
-    assert.doesNotMatch(text, /"type":"function_call"/);
-    assert.doesNotMatch(text, /"type":"web_search_call"/);
-    assert.doesNotMatch(text, /DSML tool_calls/);
-    assert.match(text, /data: \[DONE\]/);
+    const frames = parseResponsesSse(text);
+    const completed = frames.find((frame) => frame.event === 'response.completed');
+    assert.match(completed.data.response.output_text, /Gateway incomplete: after web tools were disabled/);
+    assert.equal(completed.data.response.output.some((item) => item.type === 'function_call'), false);
+    assert.equal(completed.data.response.output.some((item) => item.type === 'web_search_call'), false);
+    assert.doesNotMatch(completed.data.response.output_text, /DSML tool_calls/);
+    assert.equal(frames.at(-1).data, '[DONE]');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -961,7 +867,7 @@ test('includes web_search_call sources only when requested', async () => {
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1073,7 +979,7 @@ test('adds Firecrawl opened page excerpts to Tavily-backed web_search', async ()
       firecrawlTimeoutMs: 5000,
       firecrawlPageMaxChars: 4000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1184,7 +1090,7 @@ test('lets DeepSeek explicitly open a page through Firecrawl during web_search e
       firecrawlAutoScrapeTopResults: 0,
       firecrawlTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1281,7 +1187,7 @@ test('intercepts leaked web_search function calls from DeepSeek', async () => {
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1310,108 +1216,6 @@ test('intercepts leaked web_search function calls from DeepSeek', async () => {
   }
 });
 
-test('keeps Tavily search history valid for previous_response_id follow-ups', async () => {
-  const upstreamBodies = [];
-  const upstream = http.createServer(async (req, res) => {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    upstreamBodies.push(body);
-
-    for (const [index, message] of body.messages.entries()) {
-      if (message.role !== 'assistant' || !Array.isArray(message.tool_calls) || !message.tool_calls.length) continue;
-      const expectedIds = message.tool_calls.map((toolCall) => toolCall.id);
-      const following = body.messages.slice(index + 1, index + 1 + expectedIds.length);
-      assert.deepEqual(following.map((next) => next.role), expectedIds.map(() => 'tool'));
-      assert.deepEqual(following.map((next) => next.tool_call_id), expectedIds);
-    }
-
-    res.writeHead(200, { 'content-type': 'application/json' });
-    if (upstreamBodies.length === 1) {
-      res.end(JSON.stringify({
-        choices: [
-          {
-            message: {
-              role: 'assistant',
-              content: '',
-              tool_calls: [
-                {
-                  id: 'call_search',
-                  type: 'function',
-                  function: { name: 'tavily_search', arguments: '{"query":"gold futures price"}' },
-                },
-              ],
-            },
-            finish_reason: 'tool_calls',
-          },
-        ],
-      }));
-      return;
-    }
-    res.end(JSON.stringify({
-      choices: [{ message: { role: 'assistant', content: upstreamBodies.length === 2 ? 'Gold moved [1].' : 'Oil moved too.' }, finish_reason: 'stop' }],
-    }));
-  });
-  const tavily = http.createServer(async (_req, res) => {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
-      results: [{ title: 'Gold source', url: 'https://example.com/gold', content: 'Gold price update.' }],
-    }));
-  });
-  const upstreamUrl = await listen(upstream);
-  const tavilyUrl = await listen(tavily);
-  const proxy = createProxyServer({
-    config: {
-      upstreamBaseUrl: upstreamUrl,
-      upstreamApiKey: 'test-key',
-      upstreamModel: 'deepseek-v4-flash',
-      upstreamProvider: 'deepseek',
-      upstreamTimeoutMs: 5000,
-      tavilyApiKey: 'tvly-test',
-      tavilyBaseUrl: tavilyUrl,
-      tavilyWebSearchEnabled: true,
-      tavilyTimeoutMs: 5000,
-    },
-    sessions: new SessionStore(),
-  });
-  const proxyUrl = await listen(proxy);
-
-  try {
-    const firstResponse = await fetch(`${proxyUrl}/v1/responses`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'codex',
-        input: 'Search gold',
-        tools: [{ type: 'web_search' }],
-      }),
-    });
-    assert.equal(firstResponse.status, 200);
-    const firstBody = await firstResponse.json();
-    assert.equal(firstBody.output[0].type, 'web_search_call');
-
-    const secondResponse = await fetch(`${proxyUrl}/v1/responses`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'codex',
-        input: 'Now discuss oil',
-        previous_response_id: firstBody.id,
-      }),
-    });
-    assert.equal(secondResponse.status, 200);
-    assert.equal(upstreamBodies.length, 3);
-    const secondRequestMessages = upstreamBodies[2].messages;
-    const searchAssistantIndex = secondRequestMessages.findIndex((message) => Array.isArray(message.tool_calls));
-    assert.notEqual(searchAssistantIndex, -1);
-    assert.equal(secondRequestMessages[searchAssistantIndex + 1].role, 'tool');
-    assert.equal(secondRequestMessages.at(-1).content, 'Now discuss oil');
-  } finally {
-    await close(proxy);
-    await close(upstream);
-    await close(tavily);
-  }
-});
 
 test('accepts Codex state that replays prior web_search_call items', async () => {
   const upstreamBodies = [];
@@ -1470,7 +1274,7 @@ test('accepts Codex state that replays prior web_search_call items', async () =>
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1562,7 +1366,7 @@ test('maps Codex web_search filters to Tavily domains', async () => {
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1618,7 +1422,7 @@ test('does not pass forced web_search tool_choice to DeepSeek', async () => {
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1665,7 +1469,7 @@ test('does not pass required web_search tool_choice to DeepSeek', async () => {
       tavilyBaseUrl: 'https://tavily.invalid',
       tavilyWebSearchEnabled: true,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1750,7 +1554,7 @@ test('passes through real external tool calls while web search emulation is enab
       debugPayload: true,
       debugPayloadLogPath: debugPath,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1851,7 +1655,7 @@ test('does not enable Tavily when Codex allowed_tools excludes web search', asyn
       tavilyBaseUrl: 'https://tavily.invalid',
       tavilyWebSearchEnabled: true,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1884,7 +1688,7 @@ test('does not enable Tavily when Codex allowed_tools excludes web search', asyn
     });
     assert.equal(response.status, 200);
     assert.deepEqual(upstreamBody.tools.map((tool) => tool.function?.name), ['lookup', 'commentary']);
-    assert.equal(upstreamBody.messages[0].content.includes('For live web information, use tavily_search.'), false);
+    assert.equal(upstreamBody.messages[0].content.includes('Use tavily_search for live web information.'), false);
     const body = await response.json();
     const toolCall = body.output.find((item) => item.type === 'function_call');
     assert.equal(toolCall.name, 'lookup');
@@ -1905,9 +1709,9 @@ test('does not leak internal search function calls when search loop reaches max 
     if (upstreamBodies.length === 3) {
       assert.equal(body.tool_choice, undefined);
       assert.equal(body.tools, undefined);
-      assert.equal(body.messages.some((message) => String(message.content || '').includes('For live web information, use tavily_search.')), false);
+      assert.equal(body.messages.some((message) => String(message.content || '').includes('Use tavily_search for live web information.')), false);
       assert.equal(body.messages.at(-1).role, 'user');
-      assert.match(body.messages.at(-1).content, /Web tools are not available now/);
+      assert.match(body.messages.at(-1).content, /Web tools are now unavailable/);
       assert.equal(body.messages.some((message) => message.role === 'tool'), true);
       res.end(JSON.stringify({
         choices: [{ message: { role: 'assistant', content: 'Final answer from the completed search [1].' }, finish_reason: 'stop' }],
@@ -1953,7 +1757,7 @@ test('does not leak internal search function calls when search loop reaches max 
       tavilyWebSearchEnabled: true,
       tavilyMaxSearchRounds: 1,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -1992,7 +1796,7 @@ test('completes with a visible gateway explanation when final answer turn writes
     if (upstreamBodies.length === 3) {
       assert.equal(body.tool_choice, undefined);
       assert.equal(body.tools, undefined);
-      assert.match(body.messages.at(-1).content, /Do not write tool calls/);
+      assert.match(body.messages.at(-1).content, /without tool calls or tool-call markup/);
       res.end(JSON.stringify({
         choices: [
           {
@@ -2051,7 +1855,7 @@ test('completes with a visible gateway explanation when final answer turn writes
       tavilyWebSearchEnabled: true,
       tavilyMaxSearchRounds: 1,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2149,7 +1953,7 @@ test('allows model-driven multi-round web search before final answer', async () 
       tavilyWebSearchEnabled: true,
       tavilyMaxSearchRounds: 8,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2239,7 +2043,7 @@ test('completes with a visible gateway explanation when final answer turn has no
       tavilyWebSearchEnabled: true,
       tavilyMaxSearchRounds: 2,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2344,7 +2148,7 @@ test('recovers from unsupported model tool calls with a final answer turn', asyn
       tavilyWebSearchEnabled: true,
       tavilyMaxSearchRounds: 2,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2385,7 +2189,7 @@ test('returns upstream stream errors before opening Responses SSE', async () => 
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2431,7 +2235,7 @@ test('converts streaming chat completion chunks to Responses SSE events', async 
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2443,12 +2247,22 @@ test('converts streaming chat completion chunks to Responses SSE events', async 
     });
     assert.equal(response.status, 200);
     const text = await response.text();
-    assert.match(text, /event: response\.created/);
-    assert.match(text, /event: response\.output_text\.delta/);
-    assert.match(text, /event: response\.completed/);
-    assert.match(text, /"text":"pong"/);
-    assert.match(text, /"input_tokens"/);
-    assert.match(text, /data: \[DONE\]/);
+    const frames = parseResponsesSse(text);
+    assert.equal(frames[0].event, 'response.created');
+    assert.deepEqual(
+      frames.filter((frame) => frame.event === 'response.output_text.delta').map((frame) => frame.data.delta),
+      ['po', 'ng'],
+    );
+    const completed = frames.find((frame) => frame.event === 'response.completed');
+    assert.equal(completed.data.response.output_text, 'pong');
+    assert.deepEqual(completed.data.response.usage, {
+      input_tokens: 2,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens: 1,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 3,
+    });
+    assert.equal(frames.at(-1).data, '[DONE]');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2480,7 +2294,7 @@ test('emits complete reasoning summary before visible output when thinking is en
       upstreamTimeoutMs: 5000,
       codexReasoningEffort: 'xhigh',
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2492,101 +2306,20 @@ test('emits complete reasoning summary before visible output when thinking is en
     });
     assert.equal(response.status, 200);
     const text = await response.text();
-    const summaryDeltaMatches = [...text.matchAll(/event: response\.reasoning_summary_text\.delta\r?\ndata: ([^\n]+)/g)];
-    const summaryDeltaIndex = text.indexOf('event: response.reasoning_summary_text.delta');
-    const outputTextDeltaIndex = text.indexOf('event: response.output_text.delta');
-    assert.match(text, /event: response\.reasoning_summary_part\.added/);
-    assert.match(text, /event: response\.reasoning_summary_text\.delta/);
-    assert.equal(summaryDeltaMatches.length, 1);
-    assert.equal(JSON.parse(summaryDeltaMatches[0][1]).delta, '**Reasoning**\n\nthink first. think second.');
+    const frames = parseResponsesSse(text);
+    const summaryDeltaFrames = frames.filter((frame) => frame.event === 'response.reasoning_summary_text.delta');
+    const summaryDeltaIndex = frames.findIndex((frame) => frame.event === 'response.reasoning_summary_text.delta');
+    const outputTextDeltaIndex = frames.findIndex((frame) => frame.event === 'response.output_text.delta');
+    assert.equal(frames.some((frame) => frame.event === 'response.reasoning_summary_part.added'), true);
+    assert.equal(summaryDeltaFrames.length, 1);
+    assert.equal(summaryDeltaFrames[0].data.delta, '**Reasoning**\n\nthink first. think second.');
     assert.ok(summaryDeltaIndex !== -1 && outputTextDeltaIndex !== -1);
     assert.ok(summaryDeltaIndex < outputTextDeltaIndex);
-    assert.match(text, /event: response\.output_text\.delta/);
-    assert.match(text, /"text":"answer"/);
-  } finally {
-    await close(proxy);
-    await close(upstream);
-  }
-});
-
-test('marks streamed assistant text before tool calls as commentary when thinking is enabled', async () => {
-  const upstreamBodies = [];
-  const upstream = http.createServer(async (req, res) => {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    res.writeHead(200, {
-      'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache',
-    });
-    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'I will inspect available tools first.' }, finish_reason: null }] })}\n\n`);
-    res.write(`data: ${JSON.stringify({
-      choices: [
-        {
-          delta: {
-            tool_calls: [
-              {
-                index: 0,
-                id: 'call_search',
-                type: 'function',
-                function: { name: 'tool_search', arguments: '{"query":"multi_tool_use.parallel"}' },
-              },
-            ],
-          },
-          finish_reason: null,
-        },
-      ],
-    })}\n\n`);
-    res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
-    res.write('data: [DONE]\n\n');
-    res.end();
-  });
-  const upstreamUrl = await listen(upstream);
-
-  const proxy = createProxyServer({
-    config: {
-      serverName: 'test',
-      upstreamBaseUrl: upstreamUrl,
-      upstreamApiKey: 'test-key',
-      upstreamModel: 'deepseek-v4-pro',
-      upstreamProvider: 'deepseek',
-      upstreamTimeoutMs: 5000,
-      codexReasoningEffort: 'high',
-    },
-    sessions: new SessionStore(),
-  });
-  const proxyUrl = await listen(proxy);
-
-  try {
-    const response = await fetch(`${proxyUrl}/v1/responses`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'deepseek-v4-pro',
-        input: 'list current tools',
-        stream: true,
-        reasoning: { effort: 'high' },
-        tools: [
-          {
-            type: 'tool_search',
-            execution: 'client',
-            parameters: {
-              type: 'object',
-              properties: { query: { type: 'string' } },
-              required: ['query'],
-              additionalProperties: false,
-            },
-          },
-        ],
-      }),
-    });
-    assert.equal(response.status, 200);
-    const text = await response.text();
-    assert.equal(upstreamBodies[0].tools.some((tool) => tool.function?.name === 'tool_search'), true);
-    assert.match(text, /"phase":"commentary"/);
-    assert.doesNotMatch(text, /"phase":"final_answer"/);
-    assert.match(text, /"type":"tool_search_call"/);
-    assert.match(text, /"output_text":""/);
+    assert.deepEqual(
+      frames.filter((frame) => frame.event === 'response.output_text.delta').map((frame) => frame.data.delta),
+      ['answer'],
+    );
+    assert.equal(frames.find((frame) => frame.event === 'response.completed').data.response.output_text, 'answer');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2632,7 +2365,7 @@ test('starts streamed assistant text as commentary when DeepSeek tools may still
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2659,18 +2392,24 @@ test('starts streamed assistant text as commentary when DeepSeek tools may still
     });
     assert.equal(response.status, 200);
     const text = await response.text();
-    const messageAddedLine = text
-      .split(/\r?\n/)
-      .find((line, index, lines) => lines[index - 1] === 'event: response.output_item.added' && line.includes('"type":"message"'));
-    assert.ok(messageAddedLine);
-    assert.match(messageAddedLine, /"phase":"commentary"/);
-    assert.doesNotMatch(messageAddedLine, /"phase":"final_answer"/);
-    const lines = text.split(/\r?\n/);
-    const messageAddedIndex = lines.findIndex((line, index) => lines[index - 1] === 'event: response.output_item.added' && line.includes('"type":"message"'));
-    const textDeltaIndex = lines.findIndex((line) => line === 'event: response.output_text.delta');
+    const frames = parseResponsesSse(text);
+    const messageAddedIndex = frames.findIndex(
+      (frame) => frame.event === 'response.output_item.added' && frame.data.item.type === 'message',
+    );
+    const textDeltaIndex = frames.findIndex((frame) => frame.event === 'response.output_text.delta');
+    const messageAdded = frames[messageAddedIndex].data.item;
+    assert.equal(messageAdded.phase, 'commentary');
     assert.ok(textDeltaIndex === -1 || messageAddedIndex < textDeltaIndex);
-    assert.match(text, /"type":"tool_search_call"/);
-    assert.match(text, /"output_text":""/);
+    assert.equal(
+      frames.some((frame) => frame.event === 'response.output_item.done' && frame.data.item.type === 'tool_search_call'),
+      true,
+    );
+    const completed = frames.find((frame) => frame.event === 'response.completed');
+    assert.equal(completed.data.response.output_text, '');
+    assert.equal(
+      completed.data.response.output.some((item) => item.type === 'message' && item.phase === 'final_answer'),
+      false,
+    );
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2699,7 +2438,7 @@ test('promotes streamed assistant text to final answer when DeepSeek does not ca
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2726,19 +2465,20 @@ test('promotes streamed assistant text to final answer when DeepSeek does not ca
     });
     assert.equal(response.status, 200);
     const text = await response.text();
-    const lines = text.split(/\r?\n/);
-    const messageAddedLine = lines
-      .find((line, index) => lines[index - 1] === 'event: response.output_item.added' && line.includes('"type":"message"'));
-    const messageDoneLine = lines
-      .find((line, index) => lines[index - 1] === 'event: response.output_item.done' && line.includes('"type":"message"'));
-    const textDeltaLine = lines
-      .find((line, index) => lines[index - 1] === 'event: response.output_text.delta' && line.includes('direct answer'));
-    assert.ok(messageAddedLine);
-    assert.match(messageAddedLine, /"phase":"commentary"/);
-    assert.ok(textDeltaLine);
-    assert.ok(messageDoneLine);
-    assert.match(messageDoneLine, /"phase":"final_answer"/);
-    assert.match(text, /"output_text":"direct answer"/);
+    const frames = parseResponsesSse(text);
+    const messageAdded = frames.find(
+      (frame) => frame.event === 'response.output_item.added' && frame.data.item.type === 'message',
+    );
+    const messageDone = frames.find(
+      (frame) => frame.event === 'response.output_item.done' && frame.data.item.type === 'message',
+    );
+    assert.equal(messageAdded.data.item.phase, 'commentary');
+    assert.deepEqual(
+      frames.filter((frame) => frame.event === 'response.output_text.delta').map((frame) => frame.data.delta),
+      ['direct answer'],
+    );
+    assert.equal(messageDone.data.item.phase, 'final_answer');
+    assert.equal(frames.find((frame) => frame.event === 'response.completed').data.response.output_text, 'direct answer');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2772,7 +2512,7 @@ test('streams thinking-mode final text incrementally through the web-search path
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2790,23 +2530,31 @@ test('streams thinking-mode final text incrementally through the web-search path
     });
     assert.equal(response.status, 200);
     const text = await response.text();
-    const lines = text.split(/\r?\n/);
-    const textDeltas = lines
-      .filter((line, index) => lines[index - 1] === 'event: response.output_text.delta')
-      .map((line) => JSON.parse(line.slice('data: '.length)).delta);
+    const frames = parseResponsesSse(text);
+    const textDeltas = frames
+      .filter((frame) => frame.event === 'response.output_text.delta')
+      .map((frame) => frame.data.delta);
     assert.deepEqual(textDeltas, ['Hello ', 'streamed ', 'world.']);
-    const summaryDeltaIndex = lines.findIndex((line) => line === 'event: response.reasoning_summary_text.delta');
-    const reasoningDoneIndex = lines.findIndex((line, index) => lines[index - 1] === 'event: response.output_item.done' && line.includes('"type":"reasoning"')) ;
-    const messageAddedIndex = lines.findIndex((line, index) => lines[index - 1] === 'event: response.output_item.added' && line.includes('"type":"message"'));
-    const firstTextDeltaIndex = lines.findIndex((line) => line === 'event: response.output_text.delta');
+    const summaryDeltaIndex = frames.findIndex((frame) => frame.event === 'response.reasoning_summary_text.delta');
+    const reasoningDoneIndex = frames.findIndex(
+      (frame) => frame.event === 'response.output_item.done' && frame.data.item.type === 'reasoning',
+    );
+    const messageAddedIndex = frames.findIndex(
+      (frame) => frame.event === 'response.output_item.added' && frame.data.item.type === 'message',
+    );
+    const firstTextDeltaIndex = frames.findIndex((frame) => frame.event === 'response.output_text.delta');
     assert.ok(summaryDeltaIndex !== -1 && reasoningDoneIndex !== -1 && messageAddedIndex !== -1 && firstTextDeltaIndex !== -1);
     assert.ok(summaryDeltaIndex < reasoningDoneIndex);
     assert.ok(reasoningDoneIndex < messageAddedIndex);
     assert.ok(messageAddedIndex < firstTextDeltaIndex);
-    const messageDoneLine = lines
-      .find((line, index) => lines[index - 1] === 'event: response.output_item.done' && line.includes('"type":"message"'));
-    assert.match(messageDoneLine, /"phase":"final_answer"/);
-    assert.match(text, /"output_text":"Hello streamed world."/);
+    const messageDone = frames.find(
+      (frame) => frame.event === 'response.output_item.done' && frame.data.item.type === 'message',
+    );
+    assert.equal(messageDone.data.item.phase, 'final_answer');
+    assert.equal(
+      frames.find((frame) => frame.event === 'response.completed').data.response.output_text,
+      'Hello streamed world.',
+    );
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2844,7 +2592,7 @@ test('expands multi_tool_use.parallel into individual Codex tool calls through t
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -2873,10 +2621,10 @@ test('expands multi_tool_use.parallel into individual Codex tool calls through t
     });
     assert.equal(response.status, 200);
     const text = await response.text();
-    const lines = text.split(/\r?\n/);
-    const doneItems = lines
-      .filter((line, index) => lines[index - 1] === 'event: response.output_item.done' && line.includes('"type":"function_call"'))
-      .map((line) => JSON.parse(line.slice('data: '.length)).item);
+    const frames = parseResponsesSse(text);
+    const doneItems = frames
+      .filter((frame) => frame.event === 'response.output_item.done' && frame.data.item.type === 'function_call')
+      .map((frame) => frame.data.item);
     assert.equal(doneItems.length, 2);
     assert.deepEqual(doneItems.map((item) => item.name), ['shell_command', 'shell_command']);
     assert.deepEqual(
@@ -2884,9 +2632,9 @@ test('expands multi_tool_use.parallel into individual Codex tool calls through t
       ['{"command":"rg --files src"}', '{"command":"Get-Content package.json"}'],
     );
     assert.notEqual(doneItems[0].call_id, doneItems[1].call_id);
-    assert.equal(text.includes('multi_tool_use'), false);
-    assert.match(text, /event: response\.reasoning_summary_text\.delta/);
-    assert.match(text, /event: response\.completed/);
+    assert.equal(doneItems.some((item) => item.name === 'multi_tool_use.parallel'), false);
+    assert.equal(frames.some((frame) => frame.event === 'response.reasoning_summary_text.delta'), true);
+    assert.equal(frames.some((frame) => frame.event === 'response.completed'), true);
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2944,7 +2692,7 @@ test('restores DeepSeek reasoning_content when Codex sends only tool output on t
       upstreamTimeoutMs: 5000,
       modelAliases: DEFAULT_MODEL_ALIASES,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -3008,7 +2756,7 @@ test('restores DeepSeek reasoning_content when Codex sends only tool output on t
   }
 });
 
-test('restores raw DeepSeek reasoning for replayed tool-call turns via session store', async () => {
+test('restores raw DeepSeek reasoning for replayed tool-call turns via reasoning cache', async () => {
   const upstreamBodies = [];
   const upstream = http.createServer(async (req, res) => {
     const chunks = [];
@@ -3050,7 +2798,7 @@ test('restores raw DeepSeek reasoning for replayed tool-call turns via session s
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -3116,7 +2864,7 @@ test('reports response.failed when the upstream stream ends without finish_reaso
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -3128,9 +2876,11 @@ test('reports response.failed when the upstream stream ends without finish_reaso
     });
     assert.equal(response.status, 200);
     const text = await response.text();
-    assert.match(text, /event: response\.failed/);
-    assert.doesNotMatch(text, /event: response\.completed/);
-    assert.match(text, /ended before completion/);
+    const frames = parseResponsesSse(text);
+    const failed = frames.find((frame) => frame.event === 'response.failed');
+    assert.ok(failed);
+    assert.equal(frames.some((frame) => frame.event === 'response.completed'), false);
+    assert.match(failed.data.response.error.message, /ended before completion/);
   } finally {
     await close(proxy);
     await close(upstream);
@@ -3191,7 +2941,7 @@ test('answers commentary-only rounds internally and streams the update as a comm
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 1000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -3212,6 +2962,7 @@ test('answers commentary-only rounds internally and streams the update as a comm
     });
     assert.equal(response.status, 200);
     const text = await response.text();
+    const frames = parseResponsesSse(text);
 
     assert.equal(upstreamBodies.length, 2);
     assert.equal(upstreamBodies[0].tools.some((tool) => tool.function?.name === 'commentary'), true);
@@ -3225,15 +2976,22 @@ test('answers commentary-only rounds internally and streams the update as a comm
     );
     assert.equal(commentaryToolResult.content, 'Delivered to the user.');
 
-    assert.match(text, /"phase":"commentary"/);
-    assert.match(text, /Starting with the config file\./);
-    assert.doesNotMatch(text, /"name":"commentary"/);
-    assert.match(text, /"name":"shell_command"/);
-    assert.ok(text.indexOf('Starting with the config file.') < text.indexOf('"call_id":"call_shell"'));
-    assert.match(text, /event: response\.completed/);
-    const completedPayload = JSON.parse(
-      [...text.matchAll(/event: response\.completed\r?\ndata: ([^\n]+)/g)].at(-1)[1],
+    const commentaryDoneIndex = frames.findIndex(
+      (frame) => frame.event === 'response.output_item.done'
+        && frame.data.item.type === 'message'
+        && frame.data.item.phase === 'commentary',
     );
+    const shellDoneIndex = frames.findIndex(
+      (frame) => frame.event === 'response.output_item.done'
+        && frame.data.item.type === 'function_call'
+        && frame.data.item.name === 'shell_command',
+    );
+    assert.ok(commentaryDoneIndex !== -1 && commentaryDoneIndex < shellDoneIndex);
+    assert.equal(
+      frames.some((frame) => frame.event === 'response.output_item.done' && frame.data.item.name === 'commentary'),
+      false,
+    );
+    const completedPayload = frames.find((frame) => frame.event === 'response.completed').data;
     const commentaryItems = completedPayload.response.output.filter(
       (item) => item.type === 'message' && item.phase === 'commentary',
     );
@@ -3269,7 +3027,7 @@ test('aborts the upstream request when the streaming client disconnects', async 
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -3341,7 +3099,7 @@ test('stops the web-search loop without further rounds when the client disconnec
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 1000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -3405,7 +3163,7 @@ test('exposes an unavailable web_search shim when no search provider is configur
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
     },
-    sessions: new SessionStore(),
+    reasoningCache: new ReasoningCache(),
   });
   const proxyUrl = await listen(proxy);
 
@@ -3428,6 +3186,156 @@ test('exposes an unavailable web_search shim when no search provider is configur
     assert.deepEqual(toolNames, ['shell_command', 'web_search', 'commentary']);
     const shim = upstreamBodies[0].tools.find((tool) => tool.function.name === 'web_search');
     assert.match(shim.function.description, /no search provider configured/);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('emits heartbeat in_progress events while the upstream stream stays silent', async () => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(': keep-alive\n\n');
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      streamHeartbeatMs: 30,
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 3000);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: 'hello', stream: true }),
+      signal: controller.signal,
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body.getReader();
+    let text = '';
+    while ((text.match(/event: response\.in_progress/g) || []).length < 3) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += Buffer.from(value).toString('utf8');
+    }
+    assert.ok((text.match(/event: response\.in_progress/g) || []).length >= 3);
+    assert.match(text, /event: response\.created/);
+    assert.doesNotMatch(text, /event: response\.completed/);
+  } finally {
+    clearTimeout(deadline);
+    controller.abort();
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('returns a diagnostic 400 before upstream when DeepSeek tool capacity is exceeded', async () => {
+  let upstreamCalled = false;
+  const upstream = http.createServer((_req, res) => {
+    upstreamCalled = true;
+    res.writeHead(500).end();
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+  const tools = Array.from({ length: 128 }, (_, index) => ({
+    type: 'function',
+    name: `tool_${index}`,
+    parameters: { type: 'object', properties: {} },
+  }));
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', input: 'hello', tools }),
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.error.code, 'too_many_tools');
+    assert.match(body.error.message, /at most 128/);
+    assert.equal(upstreamCalled, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('does not persist partial tool calls from failed DeepSeek completions', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const _chunk of req) {}
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl_resource_failure',
+      created: 123,
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_partial',
+            type: 'function',
+            function: { name: 'lookup', arguments: '{"query":"partial"}' },
+          }],
+        },
+        finish_reason: 'insufficient_system_resource',
+      }],
+    }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const reasoningCache = new ReasoningCache();
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+    },
+    reasoningCache,
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        input: 'lookup',
+        store: false,
+        tools: [{
+          type: 'function',
+          name: 'lookup',
+          parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+        }],
+      }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(body));
+    assert.equal(body.status, 'failed');
+    assert.equal(body.error.code, 'server_is_overloaded');
+    assert.equal(body.output[0].status, 'failed');
+    assert.equal(reasoningCache.getAssistantMessageForToolCall('call_partial'), null);
   } finally {
     await close(proxy);
     await close(upstream);

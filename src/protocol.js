@@ -2,9 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { generateId, isObject, normalizeRole, parseJsonObject, safeJsonParse, toText } from './common.js';
 import {
-  DEFAULT_MODEL_ALIASES,
   deepseekReasoningPayload,
-  isDeprecatedModel,
   resolveModelAlias,
 } from './model-map.js';
 
@@ -51,17 +49,16 @@ const UNSUPPORTED_HOSTED_TOOL_TYPES = new Set([
 const DEEPSEEK_TOOL_INSTRUCTIONS_MARKER = 'The tools in this request are real callable functions available now.';
 const DEEPSEEK_TOOL_INSTRUCTIONS = [
   DEEPSEEK_TOOL_INSTRUCTIONS_MARKER,
-  'When a tool is needed, respond with Chat Completions tool_calls and JSON arguments matching the schema.',
-  'Do not write pseudo XML, DSML, or JSON tool calls in assistant text.',
-  'Do not claim a listed function is unavailable because its name is unfamiliar.',
+  'When needed, use Chat Completions tool_calls with JSON arguments that match the schema.',
+  'Never write tool calls in assistant text, including as XML, DSML, or JSON, or claim a listed function is unavailable merely because its name is unfamiliar.',
 ].join(' ');
 export const INTERNAL_COMMENTARY_TOOL = 'commentary';
-const DEEPSEEK_COMMENTARY_INSTRUCTIONS = 'The user cannot see your thinking; commentary is the only progress they see between tool batches. Include one commentary call, first, in every tool_calls batch, with one or two sentences on what you are doing. Never call it alone; never put the final answer in it — deliver the final answer as plain assistant text with no tool calls.';
+const DEEPSEEK_COMMENTARY_INSTRUCTIONS = 'The user cannot see your thinking; commentary is the progress they see during tool work. In every tool-calling reply, include one commentary call first in the tool_calls array with a one- or two-sentence update. Never call it alone or use it for the final answer.';
 const INTERNAL_COMMENTARY_TOOL_DEFINITION = {
   type: 'function',
   function: {
     name: INTERNAL_COMMENTARY_TOOL,
-    description: "Post a short progress update the user sees immediately. The user cannot see your thinking; this is the only progress they see between tool batches. Include one commentary call, first, in every tool_calls batch, e.g. commentary(text: 'Config loader read; now checking how sessions persist.'). One or two sentences. Never call it alone; never put the final answer in it.",
+    description: 'Post the user-visible progress update. Include this function first in every tool_calls array with other tool calls. One or two sentences; never call it alone or use it for the final answer.',
     parameters: {
       type: 'object',
       properties: {
@@ -77,10 +74,9 @@ const INTERNAL_COMMENTARY_TOOL_DEFINITION = {
 };
 const CHAT_FUNCTION_NAME_MAX_CHARS = 64;
 const TOOL_NAME_HASH_CHARS = 8;
-const DEEPSEEK_TOOL_DESCRIPTION_CHARS = 900;
-const DEEPSEEK_SCHEMA_DESCRIPTION_CHARS = 480;
-const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const CODEX_SPAWN_AGENT_TOOL_NAME = 'multi_agent_v1__spawn_agent';
+const DEEPSEEK_TOOL_DESCRIPTION_SOFT_CHARS = 900;
+const DEEPSEEK_SCHEMA_DESCRIPTION_SOFT_CHARS = 480;
+const DEEPSEEK_MAX_FUNCTION_TOOLS = 128;
 const CODEX_TOOL_SEARCH_TOOL_NAME = 'tool_search';
 
 function jsonString(value) {
@@ -170,6 +166,16 @@ function omitUndefined(value) {
 
 function compactText(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function compactStructuredText(value, softChars) {
+  const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n');
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines.at(-1).trim()) lines.pop();
+  const structured = lines.join('\n').replace(/\n(?:[ \t]*\n){2,}/g, '\n\n');
+  if (!structured) return '';
+  const compact = compactText(structured);
+  return compact.length <= softChars ? compact : structured;
 }
 
 function shortenText(value, maxChars) {
@@ -631,8 +637,6 @@ function extractMessagesFromResponsesInput(input) {
 }
 
 const CUSTOM_TOOL_INPUT_HINT = 'Pass the complete raw tool input as the "input" string argument. Do not wrap it in extra JSON, quotes, or markdown fences.';
-const CUSTOM_TOOL_GRAMMAR_CHARS = 1600;
-const CUSTOM_TOOL_DESCRIPTION_CHARS = 3600;
 
 function truncateRawText(value, maxChars) {
   const text = String(value ?? '');
@@ -658,25 +662,25 @@ function customToolShim(tool) {
   const format = isObject(tool.format) ? tool.format : {};
   const baseName = toolBaseName(tool, 'custom_tool');
   const chunks = [
-    compactText(tool.description) || `Freeform tool ${baseName}.`,
+    compactStructuredText(tool.description, DEEPSEEK_TOOL_DESCRIPTION_SOFT_CHARS) || `Freeform tool ${baseName}.`,
     CUSTOM_TOOL_INPUT_HINT,
   ];
   if (format.syntax) chunks.push(`Input syntax: ${format.syntax}.`);
   if (typeof format.definition === 'string' && format.definition.trim()) {
-    chunks.push(`Input grammar:\n${truncateRawText(format.definition.trim(), CUSTOM_TOOL_GRAMMAR_CHARS)}`);
+    chunks.push(`Input grammar:\n${format.definition.trim()}`);
   }
   const parameters = customToolShimParameters();
   const sourceSchema = isObject(tool.input_schema) ? tool.input_schema : isObject(tool.parameters) ? tool.parameters : null;
   const sourceInputDescription = sourceSchema?.properties?.input?.description;
   if (typeof sourceInputDescription === 'string' && sourceInputDescription) {
-    parameters.properties.input.description = sourceInputDescription;
+    parameters.properties.input.description = compactStructuredText(sourceInputDescription, DEEPSEEK_SCHEMA_DESCRIPTION_SOFT_CHARS);
   }
   return {
     type: 'function',
     gateway_custom_tool: true,
     function: {
       name: encodeToolName(toolNamespace(tool), baseName),
-      description: truncateRawText(chunks.join('\n'), CUSTOM_TOOL_DESCRIPTION_CHARS),
+      description: chunks.join('\n'),
       parameters,
     },
   };
@@ -1127,7 +1131,7 @@ function simplifyJsonSchemaDescriptions(schema) {
   const next = {};
   for (const [key, value] of Object.entries(schema)) {
     if (key === 'description' && typeof value === 'string') {
-      const description = shortenText(value, DEEPSEEK_SCHEMA_DESCRIPTION_CHARS);
+      const description = compactStructuredText(value, DEEPSEEK_SCHEMA_DESCRIPTION_SOFT_CHARS);
       if (description) next.description = description;
       continue;
     }
@@ -1150,83 +1154,15 @@ function defaultDeepSeekToolDescription(name) {
   return compactText(`Call ${readable || name || 'this function'} when needed.`);
 }
 
-function deepSeekGatewayModelAliases(config = {}) {
-  const aliases = isObject(config.modelAliases) && Object.keys(config.modelAliases).length
-    ? config.modelAliases
-    : DEFAULT_MODEL_ALIASES;
-  const spawnConfig = { ...config, upstreamProvider: 'deepseek', modelAliases: aliases };
-  const names = [];
-  for (const name of Object.keys(aliases)) {
-    if (!name || isDeprecatedModel(name)) continue;
-    const alias = resolveModelAlias(name, spawnConfig);
-    if (isDeprecatedModel(alias.upstreamModel)) continue;
-    names.push(name);
-  }
-  return [...new Set(names)];
-}
-
-function enumStringProperty(property, values, description) {
-  const source = isObject(property) ? property : {};
-  const next = { ...source };
-  delete next.const;
-  delete next.oneOf;
-  delete next.anyOf;
-  delete next.allOf;
-  delete next.examples;
-  if (next.default !== undefined && !values.includes(next.default)) delete next.default;
-  next.type = 'string';
-  next.enum = values;
-  next.description = description;
-  return next;
-}
-
-function deepSeekSpawnAgentParameters(parameters, config = {}) {
-  const next = normalizeJsonSchemaObject(parameters);
-  const properties = isObject(next.properties) ? { ...next.properties } : {};
-  const modelAliases = deepSeekGatewayModelAliases(config);
-  properties.model = enumStringProperty(
-    properties.model,
-    modelAliases,
-    'Model for the sub-agent. Omit to inherit.',
-  );
-  properties.reasoning_effort = enumStringProperty(
-    properties.reasoning_effort,
-    CODEX_REASONING_EFFORTS,
-    'Codex reasoning effort for the sub-agent. Omit to inherit.',
-  );
-  return {
-    ...next,
-    properties,
-  };
-}
-
-function deepSeekSpawnAgentDescription() {
-  const description = [
-    'Spawn a Codex-native sub-agent.',
-    'Omit model/reasoning_effort to inherit.',
-    'Valid values are enforced by the schema.',
-  ].filter(Boolean).join(' ');
-  return shortenText(description, DEEPSEEK_TOOL_DESCRIPTION_CHARS);
-}
-
-function isCodexSpawnAgentTool(name) {
-  return name === CODEX_SPAWN_AGENT_TOOL_NAME;
-}
-
-function simplifyToolForDeepSeek(tool, config = {}) {
+function simplifyToolForDeepSeek(tool) {
   if (tool?.type !== 'function' || !isObject(tool.function)) return tool;
   if (tool.gateway_custom_tool) return tool;
   const fn = tool.function;
-  let parameters = simplifyJsonSchemaDescriptions(fn.parameters);
-  if (isCodexSpawnAgentTool(fn.name)) {
-    parameters = deepSeekSpawnAgentParameters(parameters, config);
-  }
+  const parameters = simplifyJsonSchemaDescriptions(fn.parameters);
   const requiredText = requiredParametersText(parameters);
-  const descriptionBudget = Math.max(32, DEEPSEEK_TOOL_DESCRIPTION_CHARS - requiredText.length);
-  const baseDescription = isCodexSpawnAgentTool(fn.name)
-    ? deepSeekSpawnAgentDescription()
-    : shortenText(fn.description, descriptionBudget) || defaultDeepSeekToolDescription(fn.name);
-  const description = shortenText(`${baseDescription}${requiredText}`, DEEPSEEK_TOOL_DESCRIPTION_CHARS);
+  const baseDescription = compactStructuredText(fn.description, DEEPSEEK_TOOL_DESCRIPTION_SOFT_CHARS)
+    || defaultDeepSeekToolDescription(fn.name);
+  const description = `${baseDescription}${requiredText}`;
   return {
     ...tool,
     function: omitUndefined({
@@ -1266,13 +1202,24 @@ function adaptToolsForProvider(tools, provider, config = {}) {
   if (provider !== 'deepseek' || !Array.isArray(tools)) return tools;
   const keepStrict = isDeepSeekBetaBaseUrl(config.upstreamBaseUrl);
   return tools.map((tool) => {
-    const simplified = simplifyToolForDeepSeek(tool, config);
+    const simplified = simplifyToolForDeepSeek(tool);
     if (!keepStrict && simplified?.type === 'function' && isObject(simplified.function) && simplified.function.strict !== undefined) {
       const { strict, ...fn } = simplified.function;
       return { ...simplified, function: fn };
     }
     return simplified;
   });
+}
+
+function assertDeepSeekToolCapacity(tools) {
+  const count = Array.isArray(tools)
+    ? tools.filter((tool) => tool?.type === 'function' && isObject(tool.function)).length
+    : 0;
+  if (count <= DEEPSEEK_MAX_FUNCTION_TOOLS) return;
+  const error = new RangeError(`DeepSeek supports at most ${DEEPSEEK_MAX_FUNCTION_TOOLS} function tools; received ${count} after gateway adaptation.`);
+  error.statusCode = 400;
+  error.code = 'too_many_tools';
+  throw error;
 }
 
 function normalizeToolCallArguments(name, argumentsText, toolSchema) {
@@ -1297,54 +1244,16 @@ function normalizeToolCallArguments(name, argumentsText, toolSchema) {
   }
 }
 
-function normalizeReasoningEffortName(value) {
-  return value == null ? '' : String(value).toLowerCase().replaceAll('_', '-');
-}
-
-function normalizeCodexSpawnAgentArguments(encodedName, argumentsText, config = {}) {
-  if (!isCodexSpawnAgentTool(encodedName) || !argumentsText) return argumentsText;
-  let parsed;
-  try {
-    parsed = JSON.parse(argumentsText);
-  } catch {
-    return argumentsText;
-  }
-  if (!isObject(parsed)) return argumentsText;
-  const next = { ...parsed };
-  let changed = false;
-  const allowedModels = deepSeekGatewayModelAliases(config);
-
-  if (typeof next.model === 'string') {
-    const requestedModel = next.model;
-    if (allowedModels.length && !allowedModels.includes(requestedModel)) {
-      delete next.model;
-      changed = true;
-    }
-  }
-
-  if (typeof next.reasoning_effort === 'string') {
-    const requestedEffort = normalizeReasoningEffortName(next.reasoning_effort);
-    if (!CODEX_REASONING_EFFORTS.includes(requestedEffort)) {
-      delete next.reasoning_effort;
-      changed = true;
-      return JSON.stringify(next);
-    }
-  }
-
-  return changed ? JSON.stringify(next) : argumentsText;
-}
-
-function normalizeFunctionCallItemArguments(item, toolSchemas, config = {}) {
+function normalizeFunctionCallItemArguments(item, toolSchemas) {
   if (!item || item.type !== 'function_call') return;
   const encodedName = encodeToolName(item.namespace, item.name);
   item.arguments = normalizeToolCallArguments(encodedName, item.arguments, toolSchemas?.get(encodedName));
-  item.arguments = normalizeCodexSpawnAgentArguments(encodedName, item.arguments, config);
 }
 
-function functionCallItemNeedsArgumentNormalization(item, toolSchemas, config = {}) {
+function functionCallItemNeedsArgumentNormalization(item, toolSchemas) {
   if (!item || item.type !== 'function_call') return false;
   const encodedName = encodeToolName(item.namespace, item.name);
-  return Boolean(toolSchemas?.has(encodedName) || isCodexSpawnAgentTool(encodedName));
+  return Boolean(toolSchemas?.has(encodedName));
 }
 
 function hasToolCallFunctionName(toolCall) {
@@ -1475,7 +1384,7 @@ function deepseekDefaultMaxTokens(config = {}) {
   return DEEPSEEK_DEFAULT_MAX_TOKENS;
 }
 
-const DEEPSEEK_JSON_SCHEMA_INSTRUCTIONS_MARKER = 'Respond with a single valid json object';
+const DEEPSEEK_JSON_SCHEMA_INSTRUCTIONS_MARKER = 'Return only one valid JSON object';
 
 function jsonSchemaFromResponseFormat(responseFormat) {
   if (!isObject(responseFormat)) return null;
@@ -1490,10 +1399,10 @@ function addDeepSeekJsonSchemaInstructions(messages, responseFormat) {
   const schema = jsonSchemaFromResponseFormat(responseFormat);
   const schemaText = schema ? truncateRawText(JSON.stringify(schema), 6000) : '';
   const instructions = [
-    `${DEEPSEEK_JSON_SCHEMA_INSTRUCTIONS_MARKER} and nothing else: no prose, no markdown fences.`,
+    `${DEEPSEEK_JSON_SCHEMA_INSTRUCTIONS_MARKER}, with no prose or Markdown.`,
     schemaText
-      ? `The json object must conform to this JSON Schema:\n${schemaText}`
-      : 'Use the json object shape requested in the conversation.',
+      ? `It must match this JSON Schema:\n${schemaText}`
+      : 'Use the object shape requested in the conversation.',
   ].join('\n');
   if (!messages.length || messages[0]?.role !== 'system') {
     return [{ role: 'system', content: instructions }, ...messages];
@@ -1656,12 +1565,14 @@ function normalizeInstructions(instructions) {
   return toText(instructions);
 }
 
-export function normalizeResponsesRequest(request) {
+export function normalizeResponsesRequest(request, { restoreDiscoveredTools = true } = {}) {
   const messages = extractMessagesFromResponsesInput(request.input ?? request);
   const model = request.model || request.model_id || request.upstream_model || '';
   const instructions = normalizeInstructions(request.instructions);
   const responseFormat = request.response_format || request.text?.format;
-  const tools = mergeToolsWithToolSearchOutput(request.tools, request.input ?? request);
+  const tools = restoreDiscoveredTools
+    ? mergeToolsWithToolSearchOutput(request.tools, request.input ?? request)
+    : request.tools;
   return {
     model,
     messages,
@@ -1683,10 +1594,8 @@ export function normalizeResponsesRequest(request) {
     text: request.text,
     truncation: request.truncation,
     user: request.user,
-    previous_response_id: request.previous_response_id,
     store: request.store,
     include: request.include,
-    conversation: request.conversation,
   };
 }
 
@@ -1848,7 +1757,10 @@ export function toProviderChatCompletionsRequest(chatRequest, config = {}) {
   if (provider === 'deepseek') {
     delete request.reasoning_effort;
     delete request.parallel_tool_calls;
+    delete request.frequency_penalty;
+    delete request.presence_penalty;
     request.tools = addInternalCommentaryTool(adaptToolsForProvider(request.tools, provider, config), chatRequest.tool_choice);
+    assertDeepSeekToolCapacity(request.tools);
     request.messages = addDeepSeekToolInstructions(request.messages, request.tools);
     if (request.user !== undefined) {
       request.user_id = request.user;
@@ -1899,6 +1811,7 @@ function createBaseResponse({
   normalized,
   completedAt = null,
   incompleteReason = null,
+  error = null,
 }) {
   return {
     id,
@@ -1907,7 +1820,7 @@ function createBaseResponse({
     completed_at: completedAt == null ? null : Math.floor(completedAt),
     status,
     background: false,
-    error: null,
+    error,
     incomplete_details: incompleteReason ? { reason: incompleteReason } : null,
     instructions: normalized?.instructions || null,
     max_output_tokens: normalized?.max_tokens ?? null,
@@ -1927,6 +1840,37 @@ function createBaseResponse({
     usage,
     user: normalized?.user ?? null,
     metadata: normalized?.metadata ?? null,
+  };
+}
+
+function deepSeekFinishReasonOutcome(finishReason) {
+  if (finishReason === 'stop' || finishReason === 'tool_calls') {
+    return { status: 'completed', incompleteReason: null, error: null };
+  }
+  if (finishReason === 'length') {
+    return { status: 'incomplete', incompleteReason: 'max_output_tokens', error: null };
+  }
+  if (finishReason === 'content_filter') {
+    return { status: 'incomplete', incompleteReason: 'content_filter', error: null };
+  }
+  if (finishReason === 'insufficient_system_resource') {
+    return {
+      status: 'failed',
+      incompleteReason: null,
+      error: {
+        code: 'server_is_overloaded',
+        message: 'DeepSeek ended the response because upstream resources were insufficient.',
+      },
+    };
+  }
+  const label = finishReason == null || finishReason === '' ? 'missing' : String(finishReason);
+  return {
+    status: 'failed',
+    incompleteReason: null,
+    error: {
+      code: 'upstream_error',
+      message: `DeepSeek returned an unsupported finish_reason: ${label}.`,
+    },
   };
 }
 
@@ -1991,7 +1935,7 @@ export function createResponseEnvelope({
 const PARALLEL_TOOL_WRAPPER_NAMES = new Set(['multi_tool_use.parallel', 'multi_tool_use_parallel']);
 const EMITTED_TOOL_NAME_PREFIX = 'functions.';
 
-export function isParallelToolWrapperName(name) {
+function isParallelToolWrapperName(name) {
   const raw = String(name || '').toLowerCase();
   const stripped = raw.startsWith(EMITTED_TOOL_NAME_PREFIX) ? raw.slice(EMITTED_TOOL_NAME_PREFIX.length) : raw;
   return PARALLEL_TOOL_WRAPPER_NAMES.has(stripped);
@@ -2001,7 +1945,7 @@ function toolNameMatchKey(name) {
   return String(name || '').toLowerCase().replace(/\./g, '__');
 }
 
-export function resolveEmittedToolName(name, knownNames) {
+function resolveEmittedToolName(name, knownNames) {
   const raw = String(name || '');
   if (!raw || !knownNames) return name;
   const known = knownNames instanceof Set ? knownNames : new Set(knownNames);
@@ -2074,7 +2018,7 @@ function parallelToolUsesFromArguments(argumentsText) {
   return calls;
 }
 
-export function expandParallelToolCalls(toolCalls) {
+function expandParallelToolCalls(toolCalls) {
   if (!Array.isArray(toolCalls)) return toolCalls;
   if (!toolCalls.some((toolCall) => isParallelToolWrapperName(toolCall?.function?.name))) return toolCalls;
   const expanded = [];
@@ -2120,6 +2064,7 @@ export function convertChatCompletionToResponses({ completion: rawCompletion, mo
   );
   const createdAt = completion.created || Date.now() / 1000;
   const choice = Array.isArray(completion.choices) ? completion.choices[0] : null;
+  const outcome = deepSeekFinishReasonOutcome(choice?.finish_reason);
   const message = choice?.message || {};
   const content = chatContentToResponseOutputParts(message.content);
   const messageHasToolCalls = hasChatToolCalls(message);
@@ -2133,7 +2078,7 @@ export function convertChatCompletionToResponses({ completion: rawCompletion, mo
       id: generateId('msg'),
       role: 'assistant',
       content,
-      status: 'completed',
+      status: outcome.status,
       phase: message.phase || (messageHasToolCalls ? 'commentary' : 'final_answer'),
     });
   }
@@ -2156,6 +2101,7 @@ export function convertChatCompletionToResponses({ completion: rawCompletion, mo
         continue;
       }
       const item = responseItemFromChatToolCall(toolCall, toolNames, customToolNames);
+      item.status = outcome.status;
       normalizeFunctionCallItemArguments(item, toolSchemas, config);
       output.push(item);
     }
@@ -2170,7 +2116,7 @@ export function convertChatCompletionToResponses({ completion: rawCompletion, mo
       content: [],
       reasoning_content: reasoningText,
       encrypted_content: encodeGatewayReasoning(reasoningText),
-      status: 'completed',
+      status: outcome.status,
     });
   }
 
@@ -2178,13 +2124,14 @@ export function convertChatCompletionToResponses({ completion: rawCompletion, mo
     id: responseId,
     model,
     createdAt,
-    status: choice?.finish_reason === 'length' ? 'incomplete' : 'completed',
+    status: outcome.status,
     output,
     previousResponseId: previousResponseId ?? null,
     usage: normalizeResponsesUsage(completion.usage),
     normalized,
     completedAt: Date.now() / 1000,
-    incompleteReason: choice?.finish_reason === 'length' ? 'max_output_tokens' : null,
+    incompleteReason: outcome.incompleteReason,
+    error: outcome.error,
   });
 }
 
@@ -2224,6 +2171,7 @@ export class ResponsesStreamMapper {
     this.pendingUsage = null;
     this.completedAt = null;
     this.finalized = false;
+    this.terminalStatus = null;
     this.messageItemAdded = false;
     this.messageContentAdded = false;
     this.messageItemClosed = false;
@@ -2253,6 +2201,7 @@ export class ResponsesStreamMapper {
   }
 
   response(status = 'in_progress') {
+    const outcome = deepSeekFinishReasonOutcome(this.finishReason);
     return createBaseResponse({
       id: this.responseId,
       model: this.model,
@@ -2263,7 +2212,8 @@ export class ResponsesStreamMapper {
       usage: this.usage,
       normalized: this.normalized,
       completedAt: this.completedAt,
-      incompleteReason: this.finishReason === 'length' ? 'max_output_tokens' : null,
+      incompleteReason: status === 'in_progress' ? null : outcome.incompleteReason,
+      error: status === 'failed' ? outcome.error : null,
     });
   }
 
@@ -2761,7 +2711,9 @@ export class ResponsesStreamMapper {
     if (this.finalized) return [];
     this.finalized = true;
     this.expandParallelToolItems();
-    const status = finishReason === 'length' ? 'incomplete' : 'completed';
+    const outcome = deepSeekFinishReasonOutcome(finishReason);
+    const status = outcome.status;
+    this.terminalStatus = status;
     this.finishReason = finishReason;
     this.usage = normalizeResponsesUsage(usage);
     this.completedAt = Date.now() / 1000;
@@ -2876,10 +2828,11 @@ export class ResponsesStreamMapper {
       usage: normalizeResponsesUsage(usage),
       normalized: this.normalized,
       completedAt: Date.now() / 1000,
-      incompleteReason: finishReason === 'length' ? 'max_output_tokens' : null,
+      incompleteReason: outcome.incompleteReason,
+      error: outcome.error,
     });
     events.push({
-      type: status === 'incomplete' ? 'response.incomplete' : 'response.completed',
+      type: status === 'completed' ? 'response.completed' : status === 'incomplete' ? 'response.incomplete' : 'response.failed',
       sequence_number: this.nextSequence(),
       response,
     });
@@ -3060,6 +3013,7 @@ export class ResponsesStreamMapper {
   streamFailed(message) {
     if (this.finalized) return [];
     this.finalized = true;
+    this.terminalStatus = 'failed';
     this.completedAt = Date.now() / 1000;
     const response = this.response('failed');
     response.error = { code: 'upstream_error', message: String(message || 'upstream stream failed') };

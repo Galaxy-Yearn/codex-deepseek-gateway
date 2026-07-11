@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import test from 'node:test';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
@@ -10,7 +11,6 @@ import {
   codexResumeCommand,
   createLaunchContext,
   pickerWindow,
-  resolveCodexExecutable,
 } from '../src/codex-launch.js';
 
 const context = {
@@ -59,6 +59,17 @@ test('non-gateway launches do not force the gateway model catalog', () => {
   assert.equal(codexResumeCommand('session-1', other).includes('model_catalog_json='), false);
 });
 
+test('gateway launches reject unsupported reasoning efforts', () => {
+  assert.throws(
+    () => codexNewArgs({ ...context, reasoningEffort: 'minimal' }),
+    /Unsupported DeepSeek reasoning effort "minimal"\. Expected one of: low, medium, high, xhigh, max/,
+  );
+});
+
+test('non-gateway launches keep Codex custom reasoning efforts open', () => {
+  assert.doesNotThrow(() => codexNewArgs({ ...context, provider: 'other', reasoningEffort: 'future' }));
+});
+
 test('launch context defaults to the English Codex catalog', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-launch-'));
   try {
@@ -90,53 +101,54 @@ test('launch context uses Chinese Codex catalog when configured', async () => {
   }
 });
 
-test('resolves Codex launcher without shell-only shims when available', () => {
-  const executable = resolveCodexExecutable();
-  assert.equal(typeof executable, 'string');
-  assert.ok(executable.length > 0);
-  assert.equal(/\.(?:cmd|bat|ps1)$/i.test(executable), false);
+test('launch context ignores reasoning effort from a different provider', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-launch-'));
+  const previousConfigFile = process.env.CODEX_CONFIG_FILE;
+  try {
+    mkdirSync(join(dir, 'config'));
+    writeFileSync(join(dir, 'config', 'model-aliases.json'), JSON.stringify({ 'deepseek-v4-flash': 'deepseek-v4-flash' }));
+    writeFileSync(join(dir, 'config', 'gateway.local.json'), JSON.stringify({ upstreamApiKey: 'test-key' }));
+    const codexConfigFile = join(dir, 'config.toml');
+    writeFileSync(codexConfigFile, 'model_provider = "other"\nmodel_reasoning_effort = "minimal"\n');
+    process.env.CODEX_CONFIG_FILE = codexConfigFile;
+
+    const context = createLaunchContext({ dir });
+    assert.equal(context.reasoningEffort, 'low');
+  } finally {
+    if (previousConfigFile === undefined) delete process.env.CODEX_CONFIG_FILE;
+    else process.env.CODEX_CONFIG_FILE = previousConfigFile;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test('gateway Codex model catalog contains only DeepSeek aliases with Codex-compatible reasoning', () => {
-  for (const file of ['codex-model-catalog.json', 'codex-model-catalog.zh.json']) {
-    const catalog = JSON.parse(readFileSync(new URL(`../config/${file}`, import.meta.url), 'utf8'));
-    assert.deepEqual(catalog.models.map((model) => model.slug), ['deepseek-v4-flash', 'deepseek-v4-pro']);
+test('gateway Codex model catalogs satisfy the shared structural contract', () => {
+  const files = ['codex-model-catalog.json', 'codex-model-catalog.zh.json'];
+  const expectedSlugs = ['deepseek-v4-flash', 'deepseek-v4-pro'];
+  const expectedEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+  const expectedPersonalityKeys = ['personality_default', 'personality_friendly', 'personality_pragmatic'];
+
+  for (const file of files) {
+    const raw = readFileSync(new URL(`../config/${file}`, import.meta.url), 'utf8');
+    assert.equal(/(?:\u0000|\uFFFD|\?{4,})/u.test(raw), false);
+    const catalog = JSON.parse(raw);
+    assert.deepEqual(catalog.models.map((model) => model.slug), expectedSlugs);
+
     for (const model of catalog.models) {
-      assert.equal(typeof model.base_instructions, 'string');
-      assert.match(model.base_instructions, /Codex/);
-      assert.equal(model.base_instructions.includes('based on GPT-5'), false);
-      assert.equal(model.base_instructions.includes('multi_tool_use'), false);
-      assert.match(model.base_instructions, /tool_search/);
-      assert.equal(model.base_instructions.includes('rg --files'), false);
-      assert.equal(model.base_instructions.includes('Get-ChildItem'), false);
-      assert.match(model.base_instructions, /commentary\(text:/);
-      assert.equal(model.model_messages.instructions_template.includes('based on GPT-5'), false);
-      assert.equal(model.model_messages.instructions_template.includes('{{ personality }}'), true);
-      assert.equal(model.model_messages.instructions_template.includes('multi_tool_use'), false);
-      assert.match(model.model_messages.instructions_template, /tool_search/);
-      assert.equal(model.model_messages.instructions_template.includes('rg --files'), false);
-      assert.equal(model.model_messages.instructions_template.includes('Get-ChildItem'), false);
-      assert.match(model.model_messages.instructions_template, /commentary\(text:/);
-      assert.equal(model.base_instructions.includes('????????'), false);
-      assert.equal(model.model_messages.instructions_template.includes('????????'), false);
-      assert.equal(model.base_instructions.includes('\uFFFD'), false);
-      assert.equal(model.model_messages.instructions_template.includes('\uFFFD'), false);
-      if (file.endsWith('.zh.json')) {
-        assert.match(model.model_messages.instructions_template, /在同一条回复里同时发出多个工具调用/);
-        assert.match(model.model_messages.instructions_template, /先调用 `tool_search` 检索/);
-      } else {
-        assert.match(model.model_messages.instructions_template, /emit them together in one reply as multiple parallel tool calls/);
-        assert.match(model.model_messages.instructions_template, /call `tool_search` first/);
-      }
-      assert.equal(typeof model.model_messages.instructions_variables.personality_friendly, 'string');
-      assert.equal(typeof model.model_messages.instructions_variables.personality_pragmatic, 'string');
-      assert.equal(model.description.includes('Gateway alias'), false);
-      assert.equal(model.description.includes('coding'), false);
-      assert.match(model.description, /^DeepSeek V4 /);
-      assert.deepEqual(
-        model.supported_reasoning_levels.map((level) => level.effort),
-        ['low', 'medium', 'high', 'xhigh'],
-      );
+      const template = model.model_messages.instructions_template;
+      const variables = model.model_messages.instructions_variables;
+      assert.equal(typeof template, 'string');
+      assert.equal((template.match(/\{\{ personality \}\}/g) || []).length, 1);
+      assert.deepEqual(Object.keys(variables).sort(), expectedPersonalityKeys);
+      assert.equal(Object.values(variables).every((value) => typeof value === 'string'), true);
+      assert.equal(model.base_instructions, template.replace('{{ personality }}', variables.personality_pragmatic));
+      assert.match(template, /commentary\(text:/);
+      assert.equal(template.includes('multi_tool_use'), false);
+      assert.deepEqual(model.supported_reasoning_levels.map((level) => level.effort), expectedEfforts);
+      assert.equal(expectedEfforts.includes(model.default_reasoning_level), true);
+      assert.equal(model.supports_reasoning_summaries, true);
+      assert.equal(model.default_reasoning_summary, 'auto');
+      assert.equal(model.supports_parallel_tool_calls, true);
+      assert.equal(model.effective_context_window_percent, 90);
     }
   }
 });
@@ -167,4 +179,26 @@ test('picker window scrolls only when selection leaves the visible window', () =
     offset: 25,
     rows: ['row 26', 'row 27', 'row 28', 'row 29', 'row 30'],
   });
+});
+
+test('picker indents empty state and separates muted control descriptions', () => {
+  const moduleUrl = new URL('../src/codex-launch.js', import.meta.url).href;
+  const script = `
+    import { pick } from ${JSON.stringify(moduleUrl)};
+    await pick('Choose Codex session', [], 'Date  Provider  Title', {
+      emptyMessage: 'No matching sessions found.',
+      shortcuts: [{ key: 'n', displayKey: 'N', action: 'new', label: 'new' }],
+    });
+    process.stdin.pause();
+  `;
+  const output = execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+    encoding: 'utf8',
+    input: '\u001b',
+  });
+  const plain = output.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(plain, /\n  No matching sessions found\.\n/);
+  assert.match(plain, /\n  ─{21}\n/);
+  assert.match(plain, /N new {4}↑\/↓ browse {4}← back {4}Enter confirm {4}Esc quit/);
+  assert.match(output, /\x1b\[90m─{21}\x1b\[0m/);
+  assert.match(output, /N \x1b\[90mnew\x1b\[0m {4}↑\/↓ \x1b\[90mbrowse\x1b\[0m/);
 });

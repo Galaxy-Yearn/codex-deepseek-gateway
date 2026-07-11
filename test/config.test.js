@@ -39,41 +39,43 @@ test('loads local gateway config and lets env override it', async () => {
     assert.equal(config.tavilyWebSearchEnabled, false);
     assert.equal(config.tavilyMaxSearchRounds, 20);
     assert.equal(config.codexPromptLanguage, 'en');
-    assert.equal(config.sessionStoreEnabled, true);
-    assert.equal(config.sessionStorePath, join(dir, 'state', 'sessions.json'));
+    assert.equal(config.reasoningCacheEnabled, true);
+    assert.equal(config.reasoningCachePath, join(dir, 'state', 'reasoning-cache.jsonl'));
+    assert.equal(config.reasoningCacheMaxMessages, 1000);
+    assert.equal(config.legacyReasoningCachePath, join(dir, 'state', 'sessions.json'));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('lets local config and env override persisted session store settings', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'gateway-session-config-'));
+test('lets local config and env override reasoning cache settings', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-reasoning-cache-config-'));
   try {
     await mkdir(join(dir, 'config'));
     const file = join(dir, 'config', 'gateway.local.json');
     await writeFile(
       file,
       JSON.stringify({
-        sessionStoreEnabled: false,
-        sessionStorePath: join(dir, 'custom', 'sessions.json'),
-        sessionStoreMaxSessions: 42,
+        reasoningCacheEnabled: false,
+        reasoningCachePath: join(dir, 'custom', 'reasoning-cache.jsonl'),
+        reasoningCacheMaxMessages: 42,
       }),
     );
 
     const localConfig = loadConfig({ GATEWAY_CONFIG_FILE: file });
-    assert.equal(localConfig.sessionStoreEnabled, false);
-    assert.equal(localConfig.sessionStorePath, join(dir, 'custom', 'sessions.json'));
-    assert.equal(localConfig.sessionStoreMaxSessions, 42);
+    assert.equal(localConfig.reasoningCacheEnabled, false);
+    assert.equal(localConfig.reasoningCachePath, join(dir, 'custom', 'reasoning-cache.jsonl'));
+    assert.equal(localConfig.reasoningCacheMaxMessages, 42);
 
     const envConfig = loadConfig({
       GATEWAY_CONFIG_FILE: file,
-      SESSION_STORE_ENABLED: 'true',
-      SESSION_STORE_PATH: join(dir, 'env', 'sessions.json'),
-      SESSION_STORE_MAX_SESSIONS: '7',
+      REASONING_CACHE_ENABLED: 'true',
+      REASONING_CACHE_PATH: join(dir, 'env', 'reasoning-cache.jsonl'),
+      REASONING_CACHE_MAX_MESSAGES: '7',
     });
-    assert.equal(envConfig.sessionStoreEnabled, true);
-    assert.equal(envConfig.sessionStorePath, join(dir, 'env', 'sessions.json'));
-    assert.equal(envConfig.sessionStoreMaxSessions, 7);
+    assert.equal(envConfig.reasoningCacheEnabled, true);
+    assert.equal(envConfig.reasoningCachePath, join(dir, 'env', 'reasoning-cache.jsonl'));
+    assert.equal(envConfig.reasoningCacheMaxMessages, 7);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

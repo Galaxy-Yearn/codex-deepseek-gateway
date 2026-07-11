@@ -11,11 +11,13 @@ codex-model-catalog.backup.json
 gateway.pid
 *.pid
 state/*
-!state/sessions.example.json
-CORE_BRIDGE_REVIEW.md
-system-prompt.md
+!state/reasoning-cache.example.jsonl
 AGENTS.md
 CLAUDE.md
+CORE_BRIDGE_REVIEW.md
+system-prompt.md
+.agents/
+promotion-doc/
 
 # Logs and generated output
 *.log

@@ -3,10 +3,7 @@ import test from 'node:test';
 import {
   assistantMessageFromResponseOutput,
   convertChatCompletionToResponses,
-  expandParallelToolCalls,
-  isParallelToolWrapperName,
   normalizeResponsesRequest,
-  resolveEmittedToolName,
   ResponsesStreamMapper,
   serializeResponsesSseEvent,
   toChatCompletionsRequest,
@@ -451,6 +448,23 @@ test('loads tools returned by Codex tool_search_output on the next request', () 
   assert.doesNotMatch(chat.messages[1].content, /"additionalProperties"/);
 });
 
+test('can keep internal requests free of tools discovered in history', () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: [
+      {
+        type: 'tool_search_output',
+        call_id: 'call_search',
+        status: 'completed',
+        tools: [{ type: 'function', name: 'discovered_tool', parameters: { type: 'object', properties: {} } }],
+      },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'summarize this context' }] },
+    ],
+    tools: [{ type: 'function', name: 'explicit_tool', parameters: { type: 'object', properties: {} } }],
+  }, { restoreDiscoveredTools: false });
+  assert.deepEqual(normalized.tools.map((tool) => tool.name), ['explicit_tool']);
+});
+
 test('deduplicates repeated tool_search_output discoveries across turns', () => {
   const namespaceGroup = {
     type: 'namespace',
@@ -632,18 +646,18 @@ test('expands Codex namespace tool groups before sending Chat tools', () => {
   assert.equal(toolCall.arguments, '{"agent_type":"explorer","message":"inspect protocol conversion"}');
 });
 
-test('keeps DeepSeek spawn_agent model aliases when schema allows them', () => {
+test('preserves schema-valid arguments for namespaced tools without tool-specific rewrites', () => {
   const normalized = normalizeResponsesRequest({
     model: 'deepseek-v4-pro',
     input: 'delegate work',
     tools: [
       {
         type: 'namespace',
-        name: 'multi_agent_v1',
+        name: 'workflow',
         tools: [
           {
             type: 'function',
-            name: 'spawn_agent',
+            name: 'delegate_task',
             parameters: {
               type: 'object',
               properties: {
@@ -660,7 +674,7 @@ test('keeps DeepSeek spawn_agent model aliases when schema allows them', () => {
     ],
   });
   const response = convertChatCompletionToResponses({
-    responseId: 'resp_spawn_model_alias',
+    responseId: 'resp_namespaced_arguments',
     model: 'deepseek-v4-pro',
     previousResponseId: null,
     normalized,
@@ -678,132 +692,7 @@ test('keeps DeepSeek spawn_agent model aliases when schema allows them', () => {
                 id: 'call_spawn',
                 type: 'function',
                 function: {
-                  name: 'multi_agent_v1__spawn_agent',
-                  arguments: '{"message":"say hi","model":"deepseek-v4-flash","reasoning_effort":"low"}',
-                },
-              },
-            ],
-          },
-          finish_reason: 'tool_calls',
-        },
-      ],
-    },
-  });
-  const toolCall = response.output.find((item) => item.type === 'function_call');
-  assert.equal(toolCall.namespace, 'multi_agent_v1');
-  assert.equal(toolCall.name, 'spawn_agent');
-  assert.equal(toolCall.arguments, '{"message":"say hi","model":"deepseek-v4-flash","reasoning_effort":"low"}');
-});
-
-test('keeps explicit spawn_agent DeepSeek model and effort even when the model matches the parent', () => {
-  const normalized = normalizeResponsesRequest({
-    model: 'deepseek-v4-pro',
-    reasoning: { effort: 'xhigh' },
-    input: 'delegate work',
-    tools: [
-      {
-        type: 'namespace',
-        name: 'multi_agent_v1',
-        tools: [
-          {
-            type: 'function',
-            name: 'spawn_agent',
-            parameters: {
-              type: 'object',
-              properties: {
-                message: { type: 'string' },
-                model: { type: 'string' },
-                reasoning_effort: { type: 'string' },
-              },
-              required: ['message'],
-              additionalProperties: false,
-            },
-          },
-        ],
-      },
-    ],
-  });
-  const response = convertChatCompletionToResponses({
-    responseId: 'resp_spawn_inherited_gateway_model',
-    model: 'deepseek-v4-pro',
-    previousResponseId: null,
-    normalized,
-    config: { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
-    completion: {
-      id: 'chatcmpl_test',
-      created: 1000,
-      choices: [
-        {
-          message: {
-            role: 'assistant',
-            content: '',
-            tool_calls: [
-              {
-                id: 'call_spawn',
-                type: 'function',
-                function: {
-                  name: 'multi_agent_v1__spawn_agent',
-                  arguments: '{"message":"say hi","model":"deepseek-v4-pro","reasoning_effort":"low"}',
-                },
-              },
-            ],
-          },
-          finish_reason: 'tool_calls',
-        },
-      ],
-    },
-  });
-  const toolCall = response.output.find((item) => item.type === 'function_call');
-  assert.equal(toolCall.arguments, '{"message":"say hi","model":"deepseek-v4-pro","reasoning_effort":"low"}');
-});
-
-test('drops non-gateway spawn_agent model overrides before returning to Codex', () => {
-  const normalized = normalizeResponsesRequest({
-    model: 'deepseek-v4-pro',
-    input: 'delegate work',
-    tools: [
-      {
-        type: 'namespace',
-        name: 'multi_agent_v1',
-        tools: [
-          {
-            type: 'function',
-            name: 'spawn_agent',
-            parameters: {
-              type: 'object',
-              properties: {
-                message: { type: 'string' },
-                model: { type: 'string' },
-                reasoning_effort: { type: 'string' },
-              },
-              required: ['message'],
-              additionalProperties: false,
-            },
-          },
-        ],
-      },
-    ],
-  });
-  const response = convertChatCompletionToResponses({
-    responseId: 'resp_spawn_gpt_model_dropped',
-    model: 'deepseek-v4-pro',
-    previousResponseId: null,
-    normalized,
-    config: { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
-    completion: {
-      id: 'chatcmpl_test',
-      created: 1000,
-      choices: [
-        {
-          message: {
-            role: 'assistant',
-            content: '',
-            tool_calls: [
-              {
-                id: 'call_spawn',
-                type: 'function',
-                function: {
-                  name: 'multi_agent_v1__spawn_agent',
+                  name: 'workflow__delegate_task',
                   arguments: '{"message":"say hi","model":"gpt-5.4-mini","reasoning_effort":"low"}',
                 },
               },
@@ -815,7 +704,9 @@ test('drops non-gateway spawn_agent model overrides before returning to Codex', 
     },
   });
   const toolCall = response.output.find((item) => item.type === 'function_call');
-  assert.equal(toolCall.arguments, '{"message":"say hi","reasoning_effort":"low"}');
+  assert.equal(toolCall.namespace, 'workflow');
+  assert.equal(toolCall.name, 'delegate_task');
+  assert.equal(toolCall.arguments, '{"message":"say hi","model":"gpt-5.4-mini","reasoning_effort":"low"}');
 });
 
 test('does not split ordinary double-underscore tool names as namespaces', () => {
@@ -870,18 +761,18 @@ test('does not split ordinary double-underscore tool names as namespaces', () =>
 test('restores encoded ordinary tool names on Responses output', () => {
   const normalized = normalizeResponsesRequest({
     model: 'deepseek-v4-flash',
-    input: 'apply',
+    input: 'generate report',
     tools: [
       {
         type: 'function',
-        name: 'apply.patch',
-        parameters: { type: 'object', properties: { patch: { type: 'string' } } },
+        name: 'report.generate',
+        parameters: { type: 'object', properties: { format: { type: 'string' } } },
       },
     ],
   });
   const chat = toChatCompletionsRequest(normalized);
   const encodedName = chat.tools[0].function.name;
-  assert.match(encodedName, /^apply_patch__[a-f0-9]{8}$/);
+  assert.match(encodedName, /^report_generate__[a-f0-9]{8}$/);
   const response = convertChatCompletionToResponses({
     responseId: 'resp_encoded_name',
     model: 'deepseek-v4-flash',
@@ -894,9 +785,9 @@ test('restores encoded ordinary tool names on Responses output', () => {
             content: '',
             tool_calls: [
               {
-                id: 'call_patch',
+                id: 'call_report',
                 type: 'function',
-                function: { name: encodedName, arguments: '{"patch":"*** Begin Patch"}' },
+                function: { name: encodedName, arguments: '{"format":"markdown"}' },
               },
             ],
           },
@@ -907,7 +798,7 @@ test('restores encoded ordinary tool names on Responses output', () => {
   });
   const toolCall = response.output.find((item) => item.type === 'function_call');
   assert.equal(toolCall.namespace, undefined);
-  assert.equal(toolCall.name, 'apply.patch');
+  assert.equal(toolCall.name, 'report.generate');
 });
 
 test('keeps colliding sanitized tool names distinct and reversible', () => {
@@ -917,13 +808,13 @@ test('keeps colliding sanitized tool names distinct and reversible', () => {
     tools: [
       {
         type: 'function',
-        name: 'apply.patch',
-        parameters: { type: 'object', properties: { patch: { type: 'string' } } },
+        name: 'data.lookup',
+        parameters: { type: 'object', properties: { query: { type: 'string' } } },
       },
       {
         type: 'function',
-        name: 'apply_patch',
-        parameters: { type: 'object', properties: { patch: { type: 'string' } } },
+        name: 'data_lookup',
+        parameters: { type: 'object', properties: { query: { type: 'string' } } },
       },
     ],
   });
@@ -931,8 +822,8 @@ test('keeps colliding sanitized tool names distinct and reversible', () => {
   const names = chat.tools.map((tool) => tool.function.name);
   assert.equal(names.length, 2);
   assert.equal(new Set(names).size, 2);
-  assert.match(names[0], /^apply_patch__[a-f0-9]{8}$/);
-  assert.equal(names[1], 'apply_patch');
+  assert.match(names[0], /^data_lookup__[a-f0-9]{8}$/);
+  assert.equal(names[1], 'data_lookup');
 
   const response = convertChatCompletionToResponses({
     responseId: 'resp_collision_name',
@@ -946,14 +837,14 @@ test('keeps colliding sanitized tool names distinct and reversible', () => {
             content: '',
             tool_calls: [
               {
-                id: 'call_patch_dotted',
+                id: 'call_lookup_dotted',
                 type: 'function',
-                function: { name: names[0], arguments: '{"patch":"a"}' },
+                function: { name: names[0], arguments: '{"query":"a"}' },
               },
               {
-                id: 'call_patch_plain',
+                id: 'call_lookup_plain',
                 type: 'function',
-                function: { name: names[1], arguments: '{"patch":"b"}' },
+                function: { name: names[1], arguments: '{"query":"b"}' },
               },
             ],
           },
@@ -963,17 +854,17 @@ test('keeps colliding sanitized tool names distinct and reversible', () => {
     },
   });
   const calls = response.output.filter((item) => item.type === 'function_call');
-  assert.deepEqual(calls.map((item) => item.name), ['apply.patch', 'apply_patch']);
+  assert.deepEqual(calls.map((item) => item.name), ['data.lookup', 'data_lookup']);
 });
 
-test('does not rewrite ordinary bare spawn_agent tools as Codex sub-agent tools', () => {
+test('preserves ordinary bare tools without namespace rewrites', () => {
   const normalized = normalizeResponsesRequest({
     model: 'deepseek-v4-flash',
-    input: 'spawn business job',
+    input: 'delegate business job',
     tools: [
       {
         type: 'function',
-        name: 'spawn_agent',
+        name: 'delegate_task',
         description: 'Create a business workflow agent.',
         parameters: {
           type: 'object',
@@ -990,6 +881,7 @@ test('does not rewrite ordinary bare spawn_agent tools as Codex sub-agent tools'
     upstreamProvider: 'deepseek',
     modelAliases: DEFAULT_MODEL_ALIASES,
   });
+  assert.equal(request.tools[0].function.name, 'delegate_task');
   assert.match(request.tools[0].function.description, /business workflow agent/);
   assert.deepEqual(request.tools[0].function.parameters.properties.model.enum, ['business-model']);
 });
@@ -1128,29 +1020,34 @@ test('maps provider request for DeepSeek', () => {
   assert.deepEqual(request.stream_options, { include_usage: true });
 });
 
-test('adapts DeepSeek-facing tools without changing internal tool mapping', () => {
+test('preserves long structured tool contracts and schemas without name-specific rewrites', () => {
+  const middleContract = 'MIDDLE_CONTRACT '.repeat(40);
+  const tailContract = 'TAIL_CONTRACT must remain visible after provider adaptation.';
+  const propertyTail = 'PROPERTY_TAIL must remain visible.';
   const normalized = normalizeResponsesRequest({
     model: 'deepseek-v4-flash',
     input: 'delegate',
     tools: [
       {
         type: 'namespace',
-        name: 'multi_agent_v1',
-        description: 'Tools for spawning and managing sub-agents.',
+        name: 'workflow',
         tools: [
           {
             type: 'function',
-            name: 'spawn_agent',
+            name: 'delegate_task',
             description: [
-              'Spawn a sub-agent to work on a task. This original Codex description can be long, detailed, and tailored for native Codex models.',
-              'DeepSeek should receive only a compact function description while the gateway keeps the original schema for Responses mapping.',
-            ].join(' '),
+              'Delegate a task using the runtime contract below.',
+              '',
+              middleContract,
+              '',
+              tailContract,
+            ].join('\n'),
             parameters: {
               type: 'object',
               properties: {
                 message: {
                   type: 'string',
-                  description: 'The task prompt sent to the sub-agent, including all required context for independent execution.',
+                  description: `${'Detailed input contract. '.repeat(30)}${propertyTail}`,
                 },
                 model: {
                   type: 'string',
@@ -1172,124 +1069,20 @@ test('adapts DeepSeek-facing tools without changing internal tool mapping', () =
     ],
   });
   const chat = toChatCompletionsRequest(normalized);
-  assert.match(chat.tools[0].function.description, /original Codex description can be long/);
   assert.deepEqual(chat.tools[0].function.parameters.properties.model.enum, ['gpt-5.5']);
   assert.deepEqual(chat.tools[0].function.parameters.properties.reasoning_effort.enum, ['minimal', 'low', 'medium', 'high']);
 
-  const request = toProviderChatCompletionsRequest(chat, {
-    upstreamProvider: 'deepseek',
-    modelAliases: {
-      ...DEFAULT_MODEL_ALIASES,
-      'deepseek-v4-pro-analysis': { model: 'deepseek-v4-pro', thinking: 'auto' },
-    },
-  });
+  const request = toProviderChatCompletionsRequest(chat, { upstreamProvider: 'deepseek' });
   assert.match(request.messages[0].content, /real callable functions available now/);
   assert.match(request.messages[0].content, /tool_calls/);
-  assert.equal(request.messages[0].content.includes('pseudo XML'), true);
-  assert.equal(request.tools[0].function.name, 'multi_agent_v1__spawn_agent');
-  assert.ok(request.tools[0].function.description.length < chat.tools[0].function.description.length);
-  assert.match(request.tools[0].function.description, /Codex-native sub-agent/);
-  assert.match(request.tools[0].function.description, /model\/reasoning_effort to inherit/);
-  assert.equal(request.tools[0].function.description.includes('deepseek-v4-flash'), false);
+  assert.match(request.messages[0].content, /including as XML, DSML, or JSON/);
+  assert.equal(request.tools[0].function.name, 'workflow__delegate_task');
+  assert.match(request.tools[0].function.description, /MIDDLE_CONTRACT/);
+  assert.match(request.tools[0].function.description, /TAIL_CONTRACT/);
   assert.match(request.tools[0].function.description, /Required: message/);
-  assert.ok(request.tools[0].function.parameters.properties.message.description.length < 170);
-  assert.deepEqual(request.tools[0].function.parameters.properties.model.enum, [
-    'deepseek-v4-flash',
-    'deepseek-v4-pro',
-    'deepseek-v4-pro-analysis',
-  ]);
-  assert.deepEqual(request.tools[0].function.parameters.properties.reasoning_effort.enum, ['low', 'medium', 'high', 'xhigh']);
-  assert.equal(JSON.stringify(request.tools[0]).includes('gpt-5.5'), false);
-  assert.equal(JSON.stringify(request.tools[0]).includes('minimal'), false);
-});
-
-test('keeps critical Codex tool contracts visible in DeepSeek-facing tools', () => {
-  const normalized = normalizeResponsesRequest({
-    model: 'deepseek-v4-flash',
-    input: 'edit and research',
-    tools: [
-      {
-        type: 'custom',
-        name: 'apply_patch',
-        description: [
-          'Use the apply_patch tool to edit files. This is a FREEFORM tool.',
-          'Input must obey the grammar: begin_patch, hunk, end_patch.',
-          'Do not wrap the patch in JSON.',
-        ].join(' '),
-        input_schema: {
-          type: 'object',
-          properties: {
-            input: {
-              type: 'string',
-              description: 'Patch text containing *** Begin Patch and *** End Patch.',
-            },
-          },
-          required: ['input'],
-          additionalProperties: false,
-        },
-      },
-      {
-        type: 'namespace',
-        name: 'mcp__context7',
-        tools: [
-          {
-            type: 'function',
-            name: 'query_docs',
-            description: 'Query documentation only after Resolve Context7 Library ID has selected a /org/project library id.',
-            parameters: {
-              type: 'object',
-              properties: {
-                libraryId: { type: 'string', description: 'Exact /org/project id from resolve-library-id.' },
-                query: { type: 'string', description: 'Specific docs question.' },
-              },
-              required: ['libraryId', 'query'],
-              additionalProperties: false,
-            },
-          },
-        ],
-      },
-      {
-        type: 'namespace',
-        name: 'multi_agent_v1',
-        tools: [
-          {
-            type: 'function',
-            name: 'spawn_agent',
-            description: 'Spawn a sub-agent for a well-scoped task. Do not spawn sub-agents unless explicitly asked for sub-agents, delegation, or parallel agent work.',
-            parameters: {
-              type: 'object',
-              properties: {
-                agent_type: { type: 'string' },
-                message: { type: 'string' },
-              },
-              required: ['message'],
-              additionalProperties: false,
-            },
-          },
-        ],
-      },
-    ],
-  });
-  const request = toProviderChatCompletionsRequest(toChatCompletionsRequest(normalized), {
-    upstreamProvider: 'deepseek',
-    modelAliases: DEFAULT_MODEL_ALIASES,
-  });
-  const byName = new Map(request.tools.map((tool) => [tool.function.name, tool.function]));
-
-  assert.match(byName.get('apply_patch').description, /FREEFORM/);
-  assert.match(byName.get('apply_patch').description, /begin_patch/);
-  assert.match(byName.get('apply_patch').description, /Do not wrap/);
-  assert.deepEqual(byName.get('apply_patch').parameters.required, ['input']);
-  assert.match(byName.get('apply_patch').parameters.properties.input.description, /Begin Patch/);
-
-  assert.match(byName.get('mcp__context7__query_docs').description, /Resolve Context7 Library ID/);
-  assert.match(byName.get('mcp__context7__query_docs').description, /\/org\/project/);
-  assert.deepEqual(byName.get('mcp__context7__query_docs').parameters.required, ['libraryId', 'query']);
-
-  assert.match(byName.get('multi_agent_v1__spawn_agent').description, /Codex-native sub-agent/);
-  assert.match(byName.get('multi_agent_v1__spawn_agent').description, /inherit/);
-  assert.match(byName.get('multi_agent_v1__spawn_agent').description, /Required: message/);
-  assert.deepEqual(byName.get('multi_agent_v1__spawn_agent').parameters.required, ['message']);
+  assert.match(request.tools[0].function.parameters.properties.message.description, /PROPERTY_TAIL/);
+  assert.deepEqual(request.tools[0].function.parameters.properties.model.enum, ['gpt-5.5']);
+  assert.deepEqual(request.tools[0].function.parameters.properties.reasoning_effort.enum, ['minimal', 'low', 'medium', 'high']);
 });
 
 test('filters tools for Codex allowed_tools without forcing a call', () => {
@@ -2585,60 +2378,6 @@ Line 3`;
   assert.equal(events.at(-1).response.output_text, 'final answer');
 });
 
-test('normalizes stringified shell command arrays in schema-normalized tool calls', () => {
-  const mapper = new ResponsesStreamMapper({
-    responseId: 'resp_stream',
-    model: 'deepseek-v4-flash',
-    normalized: {
-      tools: [
-        {
-          type: 'function',
-          function: {
-            name: 'shell',
-            parameters: {
-              type: 'object',
-              properties: {
-                command: { type: 'array', items: { type: 'string' } },
-              },
-            },
-          },
-        },
-      ],
-    },
-  });
-  const events = [
-    ...mapper.mapChatEvent({
-      data: JSON.stringify({
-        choices: [
-          {
-            delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: 'call_shell',
-                  function: {
-                    name: 'shell',
-                    arguments: '{"command":"[\\"powershell.exe\\",\\"-Command\\",\\"Get-Content package.json\\"]"}',
-                  },
-                },
-              ],
-            },
-            finish_reason: null,
-          },
-        ],
-      }),
-    }),
-    ...mapper.mapChatEvent({
-      data: JSON.stringify({
-        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
-      }),
-    }),
-    ...mapper.mapChatEvent({ done: true }),
-  ];
-  const done = events.find((event) => event.type === 'response.function_call_arguments.done');
-  assert.equal(done.arguments, '{"command":["powershell.exe","-Command","Get-Content package.json"]}');
-});
-
 test('emits native tool_search calls without function argument events', () => {
   const mapper = new ResponsesStreamMapper({
     responseId: 'resp_stream',
@@ -2990,117 +2729,6 @@ test('streams namespace tool group calls back with namespace restored', () => {
   assert.equal(outputDone.item.arguments, '{"target":"agent_1","message":"continue"}');
 });
 
-test('normalizes stringified command arrays from Responses input_schema tools', () => {
-  const mapper = new ResponsesStreamMapper({
-    responseId: 'resp_stream',
-    model: 'deepseek-v4-flash',
-    normalized: {
-      tools: [
-        {
-          type: 'function',
-          name: 'shell',
-          input_schema: {
-            type: 'object',
-            properties: {
-              command: { type: 'array', items: { type: 'string' } },
-            },
-          },
-        },
-      ],
-    },
-  });
-  const events = [
-    ...mapper.mapChatEvent({
-      data: JSON.stringify({
-        choices: [
-          {
-            delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: 'call_shell',
-                  function: {
-                    name: 'shell',
-                    arguments: '{"command":"[\\"cmd\\",\\"/c\\",\\"echo hello\\"]"}',
-                  },
-                },
-              ],
-            },
-            finish_reason: null,
-          },
-        ],
-      }),
-    }),
-    ...mapper.mapChatEvent({
-      data: JSON.stringify({
-        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
-      }),
-    }),
-    ...mapper.mapChatEvent({ done: true }),
-  ];
-  const done = events.find((event) => event.type === 'response.function_call_arguments.done');
-  assert.equal(done.arguments, '{"command":["cmd","/c","echo hello"]}');
-});
-
-test('normalizes stringified command arrays in non-buffered tool calls', () => {
-  const mapper = new ResponsesStreamMapper({
-    responseId: 'resp_stream',
-    model: 'deepseek-v4-flash',
-    normalized: {
-      tools: [
-        {
-          type: 'function',
-          name: 'shell',
-          input_schema: {
-            type: 'object',
-            properties: {
-              command: { type: 'array', items: { type: 'string' } },
-            },
-          },
-        },
-      ],
-    },
-  });
-  const events = [
-    ...mapper.mapChatEvent({
-      data: JSON.stringify({
-        choices: [
-          {
-            delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: 'call_shell',
-                  function: {
-                    name: 'shell',
-                    arguments: '{"command":"[\\"cmd\\",\\"/c\\",\\"echo hello\\"]"}',
-                  },
-                },
-              ],
-            },
-            finish_reason: null,
-          },
-        ],
-      }),
-    }),
-    ...mapper.mapChatEvent({
-      data: JSON.stringify({
-        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
-      }),
-    }),
-    ...mapper.mapChatEvent({ done: true }),
-  ];
-  const done = events.find((event) => event.type === 'response.function_call_arguments.done');
-  const deltas = events
-    .filter((event) => event.type === 'response.function_call_arguments.delta')
-    .map((event) => event.delta)
-    .join('');
-  const outputDone = events.find((event) => event.type === 'response.output_item.done' && event.item.type === 'function_call');
-  assert.equal(deltas, '{"command":["cmd","/c","echo hello"]}');
-  assert.equal(done.arguments, '{"command":["cmd","/c","echo hello"]}');
-  assert.equal(outputDone.item.arguments, '{"command":["cmd","/c","echo hello"]}');
-});
-
 test('delays streaming tool output item until tool name is known', () => {
   const mapper = new ResponsesStreamMapper({
     responseId: 'resp_stream',
@@ -3174,74 +2802,91 @@ test('delays streaming tool output item until tool name is known', () => {
   assert.deepEqual(done.item.arguments, { query: 'multi_tool_use.parallel' });
 });
 
-test('normalizes stringified tool argument values according to schema', () => {
-  const mapper = new ResponsesStreamMapper({
-    responseId: 'resp_stream',
-    model: 'deepseek-v4-flash',
-    normalized: {
-      tools: [
-        {
-          type: 'function',
-          function: {
-            name: 'configure',
-            parameters: {
-              type: 'object',
-              properties: {
-                options: { type: 'object', properties: { mode: { type: 'string' } } },
-                ids: { type: 'array', items: { type: 'string' } },
-                dry_run: { type: 'boolean' },
-                count: { type: 'integer' },
-                note: { type: 'string' },
-              },
+test('normalizes stringified streaming tool arguments from parameters and input_schema', () => {
+  const cases = [
+    {
+      tool: {
+        type: 'function',
+        function: {
+          name: 'configure',
+          parameters: {
+            type: 'object',
+            properties: {
+              options: { type: 'object', properties: { mode: { type: 'string' } } },
+              ids: { type: 'array', items: { type: 'string' } },
+              dry_run: { type: 'boolean' },
+              count: { type: 'integer' },
+              note: { type: 'string' },
             },
           },
         },
-      ],
+      },
+      arguments: {
+        options: '{"mode":"fast"}',
+        ids: '["a","b"]',
+        dry_run: 'true',
+        count: '2',
+        note: '["keep as string"]',
+      },
+      expected: {
+        options: { mode: 'fast' },
+        ids: ['a', 'b'],
+        dry_run: true,
+        count: 2,
+        note: '["keep as string"]',
+      },
     },
-  });
-  const events = [
-    ...mapper.mapChatEvent({
-      data: JSON.stringify({
-        choices: [
-          {
+    {
+      tool: {
+        type: 'function',
+        name: 'shell',
+        input_schema: {
+          type: 'object',
+          properties: {
+            command: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+      arguments: { command: '["cmd","/c","echo hello"]' },
+      expected: { command: ['cmd', '/c', 'echo hello'] },
+    },
+  ];
+
+  for (const entry of cases) {
+    const name = entry.tool.function?.name || entry.tool.name;
+    const mapper = new ResponsesStreamMapper({
+      responseId: `resp_stream_${name}`,
+      model: 'deepseek-v4-flash',
+      normalized: { tools: [entry.tool] },
+    });
+    const events = [
+      ...mapper.mapChatEvent({
+        data: JSON.stringify({
+          choices: [{
             delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: 'call_configure',
-                  function: {
-                    name: 'configure',
-                    arguments: JSON.stringify({
-                      options: '{"mode":"fast"}',
-                      ids: '["a","b"]',
-                      dry_run: 'true',
-                      count: '2',
-                      note: '["keep as string"]',
-                    }),
-                  },
-                },
-              ],
+              tool_calls: [{
+                index: 0,
+                id: `call_${name}`,
+                function: { name, arguments: JSON.stringify(entry.arguments) },
+              }],
             },
             finish_reason: null,
-          },
-        ],
+          }],
+        }),
       }),
-    }),
-    ...mapper.mapChatEvent({
-      data: JSON.stringify({
-        choices: [{ delta: {}, finish_reason: 'tool_calls' }],
-      }),
-    }),
-    ...mapper.mapChatEvent({ done: true }),
-  ];
-  const done = events.find((event) => event.type === 'response.function_call_arguments.done');
-  assert.deepEqual(JSON.parse(done.arguments), {
-    options: { mode: 'fast' },
-    ids: ['a', 'b'],
-    dry_run: true,
-    count: 2,
-    note: '["keep as string"]',
-  });
+      ...mapper.mapChatEvent({ data: JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }) }),
+      ...mapper.mapChatEvent({ done: true }),
+    ];
+    const deltas = events
+      .filter((event) => event.type === 'response.function_call_arguments.delta')
+      .map((event) => event.delta)
+      .join('');
+    const done = events.find((event) => event.type === 'response.function_call_arguments.done');
+    const outputDone = events.find((event) => event.type === 'response.output_item.done' && event.item.type === 'function_call');
+    assert.deepEqual(JSON.parse(deltas), entry.expected);
+    assert.deepEqual(JSON.parse(done.arguments), entry.expected);
+    assert.deepEqual(JSON.parse(outputDone.item.arguments), entry.expected);
+  }
 });
 
 test('normalizes stringified command arrays in non-streaming chat completions', () => {
@@ -3787,19 +3432,31 @@ test('expands multi_tool_use.parallel wrapper calls in non-streaming completions
         message: {
           role: 'assistant',
           content: '',
-          tool_calls: [{
-            id: 'call_wrapper',
-            type: 'function',
-            function: {
-              name: 'multi_tool_use.parallel',
-              arguments: JSON.stringify({
-                tool_uses: [
-                  { recipient_name: 'functions.shell_command', parameters: { command: 'rg --files' } },
-                  { recipient_name: 'view_image', parameters: '{"path":"a.png"}' },
-                ],
-              }),
+          tool_calls: [
+            {
+              id: 'call_wrapper',
+              type: 'function',
+              function: {
+                name: 'functions.Multi_Tool_Use_Parallel',
+                arguments: JSON.stringify({
+                  tool_uses: [
+                    { recipient_name: 'functions.shell_command', parameters: { command: 'rg --files' } },
+                    { recipient_name: 'view_image', parameters: '{"path":"a.png"}' },
+                  ],
+                }),
+              },
             },
-          }],
+            {
+              id: 'call_near_match',
+              type: 'function',
+              function: {
+                name: 'multi_tool_use.parallel2',
+                arguments: JSON.stringify({
+                  tool_uses: [{ recipient_name: 'shell_command', parameters: { command: 'should not expand' } }],
+                }),
+              },
+            },
+          ],
         },
         finish_reason: 'tool_calls',
       }],
@@ -3808,9 +3465,10 @@ test('expands multi_tool_use.parallel wrapper calls in non-streaming completions
     normalized: normalizeResponsesRequest({ model: 'deepseek-v4-flash', input: 'go' }),
   });
   const calls = payload.output.filter((item) => item.type === 'function_call');
-  assert.deepEqual(calls.map((item) => item.name), ['shell_command', 'view_image']);
+  assert.deepEqual(calls.map((item) => item.name), ['shell_command', 'view_image', 'multi_tool_use.parallel2']);
   assert.equal(calls[0].arguments, '{"command":"rg --files"}');
   assert.equal(calls[1].arguments, '{"path":"a.png"}');
+  assert.match(calls[2].arguments, /should not expand/);
   assert.notEqual(calls[0].call_id, calls[1].call_id);
 });
 
@@ -3893,7 +3551,11 @@ test('injects the commentary tool and contract line for DeepSeek tool requests',
     { upstreamProvider: 'deepseek', upstreamModel: 'deepseek-v4-flash' },
   );
   assert.deepEqual(request.tools.map((tool) => tool.function.name), ['shell_command', 'commentary']);
-  assert.match(String(request.messages[0].content), /The user cannot see your thinking; commentary is the only progress they see between tool batches\./);
+  assert.match(String(request.messages[0].content), /The user cannot see your thinking/);
+  assert.match(String(request.messages[0].content), /first in the tool_calls array/);
+  assert.match(String(request.messages[0].content), /Never call it alone or use it for the final answer/);
+  assert.match(request.tools[1].function.description, /first in every tool_calls array with other tool calls/);
+  assert.match(request.tools[1].function.description, /never call it alone or use it for the final answer/);
 
   const withOwnCommentary = toProviderChatCompletionsRequest(
     {
@@ -3954,27 +3616,17 @@ test('bridges commentary tool calls in non-streaming completions and drops empty
   assert.deepEqual(assistant.tool_calls.map((toolCall) => toolCall.function.name), ['shell_command']);
 });
 
-test('resolves emitted tool-call name variants to known chat tool names', () => {
-  const known = ['shell_command', 'mcp__context7__query_docs', 'commentary'];
-  assert.equal(resolveEmittedToolName('shell_command', known), 'shell_command');
-  assert.equal(resolveEmittedToolName('functions.shell_command', known), 'shell_command');
-  assert.equal(resolveEmittedToolName('mcp__context7.query_docs', known), 'mcp__context7__query_docs');
-  assert.equal(resolveEmittedToolName('Shell_Command', known), 'shell_command');
-  assert.equal(resolveEmittedToolName('functions.Commentary', known), 'commentary');
-  assert.equal(resolveEmittedToolName('mystery_tool', known), 'mystery_tool');
-  assert.equal(resolveEmittedToolName('functions.mystery_tool', known), 'functions.mystery_tool');
-});
-
 test('maps emitted name variants back to Codex tool identities in non-streaming conversion', () => {
   const normalized = normalizeResponsesRequest({
     model: 'deepseek-v4-flash',
     input: 'go',
     tools: [
       { type: 'function', name: 'shell_command', parameters: { type: 'object', properties: {} } },
+      { type: 'function', name: 'lookup', parameters: { type: 'object', properties: {} } },
       {
         type: 'namespace',
-        name: 'multi_agent_v1',
-        tools: [{ type: 'function', function: { name: 'spawn_agent', parameters: { type: 'object', properties: {} } } }],
+        name: 'workflow',
+        tools: [{ type: 'function', function: { name: 'delegate_task', parameters: { type: 'object', properties: {} } } }],
       },
     ],
   });
@@ -3988,7 +3640,10 @@ test('maps emitted name variants back to Codex tool identities in non-streaming 
           content: '',
           tool_calls: [
             { id: 'call_a', type: 'function', function: { name: 'functions.shell_command', arguments: '{"command":"ls"}' } },
-            { id: 'call_b', type: 'function', function: { name: 'multi_agent_v1.spawn_agent', arguments: '{}' } },
+            { id: 'call_b', type: 'function', function: { name: 'workflow.delegate_task', arguments: '{}' } },
+            { id: 'call_c', type: 'function', function: { name: 'LOOKUP', arguments: '{}' } },
+            { id: 'call_d', type: 'function', function: { name: 'mystery_tool', arguments: '{}' } },
+            { id: 'call_e', type: 'function', function: { name: 'functions.mystery_tool', arguments: '{}' } },
           ],
         },
         finish_reason: 'tool_calls',
@@ -3999,8 +3654,11 @@ test('maps emitted name variants back to Codex tool identities in non-streaming 
     normalized,
   });
   const calls = payload.output.filter((item) => item.type === 'function_call');
-  assert.deepEqual(calls.map((item) => item.name), ['shell_command', 'spawn_agent']);
-  assert.equal(calls[1].namespace, 'multi_agent_v1');
+  assert.deepEqual(
+    calls.map((item) => item.name),
+    ['shell_command', 'delegate_task', 'lookup', 'mystery_tool', 'functions.mystery_tool'],
+  );
+  assert.equal(calls[1].namespace, 'workflow');
 });
 
 test('resolves emitted name variants in streaming tool calls', () => {
@@ -4015,7 +3673,7 @@ test('resolves emitted name variants in streaming tool calls', () => {
       data: JSON.stringify({
         choices: [{
           delta: {
-            tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'functions.lookup', arguments: '{"q":"x"}' } }],
+            tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'functions.LOOKUP', arguments: '{"q":"x"}' } }],
           },
           finish_reason: null,
         }],
@@ -4033,24 +3691,6 @@ test('resolves emitted name variants in streaming tool calls', () => {
   assert.equal(doneItem.item.arguments, '{"q":"x"}');
 });
 
-test('expands parallel wrapper emissions with prefix and case variants', () => {
-  assert.equal(isParallelToolWrapperName('functions.multi_tool_use.parallel'), true);
-  assert.equal(isParallelToolWrapperName('Multi_Tool_Use_Parallel'), true);
-  assert.equal(isParallelToolWrapperName('multi_tool_use.parallel2'), false);
-  const expanded = expandParallelToolCalls([
-    {
-      id: 'call_w',
-      type: 'function',
-      function: {
-        name: 'functions.multi_tool_use.parallel',
-        arguments: JSON.stringify({ tool_uses: [{ recipient_name: 'functions.shell_command', parameters: { command: 'ls' } }] }),
-      },
-    },
-  ]);
-  assert.equal(expanded.length, 1);
-  assert.equal(expanded[0].function.name, 'shell_command');
-});
-
 test('shims web search tools as unavailable functions when no provider is configured', () => {
   const shims = unavailableWebSearchToolShims([
     { type: 'web_search' },
@@ -4060,4 +3700,248 @@ test('shims web search tools as unavailable functions when no provider is config
   assert.deepEqual(shims.map((tool) => tool.function.name), ['web_search', 'web_search_preview']);
   assert.match(shims[0].function.description, /no search provider configured/);
   assert.match(shims[0].function.description, /Do not call this tool/);
+});
+
+test('keeps DeepSeek provider request prefixes byte-stable across rounds and turns', () => {
+  const providerOptions = { upstreamProvider: 'deepseek', upstreamModel: 'deepseek-v4-flash' };
+  const shellTool = {
+    type: 'function',
+    name: 'shell_command',
+    description: 'Run a shell command',
+    parameters: {
+      type: 'object',
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  };
+  const baseInput = [
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'AGENTS.md: keep sources comment-free.' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'fix the failing test' }] },
+  ];
+  const buildProvider = (input, effort) => {
+    const normalized = normalizeResponsesRequest({
+      model: 'deepseek-v4-flash',
+      instructions: 'You are Codex.',
+      input,
+      tools: [shellTool],
+      reasoning: { effort, summary: 'auto' },
+      store: false,
+      stream: true,
+    });
+    return {
+      normalized,
+      provider: toProviderChatCompletionsRequest(toChatCompletionsRequest(normalized), providerOptions),
+    };
+  };
+  const replyItems = (normalized, message) => convertChatCompletionToResponses({
+    responseId: 'resp_prefix',
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    completion: {
+      id: 'chatcmpl_prefix',
+      created: 1000,
+      choices: [{ message, finish_reason: message.tool_calls ? 'tool_calls' : 'stop' }],
+    },
+  }).output;
+  const messageBytes = (built) => built.provider.messages.map((message) => JSON.stringify(message));
+  const assertAppendOnly = (prev, next) => {
+    assert.deepEqual(messageBytes(next).slice(0, prev.provider.messages.length), messageBytes(prev));
+    assert.equal(JSON.stringify(next.provider.tools), JSON.stringify(prev.provider.tools));
+  };
+
+  const round1 = buildProvider(baseInput, 'high');
+  const round2Input = [
+    ...baseInput,
+    ...replyItems(round1.normalized, {
+      role: 'assistant',
+      content: '',
+      reasoning_content: 'Check the test file first.',
+      tool_calls: [
+        { id: 'call_shell_1', type: 'function', function: { name: 'shell_command', arguments: '{"command":"npm test"}' } },
+      ],
+    }),
+    { type: 'function_call_output', call_id: 'call_shell_1', output: '1 failing: expects 42' },
+  ];
+  const round2 = buildProvider(round2Input, 'high');
+  assertAppendOnly(round1, round2);
+
+  const turn2Input = [
+    ...round2Input,
+    ...replyItems(round2.normalized, {
+      role: 'assistant',
+      content: 'Fixed the constant; test passes now.',
+      reasoning_content: 'The fix is a constant.',
+    }),
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'now run lint' }] },
+  ];
+  const turn2 = buildProvider(turn2Input, 'high');
+  assertAppendOnly(round2, turn2);
+
+  const commentaryItems = replyItems(turn2.normalized, {
+    role: 'assistant',
+    content: '',
+    reasoning_content: 'Lint next.',
+    tool_calls: [
+      { id: 'call_comment_1', type: 'function', function: { name: 'commentary', arguments: '{"text":"Running lint now."}' } },
+      { id: 'call_shell_2', type: 'function', function: { name: 'shell_command', arguments: '{"command":"npm run lint"}' } },
+    ],
+  });
+  assert.deepEqual(
+    commentaryItems.map((item) => item.type),
+    ['reasoning', 'message', 'function_call'],
+  );
+  const commentaryRoundInput = [
+    ...turn2Input,
+    ...commentaryItems,
+    { type: 'function_call_output', call_id: 'call_shell_2', output: 'lint clean' },
+  ];
+  const commentaryRound = buildProvider(commentaryRoundInput, 'high');
+  assertAppendOnly(turn2, commentaryRound);
+
+  const finalInput = [
+    ...commentaryRoundInput,
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'summarize' }] },
+  ];
+  assert.deepEqual(messageBytes(buildProvider(finalInput, 'low')), messageBytes(buildProvider(finalInput, 'high')));
+});
+
+test('maps Codex max effort to DeepSeek thinking with reasoning_effort max', () => {
+  const request = toProviderChatCompletionsRequest(toChatCompletionsRequest(normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'hello',
+    reasoning: { effort: 'max' },
+  })), { upstreamProvider: 'deepseek', upstreamModel: 'deepseek-v4-flash' });
+  assert.deepEqual(request.thinking, { type: 'enabled' });
+  assert.equal(request.reasoning_effort, 'max');
+});
+
+test('drops deprecated penalty fields from DeepSeek provider requests only', () => {
+  const chat = toChatCompletionsRequest(normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'hello',
+    frequency_penalty: 0.5,
+    presence_penalty: 0.25,
+  }));
+  assert.equal(chat.frequency_penalty, 0.5);
+  assert.equal(chat.presence_penalty, 0.25);
+  const generic = toProviderChatCompletionsRequest(chat, { upstreamProvider: 'generic', upstreamModel: 'other-model' });
+  assert.equal(generic.frequency_penalty, 0.5);
+  assert.equal(generic.presence_penalty, 0.25);
+  const request = toProviderChatCompletionsRequest(chat, { upstreamProvider: 'deepseek', upstreamModel: 'deepseek-v4-flash' });
+  assert.equal('frequency_penalty' in request, false);
+  assert.equal('presence_penalty' in request, false);
+});
+
+test('preserves complete custom tool grammars without name-based augmentation', () => {
+  const grammar = `start: item+\n${'item: /[a-z]+/\n'.repeat(160)}end_marker: "GRAMMAR_TAIL"`;
+  const chat = toChatCompletionsRequest(normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'patch something',
+    tools: [
+      {
+        type: 'custom',
+        name: 'grammar_tool',
+        description: 'Accept grammar input',
+        format: { type: 'grammar', syntax: 'lark', definition: grammar },
+      },
+      {
+        type: 'custom',
+        name: 'other_freeform',
+        description: 'Another freeform tool',
+        format: { type: 'grammar', syntax: 'lark', definition: grammar },
+      },
+    ],
+  }));
+  const grammarTool = chat.tools.find((tool) => tool.function.name === 'grammar_tool');
+  const other = chat.tools.find((tool) => tool.function.name === 'other_freeform');
+  assert.match(grammarTool.function.description, /GRAMMAR_TAIL/);
+  assert.match(other.function.description, /GRAMMAR_TAIL/);
+  assert.doesNotMatch(grammarTool.function.description, /Example input:/);
+  assert.doesNotMatch(other.function.description, /Example input:/);
+});
+
+test('enforces the DeepSeek 128-function limit after gateway tool injection', () => {
+  const tools = Array.from({ length: 127 }, (_, index) => ({
+    type: 'function',
+    name: `tool_${index}`,
+    parameters: { type: 'object', properties: {} },
+  }));
+  const accepted = toProviderChatCompletionsRequest(toChatCompletionsRequest(normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'use tools',
+    tools,
+  })), { upstreamProvider: 'deepseek' });
+  assert.equal(accepted.tools.length, 128);
+  assert.equal(accepted.tools.at(-1).function.name, 'commentary');
+
+  assert.throws(
+    () => toProviderChatCompletionsRequest(toChatCompletionsRequest(normalizeResponsesRequest({
+      model: 'deepseek-v4-flash',
+      input: 'use tools',
+      tools: [...tools, { type: 'function', name: 'tool_127', parameters: { type: 'object', properties: {} } }],
+    })), { upstreamProvider: 'deepseek' }),
+    (error) => error?.code === 'too_many_tools' && error?.statusCode === 400 && /received 129/.test(error.message),
+  );
+});
+
+test('maps abnormal DeepSeek finish reasons to explicit Responses terminal states', () => {
+  const normalized = normalizeResponsesRequest({ model: 'deepseek-v4-flash', input: 'hello' });
+  const convert = (finishReason) => convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [{ message: { role: 'assistant', content: 'partial' }, finish_reason: finishReason }],
+    },
+    model: 'deepseek-v4-flash',
+    normalized,
+    responseId: `resp_${finishReason}`,
+  });
+
+  const filtered = convert('content_filter');
+  assert.equal(filtered.status, 'incomplete');
+  assert.deepEqual(filtered.incomplete_details, { reason: 'content_filter' });
+  assert.equal(filtered.output[0].status, 'incomplete');
+
+  const length = convert('length');
+  assert.equal(length.status, 'incomplete');
+  assert.deepEqual(length.incomplete_details, { reason: 'max_output_tokens' });
+
+  const overloaded = convert('insufficient_system_resource');
+  assert.equal(overloaded.status, 'failed');
+  assert.equal(overloaded.error.code, 'server_is_overloaded');
+  assert.equal(overloaded.output[0].status, 'failed');
+
+  const unknown = convert('future_reason');
+  assert.equal(unknown.status, 'failed');
+  assert.equal(unknown.error.code, 'upstream_error');
+  assert.match(unknown.error.message, /future_reason/);
+});
+
+test('emits explicit streaming terminal events for abnormal DeepSeek finish reasons', () => {
+  const map = (finishReason) => {
+    const mapper = new ResponsesStreamMapper({
+      responseId: `resp_stream_${finishReason}`,
+      model: 'deepseek-v4-flash',
+      normalized: normalizeResponsesRequest({ model: 'deepseek-v4-flash', input: 'hello', stream: true }),
+    });
+    mapper.mapChatEvent({ data: JSON.stringify({ choices: [{ delta: { content: 'partial' }, finish_reason: finishReason }] }) });
+    return mapper.mapChatEvent({ done: true }).at(-1);
+  };
+
+  const filtered = map('content_filter');
+  assert.equal(filtered.type, 'response.incomplete');
+  assert.deepEqual(filtered.response.incomplete_details, { reason: 'content_filter' });
+
+  const length = map('length');
+  assert.equal(length.type, 'response.incomplete');
+  assert.deepEqual(length.response.incomplete_details, { reason: 'max_output_tokens' });
+
+  const overloaded = map('insufficient_system_resource');
+  assert.equal(overloaded.type, 'response.failed');
+  assert.equal(overloaded.response.error.code, 'server_is_overloaded');
+
+  const unknown = map('future_reason');
+  assert.equal(unknown.type, 'response.failed');
+  assert.equal(unknown.response.error.code, 'upstream_error');
 });

@@ -21,7 +21,7 @@ import {
   toProviderChatCompletionsRequest,
   unavailableWebSearchToolShims,
 } from './protocol.js';
-import { SessionStore } from './session-store.js';
+import { ReasoningCache } from './reasoning-cache.js';
 import { callChatCompletions, callModels, readJsonResponse, relayChatCompletionsResponse } from './upstream.js';
 import {
   annotateMessagePartWithWebCitations,
@@ -62,6 +62,14 @@ function getRequestPath(req) {
   return url.pathname;
 }
 
+function codexRequestKind(req) {
+  const value = req.headers['x-codex-turn-metadata'];
+  if (typeof value !== 'string') return '';
+  const parsed = safeJsonParse(value);
+  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') return '';
+  return String(parsed.value.request_kind || '');
+}
+
 function isAuthorized(req, config) {
   if (!config.proxyApiKey) return true;
   const authorization = req.headers.authorization || '';
@@ -69,29 +77,7 @@ function isAuthorized(req, config) {
   return bearerToken === config.proxyApiKey || req.headers['x-api-key'] === config.proxyApiKey;
 }
 
-function conversationIdFromRequest(request, normalized) {
-  const conversation = normalized.conversation ?? request.conversation;
-  if (typeof conversation === 'string') return conversation;
-  if (conversation && typeof conversation === 'object') return conversation.id || conversation.conversation_id || null;
-  return request.conversation_id || null;
-}
-
-function historyMessagesFromSession(session) {
-  return Array.isArray(session?.messages) ? session.messages : [];
-}
-
-function sessionMessages(chatMessages, assistantMessage) {
-  const messages = Array.isArray(chatMessages) ? chatMessages.slice() : [];
-  if (assistantMessage) messages.push(assistantMessage);
-  return messages;
-}
-
-function shouldPersistSession(normalized, request, conversationId) {
-  if (conversationId) return true;
-  return (normalized.store ?? request.store) !== false;
-}
-
-function prependMissingAssistantToolMessages(messages, sessions) {
+function prependMissingAssistantToolMessages(messages, reasoningCache) {
   const existingToolCallIds = new Set();
   const missingToolOutputIds = [];
   for (const message of messages) {
@@ -111,7 +97,7 @@ function prependMissingAssistantToolMessages(messages, sessions) {
   const inserted = new Set(existingToolCallIds);
   for (const callId of missingToolOutputIds) {
     if (inserted.has(callId)) continue;
-    const assistantMessage = sessions.getAssistantMessageForToolCall(callId);
+    const assistantMessage = reasoningCache.getAssistantMessageForToolCall(callId);
     if (!assistantMessage) continue;
     prefix.push(assistantMessage);
     for (const id of extractToolCallIdsFromMessages([assistantMessage])) inserted.add(id);
@@ -119,14 +105,14 @@ function prependMissingAssistantToolMessages(messages, sessions) {
   return prefix.length ? prefix.concat(messages) : messages;
 }
 
-function restoreAssistantReasoningContent(messages, sessions) {
+function restoreAssistantReasoningContent(messages, reasoningCache) {
   return messages.map((message) => {
     if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls) || !message.tool_calls.length) {
       return message;
     }
     if (typeof message.reasoning_content === 'string' && message.reasoning_content) return message;
     for (const toolCall of message.tool_calls) {
-      const stored = sessions.getAssistantMessageForToolCall(toolCall?.id);
+      const stored = reasoningCache.getAssistantMessageForToolCall(toolCall?.id);
       if (typeof stored?.reasoning_content === 'string' && stored.reasoning_content) {
         return { ...message, reasoning_content: stored.reasoning_content };
       }
@@ -275,11 +261,9 @@ function toolCallsToFinalAnswerRequest(request) {
     messages: removeWebSearchInstructions(request.messages).concat({
       role: 'user',
       content: [
-        'Web tools are not available now.',
-        'Use the completed tool results already provided in this conversation.',
-        'Give the final answer now as visible assistant message content.',
-        'Do not write tool calls, DSML, XML, or JSON tool-call blocks in the answer.',
-        'If the available tool results are incomplete, say what is missing and answer only what the provided context supports.',
+        'Web tools are now unavailable.',
+        'Answer now using only completed tool results as visible assistant text, without tool calls or tool-call markup.',
+        'If results are incomplete, state what is missing and do not infer beyond them.',
       ].join(' '),
     }),
   };
@@ -543,6 +527,12 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
 
 const STREAM_HEARTBEAT_MS = 10000;
 
+function streamHeartbeatMs(config) {
+  const value = Number(config?.streamHeartbeatMs);
+  if (Number.isFinite(value) && value > 0) return value;
+  return STREAM_HEARTBEAT_MS;
+}
+
 function writeSseEvent(res, event) {
   if (res.writableEnded || res.destroyed) return;
   res.write(serializeResponsesSseEvent(event));
@@ -580,7 +570,7 @@ function webSearchSseWriter({ res, mapper, outputIndexBySearch, includeSources =
   };
 }
 
-async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, config, res, responseId, previousResponseId, clientSignal }) {
+async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, config, res, responseId, clientSignal }) {
   const effectiveChatRequest = { ...chatRequest, normalized };
   const state = prepareWebSearchRequest({ normalized, chatRequest: effectiveChatRequest, config });
   if (!state.enabled) return { handled: false };
@@ -613,7 +603,6 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
     responseId,
     model: firstUpstreamRequest.model,
     createdAt: Math.floor(Date.now() / 1000),
-    previousResponseId,
     normalized,
     config,
     ...resolveReasoningStreamMode(config, firstUpstreamRequest),
@@ -663,7 +652,11 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
       writeSseEvent(res, event);
     }
     endStream();
-    return { handled: true, chatRequest: currentChatRequest, assistantMessage: mapper.roundAssistantMessage() };
+    return {
+      handled: true,
+      chatRequest: currentChatRequest,
+      assistantMessage: mapper.terminalStatus === 'completed' ? mapper.roundAssistantMessage() : null,
+    };
   };
   const relayRound = async () => {
     roundEnd = null;
@@ -810,11 +803,12 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
   }
 }
 
-export function createProxyServer({ config = loadConfig(), sessions } = {}) {
-  sessions ||= new SessionStore({
-    persistPath: config.sessionStoreEnabled === false ? '' : config.sessionStorePath,
-    maxSessions: config.sessionStoreMaxSessions,
-    maxBytes: config.sessionStoreMaxBytes,
+export function createProxyServer({ config = loadConfig(), reasoningCache } = {}) {
+  reasoningCache ||= new ReasoningCache({
+    persistPath: config.reasoningCacheEnabled === false ? '' : config.reasoningCachePath,
+    legacyPath: config.legacyReasoningCachePath,
+    maxMessages: config.reasoningCacheMaxMessages,
+    maxBytes: config.reasoningCacheMaxBytes,
   });
   let modelCache = null;
 
@@ -852,16 +846,11 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
     }
 
     const request = parsed.value;
-    const normalized = normalizeResponsesRequest(request);
-    const previousResponseId = normalized.previous_response_id || request.previous_response_id || null;
-    const conversationId = conversationIdFromRequest(request, normalized);
-    const priorSession = previousResponseId ? sessions.get(previousResponseId) : conversationId ? sessions.getConversation(conversationId) : null;
-    const priorMessages = historyMessagesFromSession(priorSession);
-    if (priorMessages.length) {
-      normalized.messages = priorMessages.concat(normalized.messages);
-    }
-    normalized.messages = prependMissingAssistantToolMessages(normalized.messages, sessions);
-    normalized.messages = restoreAssistantReasoningContent(normalized.messages, sessions);
+    const normalized = normalizeResponsesRequest(request, {
+      restoreDiscoveredTools: codexRequestKind(req) !== 'compaction',
+    });
+    normalized.messages = prependMissingAssistantToolMessages(normalized.messages, reasoningCache);
+    normalized.messages = restoreAssistantReasoningContent(normalized.messages, reasoningCache);
 
     const chatRequest = toChatCompletionsRequest(normalized);
     const useWebSearchEmulator = hasTavilyWebSearch(config, normalized);
@@ -886,17 +875,7 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
     }
 
     const responseId = generateId('resp');
-    const nextSession = { id: responseId, messages: [] };
-    const persistSession = shouldPersistSession(normalized, request, conversationId);
-    const persistTurn = (chatMessages, assistantMessage) => {
-      if (persistSession) {
-        nextSession.messages = sessionMessages(chatMessages, assistantMessage);
-        sessions.set(responseId, nextSession);
-        sessions.setConversation(conversationId, responseId);
-      } else {
-        sessions.rememberAssistantMessage(assistantMessage);
-      }
-    };
+    const persistReasoning = (assistantMessage) => reasoningCache.rememberAssistantMessage(assistantMessage);
 
     if (useWebSearchEmulator && request.stream) {
       const result = await runStreamingWebSearchTurn({
@@ -906,11 +885,10 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
         config,
         res,
         responseId,
-        previousResponseId,
         clientSignal,
       });
       if (result.handled) {
-        if (result.assistantMessage) persistTurn(result.chatRequest.messages, result.assistantMessage);
+        if (result.assistantMessage) persistReasoning(result.assistantMessage);
         return;
       }
     } else if (useWebSearchEmulator) {
@@ -936,12 +914,13 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
       const payload = applyWebSearchOutputCompatibility(convertChatCompletionToResponses({
         completion: loop.completion,
         model: upstreamRequest.model,
-        previousResponseId,
         normalized,
         responseId,
         config,
       }), loop.searches, normalized, loop.openedPages);
-      persistTurn(loop.chatRequest.messages, assistantMessageFromResponseOutput(payload.output));
+      if (payload.status === 'completed') {
+        persistReasoning(assistantMessageFromResponseOutput(payload.output));
+      }
       sendJson(res, 200, payload);
       return;
     }
@@ -969,12 +948,13 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
       const payload = convertChatCompletionToResponses({
         completion: data,
         model,
-        previousResponseId,
         normalized,
         responseId,
         config,
       });
-      persistTurn(chatRequest.messages, assistantMessageFromResponseOutput(payload.output));
+      if (payload.status === 'completed') {
+        persistReasoning(assistantMessageFromResponseOutput(payload.output));
+      }
       sendJson(res, 200, payload);
       return;
     }
@@ -990,7 +970,6 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
       responseId,
       model,
       createdAt: Math.floor(Date.now() / 1000),
-      previousResponseId,
       normalized,
       config,
       ...resolveReasoningStreamMode(config, upstreamRequest),
@@ -1006,6 +985,12 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
     writeSseEvent(res, mapper.createdEvent());
     writeSseEvent(res, mapper.inProgressEvent());
     let lastEventWriteAt = Date.now();
+    const heartbeatMs = streamHeartbeatMs(config);
+    const heartbeat = setInterval(() => {
+      if (doneSent || Date.now() - lastEventWriteAt < heartbeatMs) return;
+      writeSseEvent(res, mapper.inProgressEvent());
+      lastEventWriteAt = Date.now();
+    }, heartbeatMs);
 
     try {
       await relayChatCompletionsResponse({
@@ -1020,9 +1005,6 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
           }
           if (events.length) {
             lastEventWriteAt = Date.now();
-          } else if (!event?.done && Date.now() - lastEventWriteAt >= STREAM_HEARTBEAT_MS) {
-            writeSseEvent(res, mapper.inProgressEvent());
-            lastEventWriteAt = Date.now();
           }
           if (event?.done) writeResponsesDone();
         },
@@ -1030,9 +1012,13 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
     } catch (error) {
       if (clientSignal.aborted) return;
       throw error;
+    } finally {
+      clearInterval(heartbeat);
     }
 
-    persistTurn(chatRequest.messages, mapper.assistantMessage());
+    if (mapper.terminalStatus === 'completed') {
+      persistReasoning(mapper.assistantMessage());
+    }
   }
 
   return http.createServer(async (req, res) => {
@@ -1098,7 +1084,8 @@ export function createProxyServer({ config = loadConfig(), sessions } = {}) {
         }
         return;
       }
-      sendJson(res, 500, { error: { message: error.message || 'Internal server error' } });
+      const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
+      sendJson(res, statusCode, { error: { code: error.code, message: error.message || 'Internal server error' } });
     }
   });
 }

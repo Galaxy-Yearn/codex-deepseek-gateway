@@ -93,15 +93,15 @@ zh -> ~/.codex/deepseek-gateway/config/codex-model-catalog.zh.json
 
 `model-aliases.json` 由本软件包管理，并会在安装时刷新。随包提供的 Codex catalog 目前允许默认别名 `deepseek-v4-flash` 和 `deepseek-v4-pro`，用于 Codex 原生 sub-agent 校验。
 
-### Session State
+### Reasoning Cache
 
-网关会把 Responses 侧的 `previous_response_id` / `conversation` 图持久化到：
+网关会把有界的 DeepSeek reasoning cache 保存在：
 
 ```text
-~/.codex/deepseek-gateway/state/sessions.json
+~/.codex/deepseek-gateway/state/reasoning-cache.jsonl
 ```
 
-这份状态让 DeepSeek 能在网关重启后收到重建的 Chat 历史，包括 thinking mode 工具调用轮次中的原始 reasoning。Codex 会发送 `store: false`，因此它的轮次只持久化紧凑的按 `call_id` 索引的 reasoning 缓存；完整历史快照只会为启用存储并使用 `previous_response_id` / `conversation` 的客户端保留。该文件是可读的 JSON（`state/sessions.example.json` 展示了结构），可以随时安全删除。可通过 `sessionStorePath`、`sessionStoreMaxSessions`（默认 500）、`sessionStoreMaxBytes`（默认 16 MB）或 `sessionStoreEnabled: false` 调整；对应的 `SESSION_STORE_*` 环境变量也可使用。
+每条 JSONL 记录把工具 `call_id` 映射到含原始 `reasoning_content` 的 assistant 消息，使 DeepSeek thinking-mode 工具轮次在 gateway 重启后仍可正确回传。Codex 的会话历史由自身 rollout 管理并通过 `input` 发送；gateway 不持久化 `previous_response_id`、`conversation` 或完整消息历史。缓存平时只做追加写入，达到边界时压缩；`install` 会保留该文件，也可随时安全删除。可通过 `reasoningCachePath`、`reasoningCacheMaxMessages`（默认 1000）、`reasoningCacheMaxBytes`（默认 16 MB）或 `reasoningCacheEnabled: false` 调整；对应的 `REASONING_CACHE_*` 环境变量也可使用。已有 `sessions.json` 会迁移一次后删除。
 
 ## 使用
 
@@ -117,7 +117,7 @@ codex-deepseek-gateway new
 codex-deepseek-gateway sessions
 ```
 
-建议优先使用这些 `new` / `sessions` 命令，而不是直接使用普通的 `codex` / `codex resume`。launcher 会添加网关 provider、model catalog、model 和 reasoning 覆盖配置。
+建议仅使用这些 `new` / `sessions` 命令获得项目设计的 DeepSeek Codex 体验。普通 `codex` / `codex resume` 不会加载随包 model catalog；launcher 会添加网关 provider、model catalog、model 和 reasoning 覆盖配置。
 
 在交互式会话选择器中，使用 Up/Down 在可滚动的会话窗口中移动。按 `n` 会开始一个新对话，而不是恢复已有会话。
 
@@ -136,7 +136,7 @@ codex-deepseek-gateway sessions --exec <id-or-row>                           # �
 codex -c model_provider=deepseek-gateway -c model=<model> -c model_reasoning_effort=<effort> -c model_supports_reasoning_summaries=true -c model_reasoning_summary=auto
 ```
 
-launcher 还会传入指向随包 catalog 的 `model_catalog_json`，因此 Codex 原生 multi-agent 校验会接受 DeepSeek 模型别名和 `low|medium|high|xhigh` reasoning efforts。这个设置会替换该 Codex 进程的默认 model catalog，而不是与默认 catalog 合并。默认 context window 扩展为 1M，因为 `deepseek-v4-flash` 和 `deepseek-v4-pro` 模型都支持该长度。`context_window` 和 `max_context_window` 可以自定义。
+launcher 还会传入指向随包 catalog 的 `model_catalog_json`，因此 Codex 原生 multi-agent 校验会接受 DeepSeek 模型别名和 `low|medium|high|xhigh|max` reasoning efforts。这个设置会替换该 Codex 进程的默认 model catalog，而不是与默认 catalog 合并。默认 context window 扩展为 1M，因为 `deepseek-v4-flash` 和 `deepseek-v4-pro` 模型都支持该长度。`context_window` 和 `max_context_window` 可以自定义。
 
 在通过 launcher 启动的 Codex TUI 中，`/model` 可以在随包提供的 DeepSeek 模型和 reasoning efforts 之间切换，`/personality` 可配合 catalog 中的 `personality_default`、`personality_friendly` 和 `personality_pragmatic` 条目使用。
 
@@ -167,6 +167,7 @@ Codex effort 会映射到 DeepSeek V4 thinking mode：
 | `medium` | `thinking.type = enabled`, `reasoning_effort = high` |
 | `high` | `thinking.type = enabled`, `reasoning_effort = high` |
 | `xhigh` | `thinking.type = enabled`, `reasoning_effort = max` |
+| `max` | `thinking.type = enabled`, `reasoning_effort = max` |
 
 当 DeepSeek 返回 `reasoning_content` 时，原始文本会被保留给 DeepSeek 历史；Codex 则会收到一个用于显示的 summary：经过 Markdown 清理，并带有前置加粗 `**Reasoning**` 标题。该标题会在模型思考时驱动 Codex 状态行。
 
@@ -205,8 +206,7 @@ Chat Completions 不是完整的 Responses API 替代品。
 - 没有本地 Codex executor 的 hosted tools 会被表示为 function shims。Web search 是网关唯一直接模拟的 hosted tool。
 - Tavily/Firecrawl 的 web 模拟以文本为中心；它不提供浏览器控制、截图、原始 HTML、cookies、crawl jobs 或私有网络访问。
 - OpenAI `file_id` 值会被原样传递；网关无法获取 OpenAI 托管的私有文件。
-- 普通 `codex` 命令不会自动加载随包提供的 model catalog。如果希望 TUI `/model` 和 sub-agent 校验使用 DeepSeek catalog，请使用 launcher。
-- 恢复会话时，较早 assistant 回复中包含 Markdown 表格的部分可能被隐藏。这是一个 Codex TUI replay bug（[openai/codex#29218](https://github.com/openai/codex/issues/29218)）；会话数据本身是完整的。
+- 普通 `codex` 命令不会自动加载随包提供的 model catalog。受支持的 DeepSeek 工作流建议仅使用 `codex-deepseek-gateway new` / `sessions`，包括 TUI `/model` 和 sub-agent 校验。
 
 ## 许可证
 

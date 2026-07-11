@@ -17,17 +17,21 @@ test('prints package version', () => {
   assert.equal(output.trim(), packageJson.version);
 });
 
-test('install copies runtime assets without overwriting local config', async () => {
+test('install copies runtime assets without overwriting local config or reasoning cache', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-cli-install-'));
   try {
     await mkdir(join(dir, 'config'), { recursive: true });
+    await mkdir(join(dir, 'state'), { recursive: true });
     const localConfigPath = join(dir, 'config', 'gateway.local.json');
+    const reasoningCachePath = join(dir, 'state', 'reasoning-cache.jsonl');
     const localConfig = {
       upstreamApiKey: 'sk-REPLACE_ME',
       codexPromptLanguage: 'zh',
       customUserValue: 'keep',
     };
+    const reasoningCache = '{"version":1,"callIds":["call_existing"],"message":{"role":"assistant","reasoning_content":"keep","tool_calls":[]}}\n';
     await writeFile(localConfigPath, JSON.stringify(localConfig, null, 2));
+    await writeFile(reasoningCachePath, reasoningCache);
     await writeFile(join(dir, 'src-stale.txt'), 'leave unrelated files alone');
     await mkdir(join(dir, 'src'), { recursive: true });
     await writeFile(join(dir, 'src', 'stale.js'), 'stale');
@@ -43,6 +47,7 @@ test('install copies runtime assets without overwriting local config', async () 
     });
 
     assert.deepEqual(JSON.parse(readFileSync(localConfigPath, 'utf8')), localConfig);
+    assert.equal(readFileSync(reasoningCachePath, 'utf8'), reasoningCache);
     assert.equal(existsSync(join(dir, 'bin', 'codex-deepseek-gateway.js')), true);
     assert.equal(existsSync(join(dir, 'src', 'server.js')), true);
     assert.equal(existsSync(join(dir, 'src', 'stale.js')), false);
