@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import test from 'node:test';
+
+async function scenario(name, run) {
+  try {
+    await run();
+  } catch (error) {
+    error.message = `${name}: ${error.message}`;
+    throw error;
+  }
+}
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -20,7 +29,8 @@ const context = {
   modelCatalogPath: 'C:\\Users\\PC\\.codex\\deepseek-gateway\\config\\codex-model-catalog.json',
 };
 
-test('codex launch overrides enable reasoning summaries for custom models', () => {
+test('Codex launch configuration and catalogs', async () => {
+  await scenario('codex launch overrides enable reasoning summaries for custom models', async () => {
   assert.deepEqual(codexNewArgs(context), [
     '-c',
     'model_provider="deepseek-gateway"',
@@ -41,36 +51,31 @@ test('codex launch overrides enable reasoning summaries for custom models', () =
     'session-1',
     ...codexNewArgs(context),
   ]);
-});
-
-test('printed resume commands quote config overrides', () => {
+  });
+  await scenario('printed resume commands quote config overrides', async () => {
   assert.equal(
     codexResumeCommand('session-1', context),
     'codex resume session-1 -c \'model_provider="deepseek-gateway"\' -c \'model="deepseek-v4-flash"\' -c \'model_reasoning_effort="high"\' -c model_supports_reasoning_summaries=true -c \'model_reasoning_summary="auto"\' -c \'model_catalog_json="C:\\\\Users\\\\PC\\\\.codex\\\\deepseek-gateway\\\\config\\\\codex-model-catalog.json"\'',
   );
-});
-
-test('non-gateway launches do not force the gateway model catalog', () => {
+  });
+  await scenario('non-gateway launches do not force the gateway model catalog', async () => {
   const other = {
     ...context,
     provider: 'duckcoding',
   };
   assert.equal(codexNewArgs(other).includes('model_catalog_json="C:\\\\Users\\\\PC\\\\.codex\\\\deepseek-gateway\\\\config\\\\codex-model-catalog.json"'), false);
   assert.equal(codexResumeCommand('session-1', other).includes('model_catalog_json='), false);
-});
-
-test('gateway launches reject unsupported reasoning efforts', () => {
+  });
+  await scenario('gateway launches reject unsupported reasoning efforts', async () => {
   assert.throws(
     () => codexNewArgs({ ...context, reasoningEffort: 'minimal' }),
     /Unsupported DeepSeek reasoning effort "minimal"\. Expected one of: low, medium, high, xhigh, max/,
   );
-});
-
-test('non-gateway launches keep Codex custom reasoning efforts open', () => {
+  });
+  await scenario('non-gateway launches keep Codex custom reasoning efforts open', async () => {
   assert.doesNotThrow(() => codexNewArgs({ ...context, provider: 'other', reasoningEffort: 'future' }));
-});
-
-test('launch context defaults to the English Codex catalog', async () => {
+  });
+  await scenario('launch context defaults to the English Codex catalog', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-launch-'));
   try {
     mkdirSync(join(dir, 'config'));
@@ -83,9 +88,8 @@ test('launch context defaults to the English Codex catalog', async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test('launch context uses Chinese Codex catalog when configured', async () => {
+  });
+  await scenario('launch context uses Chinese Codex catalog when configured', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-launch-'));
   try {
     mkdirSync(join(dir, 'config'));
@@ -99,9 +103,8 @@ test('launch context uses Chinese Codex catalog when configured', async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test('launch context ignores reasoning effort from a different provider', async () => {
+  });
+  await scenario('launch context ignores reasoning effort from a different provider', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-launch-'));
   const previousConfigFile = process.env.CODEX_CONFIG_FILE;
   try {
@@ -119,9 +122,8 @@ test('launch context ignores reasoning effort from a different provider', async 
     else process.env.CODEX_CONFIG_FILE = previousConfigFile;
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test('gateway Codex model catalogs satisfy the shared structural contract', () => {
+  });
+  await scenario('gateway Codex model catalogs satisfy the shared structural contract', async () => {
   const files = ['codex-model-catalog.json', 'codex-model-catalog.zh.json'];
   const expectedSlugs = ['deepseek-v4-flash', 'deepseek-v4-pro'];
   const expectedEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -149,11 +151,14 @@ test('gateway Codex model catalogs satisfy the shared structural contract', () =
       assert.equal(model.default_reasoning_summary, 'auto');
       assert.equal(model.supports_parallel_tool_calls, true);
       assert.equal(model.effective_context_window_percent, 90);
+      assert.equal(model.auto_compact_token_limit, 900000);
     }
   }
+  });
 });
 
-test('picker window scrolls only when selection leaves the visible window', () => {
+test('interactive picker rendering and navigation', async () => {
+  await scenario('picker window scrolls only when selection leaves the visible window', async () => {
   const rows = Array.from({ length: 30 }, (_, index) => `row ${index + 1}`);
   assert.deepEqual(pickerWindow(rows, 0, 5), {
     offset: 0,
@@ -179,9 +184,8 @@ test('picker window scrolls only when selection leaves the visible window', () =
     offset: 25,
     rows: ['row 26', 'row 27', 'row 28', 'row 29', 'row 30'],
   });
-});
-
-test('picker indents empty state and separates muted control descriptions', () => {
+  });
+  await scenario('picker indents empty state and separates muted control descriptions', async () => {
   const moduleUrl = new URL('../src/codex-launch.js', import.meta.url).href;
   const script = `
     import { pick } from ${JSON.stringify(moduleUrl)};
@@ -201,4 +205,5 @@ test('picker indents empty state and separates muted control descriptions', () =
   assert.match(plain, /N new {4}↑\/↓ browse {4}← back {4}Enter confirm {4}Esc quit/);
   assert.match(output, /\x1b\[90m─{21}\x1b\[0m/);
   assert.match(output, /N \x1b\[90mnew\x1b\[0m {4}↑\/↓ \x1b\[90mbrowse\x1b\[0m/);
+  });
 });

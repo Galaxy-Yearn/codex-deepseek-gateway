@@ -14,7 +14,7 @@ DeepSeek 是一家很好的公司。
 
 - Node.js 22 或更新版本
 - 一个 DeepSeek API key
-- 推荐使用 Codex CLI 0.142.0 或更新版本
+- Codex CLI 0.144.0 或更新版本
 
 ## 安装
 
@@ -136,7 +136,7 @@ codex-deepseek-gateway sessions --exec <id-or-row>                           # �
 codex -c model_provider=deepseek-gateway -c model=<model> -c model_reasoning_effort=<effort> -c model_supports_reasoning_summaries=true -c model_reasoning_summary=auto
 ```
 
-launcher 还会传入指向随包 catalog 的 `model_catalog_json`，因此 Codex 原生 multi-agent 校验会接受 DeepSeek 模型别名和 `low|medium|high|xhigh|max` reasoning efforts。这个设置会替换该 Codex 进程的默认 model catalog，而不是与默认 catalog 合并。默认 context window 扩展为 1M，因为 `deepseek-v4-flash` 和 `deepseek-v4-pro` 模型都支持该长度。`context_window` 和 `max_context_window` 可以自定义。
+launcher 还会传入指向随包 catalog 的 `model_catalog_json`，因此 Codex 原生 multi-agent 校验会接受 DeepSeek 模型别名和 `low|medium|high|xhigh|max` reasoning efforts。这个设置会替换该 Codex 进程的默认 model catalog，而不是与默认 catalog 合并。随包 catalog 声明 1M context window 和 900K 自动压缩阈值；调用方未设置 `max_output_tokens` 时，网关会把剩余的 100K 作为 DeepSeek 默认输出预算。请求中的显式值或 `UPSTREAM_MAX_TOKENS` 优先。
 
 在通过 launcher 启动的 Codex TUI 中，`/model` 可以在随包提供的 DeepSeek 模型和 reasoning efforts 之间切换，`/personality` 可配合 catalog 中的 `personality_default`、`personality_friendly` 和 `personality_pragmatic` 条目使用。
 
@@ -171,6 +171,10 @@ Codex effort 会映射到 DeepSeek V4 thinking mode：
 
 当 DeepSeek 返回 `reasoning_content` 时，原始文本会被保留给 DeepSeek 历史；Codex 则会收到一个用于显示的 summary：经过 Markdown 清理，并带有前置加粗 `**Reasoning**` 标题。该标题会在模型思考时驱动 Codex 状态行。
 
+### 进度更新
+
+存在 function tools 时，网关会向 DeepSeek 暴露一个轻量的 `commentary` 工具。调用结果会作为 `phase: "commentary"` 的消息返回 Codex，用于显示工作进度，不会作为可执行函数调用转发。
+
 ### Tool Discovery
 
 Codex 会把部分原生工具留在初始工具列表之外，并让模型通过 `tool_search` 发现它们。网关对此提供端到端桥接：`tool_search` 会作为可调用函数暴露给 DeepSeek，Codex 在本地执行搜索，`tool_search_output` 历史中返回的工具定义会被合并进 DeepSeek 工具列表，因此发现后的工具可在后续轮次中直接调用。
@@ -195,7 +199,9 @@ Web search 是可选能力，默认关闭。配置 Tavily 以启用搜索：
 }
 ```
 
-Codex 可以继续请求 `web_search` / `web_search_preview`。网关会把紧凑的内部 web 工具暴露给 DeepSeek，自行执行 Tavily/Firecrawl 调用，把工具结果送回模型，并返回 Codex 兼容的 `web_search_call` 项。流式输出会在每一轮保持实时，包括 reasoning、`web_search_call` 进度和最终答案；没有搜索的轮次会走非 web 路径。`TAVILY_MAX_SEARCH_ROUNDS`（默认 `20`，硬上限 `40`）是防止失控和控制成本的保护阈值；达到上限时，网关会在一个最终答案轮次中禁用 web 工具。
+Codex 可以继续请求 `web_search` / `web_search_preview`。DeepSeek 会看到贴近能力语义的 `web_search`；配置 Firecrawl 后，还会看到 `web_open_page` 和 `web_find_in_page`。实际执行分别路由到 Tavily 和 Firecrawl；页面读取可用时，每次搜索默认自动读取排名第一的结果。完全相同的搜索和页面读取只在当前 Responses turn 内复用。
+
+流式输出会在每一轮保持实时，包括 reasoning、`web_search_call` 进度和最终答案；没有搜索的轮次会走非 web 路径。多轮 Responses usage 使用最终上游轮次，供 Codex 统计当前上下文；启用调试日志时才会记录隐藏轮次的累计 usage。`TAVILY_MAX_SEARCH_ROUNDS`（默认 `20`，硬上限 `40`）是防止失控和控制成本的保护阈值；达到上限时，网关会在一个最终答案轮次中禁用 web 工具。
 
 最终答案应直接包含有用的来源标题和 URL。
 
@@ -207,6 +213,7 @@ Chat Completions 不是完整的 Responses API 替代品。
 - Tavily/Firecrawl 的 web 模拟以文本为中心；它不提供浏览器控制、截图、原始 HTML、cookies、crawl jobs 或私有网络访问。
 - OpenAI `file_id` 值会被原样传递；网关无法获取 OpenAI 托管的私有文件。
 - 普通 `codex` 命令不会自动加载随包提供的 model catalog。受支持的 DeepSeek 工作流建议仅使用 `codex-deepseek-gateway new` / `sessions`，包括 TUI `/model` 和 sub-agent 校验。
+- Codex 恢复 session 后，特定长 Markdown 轮次的显示尾部可能重复；rollout 与模型历史并未重复，这是上游 Codex TUI 的回放问题。
 
 ## 许可证
 

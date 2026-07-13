@@ -1,4 +1,13 @@
 import test from 'node:test';
+
+async function scenario(name, run) {
+  try {
+    await run();
+  } catch (error) {
+    error.message = `${name}: ${error.message}`;
+    throw error;
+  }
+}
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -10,7 +19,8 @@ function writeJsonl(file, rows) {
   writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
 }
 
-test('readSession uses the last user message timestamp', () => {
+test('session discovery and filtering', async () => {
+  await scenario('readSession uses the last user message timestamp', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'codex-sessions-'));
   try {
     const file = join(dir, 'main.jsonl');
@@ -50,9 +60,8 @@ test('readSession uses the last user message timestamp', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test('readSession skips Codex subagent transcripts', () => {
+  });
+  await scenario('readSession skips Codex subagent transcripts', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'codex-sessions-'));
   try {
     const file = join(dir, 'subagent.jsonl');
@@ -82,9 +91,11 @@ test('readSession skips Codex subagent transcripts', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+  });
 });
 
-test('session picker rows include all sessions instead of truncating to the window size', () => {
+test('session picker rendering and navigation', async () => {
+  await scenario('session picker rows include all sessions instead of truncating to the window size', async () => {
   const rows = sessionPickerRows(Array.from({ length: 25 }, (_, index) => ({
     id: `019f4a63-236d-75c1-85e2-${String(index + 1).padStart(12, '0')}`,
     provider: 'deepseek-gateway',
@@ -97,9 +108,8 @@ test('session picker rows include all sessions instead of truncating to the wind
   assert.match(rows.at(-1), /\.\.\.$/);
   assert.equal(rows[0].slice(13, 30), 'deepseek-gateway ');
   assert.equal(rows[0].length, 64);
-});
-
-test('session picker truncates CJK titles by terminal display width', () => {
+  });
+  await scenario('session picker truncates CJK titles by terminal display width', async () => {
   const [row] = sessionPickerRows([{
     id: 'session-1',
     provider: 'deepseek-gateway',
@@ -107,9 +117,8 @@ test('session picker truncates CJK titles by terminal display width', () => {
     title: '中文'.repeat(20),
   }]);
   assert.equal(row.slice(32), `${'中文'.repeat(7)}... `);
-});
-
-test('left arrow returns from model selection to session selection', () => {
+  });
+  await scenario('left arrow returns from model selection to session selection', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'codex-sessions-flow-'));
   const codexHome = join(dir, 'codex-home');
   const installDir = join(dir, 'install');
@@ -160,4 +169,5 @@ test('left arrow returns from model selection to session selection', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+  });
 });

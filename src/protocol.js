@@ -1376,7 +1376,19 @@ function sanitizeMessagesForChatCompletion(messages, provider = 'generic') {
   return result;
 }
 
-const DEEPSEEK_DEFAULT_MAX_TOKENS = 65536;
+const DEEPSEEK_CONTEXT_WINDOW = 1000000;
+const DEEPSEEK_MAX_OUTPUT_TOKENS = 384000;
+const DEEPSEEK_AUTO_COMPACT_TOKEN_LIMIT = 900000;
+
+function jointOutputTokenBudget(contextWindow, maxOutputTokens, inputTokenLimit) {
+  return Math.max(1, Math.min(maxOutputTokens, contextWindow - inputTokenLimit));
+}
+
+const DEEPSEEK_DEFAULT_MAX_TOKENS = jointOutputTokenBudget(
+  DEEPSEEK_CONTEXT_WINDOW,
+  DEEPSEEK_MAX_OUTPUT_TOKENS,
+  DEEPSEEK_AUTO_COMPACT_TOKEN_LIMIT,
+);
 
 function deepseekDefaultMaxTokens(config = {}) {
   const value = Number(config.upstreamMaxTokens);
@@ -2229,7 +2241,13 @@ export class ResponsesStreamMapper {
     return {
       type: 'response.in_progress',
       sequence_number: this.nextSequence(),
-      response: this.response('in_progress'),
+      response: createBaseResponse({
+        id: this.responseId,
+        model: this.model,
+        createdAt: this.createdAt,
+        status: 'in_progress',
+        previousResponseId: this.previousResponseId,
+      }),
     };
   }
 

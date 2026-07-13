@@ -14,7 +14,7 @@ DeepSeek is a great company.
 
 - Node.js 22 or newer
 - A DeepSeek API key
-- Codex CLI 0.142.0 or newer is recommended
+- Codex CLI 0.144.0 or newer
 
 ## Install
 
@@ -136,7 +136,7 @@ codex-deepseek-gateway sessions --exec <id-or-row>                           # r
 codex -c model_provider=deepseek-gateway -c model=<model> -c model_reasoning_effort=<effort> -c model_supports_reasoning_summaries=true -c model_reasoning_summary=auto
 ```
 
-The launcher also passes `model_catalog_json` pointing at the packaged catalog, so Codex-native multi-agent validation accepts the DeepSeek model aliases and `low|medium|high|xhigh|max` reasoning efforts. This setting replaces the default model catalog for that Codex process; it is not merged into it. The default context window is expanded to 1M since both `deepseek-v4-flash` and `deepseek-v4-pro` model supports that. `context_window` and `max_context_window` can be customized.
+The launcher also passes `model_catalog_json` pointing at the packaged catalog, so Codex-native multi-agent validation accepts the DeepSeek model aliases and `low|medium|high|xhigh|max` reasoning efforts. This setting replaces the default model catalog for that Codex process; it is not merged into it. The packaged catalog declares a 1M context window and a 900K auto-compaction threshold. When the caller does not set `max_output_tokens`, the gateway uses the remaining 100K as the default DeepSeek output budget; an explicit request value or `UPSTREAM_MAX_TOKENS` takes precedence.
 
 Inside a launcher-started Codex TUI, `/model` switches between the packaged DeepSeek models and reasoning efforts, and `/personality` works with the catalog's `personality_default`, `personality_friendly`, and `personality_pragmatic` entries.
 
@@ -171,6 +171,10 @@ Codex effort maps to DeepSeek V4 thinking mode:
 
 When DeepSeek returns `reasoning_content`, the raw text is preserved for DeepSeek history, while Codex receives a display summary: Markdown-cleaned, with a leading bold `**Reasoning**` header. The header drives the Codex status line while the model thinks.
 
+### Progress Updates
+
+When function tools are available, the gateway exposes a small `commentary` tool to DeepSeek. Calls are returned to Codex as `phase: "commentary"` message items for visible progress updates and are never forwarded as executable function calls.
+
 ### Tool Discovery
 
 Codex keeps some native tools out of the initial tool list and lets the model discover them with `tool_search`. The gateway bridges this end to end: `tool_search` is exposed to DeepSeek as a callable function, Codex executes the search locally, and the tool definitions returned in `tool_search_output` history are merged into the DeepSeek tool list, so discovered tools become directly callable in later turns.
@@ -195,7 +199,9 @@ Configure Firecrawl if you also want opened-page reading:
 }
 ```
 
-Codex can keep requesting `web_search` / `web_search_preview`. The gateway exposes compact internal web tools to DeepSeek, executes Tavily/Firecrawl calls itself, feeds tool results back to the model, and returns Codex-compatible `web_search_call` items. Streaming stays live through every round — reasoning, `web_search_call` progress, and the final answer — and turns that never search behave like the non-web path. `TAVILY_MAX_SEARCH_ROUNDS` (default `20`, hard cap `40`) is a runaway/cost guardrail; when reached, the gateway disables web tools for one final-answer turn.
+Codex can keep requesting `web_search` / `web_search_preview`. DeepSeek receives the capability-oriented `web_search` tool; with Firecrawl configured, it also receives `web_open_page` and `web_find_in_page`. Execution is routed to Tavily and Firecrawl, and each search automatically reads the top result by default when page reading is available. Identical searches and page reads are reused only within the current Responses turn.
+
+Streaming stays live through every round — reasoning, `web_search_call` progress, and the final answer — and turns that never search behave like the non-web path. Multi-round Responses usage reports the final upstream round for Codex context accounting; aggregate hidden-round usage is written when debug logging is enabled. `TAVILY_MAX_SEARCH_ROUNDS` (default `20`, hard cap `40`) is a runaway/cost guardrail; when reached, the gateway disables web tools for one final-answer turn.
 
 Final answers should include useful source titles and URLs directly.
 
@@ -207,6 +213,7 @@ Chat Completions is not a full Responses API replacement.
 - Tavily/Firecrawl web emulation is text-focused; it does not provide browser control, screenshots, raw HTML, cookies, crawl jobs, or private-network access.
 - OpenAI `file_id` values are passed through; the gateway cannot fetch private OpenAI-hosted files.
 - Plain `codex` commands do not automatically load the packaged model catalog. Use only `codex-deepseek-gateway new` / `sessions` for the supported DeepSeek workflow, including TUI `/model` and sub-agent validation.
+- Codex may duplicate the displayed tail of certain long Markdown turns after session resume. The rollout and model history are not duplicated; this is an upstream Codex TUI replay issue.
 
 ## License
 

@@ -32,7 +32,6 @@ import {
   hasAnyToolCalls,
   hasKnownExternalToolCalls,
   hasUnknownExternalToolCalls,
-  INTERNAL_WEB_SEARCH_TOOL,
   maxWebSearchRounds,
   prepareWebSearchRequest,
   removeWebSearchInstructions,
@@ -228,16 +227,15 @@ function webToolTimeoutMs(config = {}) {
 function combineUsage(completions) {
   const usages = completions.map((completion) => completion?.usage).filter(Boolean);
   if (!usages.length) return null;
-  const last = usages[usages.length - 1];
   const sum = (pick) => usages.reduce((total, usage) => total + (Number(pick(usage)) || 0), 0);
-  const promptTokens = Number(last.prompt_tokens) || 0;
+  const promptTokens = sum((usage) => usage.prompt_tokens);
   const completionTokens = sum((usage) => usage.completion_tokens);
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: promptTokens + completionTokens,
     prompt_tokens_details: {
-      cached_tokens: last.prompt_tokens_details?.cached_tokens ?? last.prompt_cache_hit_tokens ?? 0,
+      cached_tokens: sum((usage) => usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens),
     },
     completion_tokens_details: {
       reasoning_tokens: sum((usage) => usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens),
@@ -245,20 +243,48 @@ function combineUsage(completions) {
   };
 }
 
-function cloneCompletionWithUsage(completion, usage) {
-  if (!usage) return completion;
-  return {
-    ...completion,
-    usage,
-  };
+function lastUsage(usages) {
+  for (let index = usages.length - 1; index >= 0; index -= 1) {
+    if (usages[index]) return usages[index];
+  }
+  return null;
 }
 
-function toolCallsToFinalAnswerRequest(request) {
+function withUsageFallback(completion, usage) {
+  if (!completion || completion.usage || !usage) return completion;
+  return { ...completion, usage };
+}
+
+function toWebSearchUpstreamRequest(chatRequest, config, webTools) {
+  const request = toProviderChatCompletionsRequest(chatRequest, config);
+  if (
+    request.thinking?.type === 'enabled' &&
+    request.tool_choice?.type === 'function' &&
+    request.tool_choice.function?.name === webTools?.search
+  ) {
+    return { ...request, thinking: { type: 'disabled' }, reasoning_effort: undefined };
+  }
+  return request;
+}
+
+function logWebSearchUsage(config, stage, usages, finalUsage) {
+  if (!config.debugPayload) return;
+  const aggregateUsage = combineUsage(usages.map((usage) => ({ usage })));
+  if (!aggregateUsage && !finalUsage) return;
+  writeDebugPayloadLine(config, `[codex-deepseek-gateway] web search usage ${JSON.stringify({
+    stage,
+    rounds: usages.length,
+    aggregate: aggregateUsage,
+    final: finalUsage || null,
+  })}\n`);
+}
+
+function toolCallsToFinalAnswerRequest(request, webTools) {
   return {
     ...request,
     tool_choice: undefined,
     tools: undefined,
-    messages: removeWebSearchInstructions(request.messages).concat({
+    messages: removeWebSearchInstructions(request.messages, webTools).concat({
       role: 'user',
       content: [
         'Web tools are now unavailable.',
@@ -391,6 +417,8 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
   const effectiveChatRequest = { ...chatRequest, normalized };
   const state = prepareWebSearchRequest({ normalized, chatRequest: effectiveChatRequest, config });
   const searchConfig = state.config || config;
+  const webTools = state.webTools;
+  const webCache = state.webCache;
   let currentChatRequest = state.enabled ? state.chatRequest : effectiveChatRequest;
   const completions = [];
   const searches = [];
@@ -401,8 +429,8 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
   const maxRounds = maxWebSearchRounds(searchConfig);
 
   async function requestFinalAnswer(baseRequest) {
-    currentChatRequest = toolCallsToFinalAnswerRequest(baseRequest);
-    const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
+    currentChatRequest = toolCallsToFinalAnswerRequest(baseRequest, webTools);
+    const upstreamRequest = toWebSearchUpstreamRequest(currentChatRequest, config, webTools);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
     logDebugPayload(config, upstreamRequest, {
       stage: 'web_search_final_answer',
@@ -428,7 +456,7 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
   }
 
   for (let round = 0; round <= maxRounds + 1; round += 1) {
-    const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
+    const upstreamRequest = toWebSearchUpstreamRequest(currentChatRequest, config, webTools);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
     logDebugPayload(config, upstreamRequest, {
       stage: `web_search_round_${round}`,
@@ -449,9 +477,9 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
     const commentaryCalls = bridgedCommentaryToolCallsFromMessage(roundChatMessage, currentChatRequest.tools);
     const routingData = stripBridgedCommentaryFromCompletion(data, currentChatRequest.tools);
 
-    if (state.enabled && hasKnownExternalToolCalls(routingData, currentChatRequest.tools)) {
+    if (state.enabled && hasKnownExternalToolCalls(routingData, currentChatRequest.tools, webTools)) {
       finalCompletion = restoreCommentaryToolCalls(
-        knownExternalToolCallsCompletion(routingData, currentChatRequest.tools),
+        knownExternalToolCallsCompletion(routingData, currentChatRequest.tools, webTools),
         commentaryCalls,
       );
       completions[completions.length - 1] = finalCompletion;
@@ -462,15 +490,16 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
       break;
     }
 
-    const wantsInternalWeb = shouldContinueWebSearchLoop(routingData);
+    const wantsInternalWeb = shouldContinueWebSearchLoop(routingData, webTools);
     const wantsInternalRound = wantsInternalWeb || commentaryCalls.length > 0;
     const hasToolCalls = hasAnyToolCalls(routingData);
 
     if (!wantsInternalRound || round >= maxRounds) {
-      if (hasToolCalls && hasUnknownExternalToolCalls(routingData, currentChatRequest.tools)) {
+      if (hasToolCalls && hasUnknownExternalToolCalls(routingData, currentChatRequest.tools, webTools)) {
         const unsupportedMessages = unhandledToolMessagesFromCompletion(routingData, undefined, {
           onlyUnknownExternal: true,
           tools: currentChatRequest.tools,
+          webTools,
         });
         const finalAnswerError = await requestFinalAnswer({
           ...currentChatRequest,
@@ -495,6 +524,8 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
       toolResult = await executeWebSearchCalls({
         completion: data,
         config: searchConfig,
+        webTools,
+        webCache,
         signal: mergeAbortSignals([controller.signal, clientSignal]),
         onSearchStart,
         onSearchDone,
@@ -508,18 +539,22 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
       ...currentChatRequest,
       messages: currentChatRequest.messages.concat(toolResult.messages, commentaryToolMessages(commentaryCalls)),
       tool_choice:
-        currentChatRequest.tool_choice?.function?.name === INTERNAL_WEB_SEARCH_TOOL
+        currentChatRequest.tool_choice?.function?.name === webTools.search && toolResult.searches.length
           ? 'auto'
           : currentChatRequest.tool_choice,
     };
   }
 
+  const usages = completions.map((completion) => completion?.usage).filter(Boolean);
+  const reportedUsage = finalCompletion?.usage || lastUsage(usages);
+  logWebSearchUsage(config, 'web_search', usages, finalCompletion?.usage);
   return {
     ok: true,
     response: finalResponse,
-    completion: cloneCompletionWithUsage(finalCompletion, combineUsage(completions)),
+    completion: withUsageFallback(finalCompletion, reportedUsage),
     searches,
     openedPages,
+    webTools,
     chatRequest: currentChatRequest,
     incompleteReason,
   };
@@ -533,23 +568,42 @@ function streamHeartbeatMs(config) {
   return STREAM_HEARTBEAT_MS;
 }
 
+function startStreamHeartbeat({ config, res, write }) {
+  const heartbeatMs = streamHeartbeatMs(config);
+  let lastActivityAt = Date.now();
+  let timer = null;
+  const stop = () => {
+    if (timer) clearInterval(timer);
+    timer = null;
+    res.off('close', stop);
+  };
+  timer = setInterval(() => {
+    if (res.writableEnded || res.destroyed || Date.now() - lastActivityAt < heartbeatMs) return;
+    write();
+    lastActivityAt = Date.now();
+  }, heartbeatMs);
+  res.once('close', stop);
+  return {
+    activity() {
+      lastActivityAt = Date.now();
+    },
+    stop,
+  };
+}
+
 function writeSseEvent(res, event) {
   if (res.writableEnded || res.destroyed) return;
   res.write(serializeResponsesSseEvent(event));
 }
 
-function writeSseDone(res) {
-  writeSseEvent(res, { done: true });
-}
-
-function webSearchSseWriter({ res, mapper, outputIndexBySearch, includeSources = false }) {
+function webSearchSseWriter({ writeEvent, mapper, outputIndexBySearch, includeSources = false }) {
   return {
     start(search) {
       const outputIndex = mapper.output.length;
       outputIndexBySearch.set(search.id, outputIndex);
       const item = buildWebSearchCallItem(search, { status: 'in_progress', includeSources });
       mapper.output.push(item);
-      writeSseEvent(res, {
+      writeEvent({
         type: 'response.output_item.added',
         sequence_number: mapper.nextSequence(),
         output_index: outputIndex,
@@ -560,7 +614,7 @@ function webSearchSseWriter({ res, mapper, outputIndexBySearch, includeSources =
       const outputIndex = outputIndexBySearch.get(search.id);
       const item = buildWebSearchCallItem(search, { includeSources });
       if (Number.isInteger(outputIndex)) mapper.output[outputIndex] = item;
-      writeSseEvent(res, {
+      writeEvent({
         type: 'response.output_item.done',
         sequence_number: mapper.nextSequence(),
         output_index: Number.isInteger(outputIndex) ? outputIndex : mapper.output.indexOf(item),
@@ -576,11 +630,13 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
   if (!state.enabled) return { handled: false };
 
   const searchConfig = state.config || config;
+  const webTools = state.webTools;
+  const webCache = state.webCache;
   const maxRounds = maxWebSearchRounds(searchConfig);
   let currentChatRequest = state.chatRequest;
 
   const buildUpstreamRequest = (stage) => {
-    const upstreamRequest = toProviderChatCompletionsRequest(currentChatRequest, config);
+    const upstreamRequest = toWebSearchUpstreamRequest(currentChatRequest, config, webTools);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
     logDebugPayload(config, upstreamRequest, { stage, rawRequest, normalized, chatRequest: currentChatRequest });
     return upstreamRequest;
@@ -609,8 +665,13 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
     holdToolItemEvents: true,
     knownToolNames: chatToolNamesFromTools(firstUpstreamRequest.tools),
   });
+  let heartbeat = null;
+  const writeEvent = (event) => {
+    writeSseEvent(res, event);
+    heartbeat?.activity();
+  };
   const searchWriter = webSearchSseWriter({
-    res,
+    writeEvent,
     mapper,
     outputIndexBySearch: new Map(),
     includeSources: shouldIncludeSearchSources(normalized),
@@ -628,18 +689,20 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
     connection: 'keep-alive',
     'x-accel-buffering': 'no',
   });
-  writeSseEvent(res, mapper.createdEvent());
-  writeSseEvent(res, mapper.inProgressEvent());
-  const heartbeat = setInterval(() => {
-    writeSseEvent(res, mapper.inProgressEvent());
-  }, STREAM_HEARTBEAT_MS);
+  writeEvent(mapper.createdEvent());
+  writeEvent(mapper.inProgressEvent());
+  heartbeat = startStreamHeartbeat({
+    config,
+    res,
+    write: () => writeEvent(mapper.inProgressEvent()),
+  });
 
   const endStream = () => {
-    writeSseDone(res);
+    writeEvent({ done: true });
     res.end();
   };
   const failStream = (message) => {
-    for (const event of mapper.streamFailed(message)) writeSseEvent(res, event);
+    for (const event of mapper.streamFailed(message)) writeEvent(event);
     endStream();
     return { handled: true };
   };
@@ -647,9 +710,11 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
     if (mapper.messageItem?.content?.length) {
       annotateMessagePartWithWebCitations(mapper.messageItem.content[0], searches, openedPages);
     }
-    const combinedUsage = combineUsage(roundUsages.concat([{ usage: mapper.pendingUsage }]));
-    for (const event of mapper.finalize(mapper.pendingFinishReason || 'stop', combinedUsage)) {
-      writeSseEvent(res, event);
+    const usages = roundUsages.map((completion) => completion.usage).filter(Boolean).concat(mapper.pendingUsage ? [mapper.pendingUsage] : []);
+    const reportedUsage = mapper.pendingUsage || lastUsage(usages);
+    logWebSearchUsage(config, 'web_search_stream', usages, mapper.pendingUsage);
+    for (const event of mapper.finalize(mapper.pendingFinishReason || 'stop', reportedUsage)) {
+      writeEvent(event);
     }
     endStream();
     return {
@@ -673,7 +738,7 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
           return;
         }
         for (const responseEvent of mapper.mapChatEvent(event)) {
-          writeSseEvent(res, responseEvent);
+          writeEvent(responseEvent);
         }
       },
     });
@@ -691,7 +756,7 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
       mapper.expandParallelToolItems();
       const roundMessage = mapper.roundAssistantMessage();
       const commentaryCalls = bridgedCommentaryToolCallsFromMessage(roundMessage, currentChatRequest.tools);
-      for (const event of mapper.convertBridgedCommentaryItems()) writeSseEvent(res, event);
+      for (const event of mapper.convertBridgedCommentaryItems()) writeEvent(event);
       const completionLike = {
         choices: [{ index: 0, message: roundMessage, finish_reason: mapper.pendingFinishReason || 'stop' }],
       };
@@ -702,13 +767,13 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
         const reason = finalAnswerIncompleteReason(routingCompletion);
         if (reason) {
           const events = mapper.replaceBufferedAssistantText(gatewayIncompleteMessageContent(reason));
-          for (const event of events || []) writeSseEvent(res, event);
+          for (const event of events || []) writeEvent(event);
         }
         return finishTurn();
       }
 
-      if (hasKnownExternalToolCalls(routingCompletion, currentChatRequest.tools)) {
-        const kept = knownExternalToolCallsCompletion(routingCompletion, currentChatRequest.tools);
+      if (hasKnownExternalToolCalls(routingCompletion, currentChatRequest.tools, webTools)) {
+        const kept = knownExternalToolCallsCompletion(routingCompletion, currentChatRequest.tools, webTools);
         const keptIds = new Set(
           (kept.choices?.[0]?.message?.tool_calls || []).map((toolCall) => toolCall.id).filter(Boolean),
         );
@@ -716,33 +781,34 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
         return finishTurn();
       }
 
-      const wantsInternalWeb = shouldContinueWebSearchLoop(routingCompletion);
+      const wantsInternalWeb = shouldContinueWebSearchLoop(routingCompletion, webTools);
       const wantsInternalRound = wantsInternalWeb || commentaryCalls.length > 0;
       const hasToolCallsRound = hasAnyToolCalls(routingCompletion);
 
       if (!wantsInternalRound || round >= maxRounds) {
-        if (hasToolCallsRound && hasUnknownExternalToolCalls(routingCompletion, currentChatRequest.tools)) {
+        if (hasToolCallsRound && hasUnknownExternalToolCalls(routingCompletion, currentChatRequest.tools, webTools)) {
           const unsupportedMessages = unhandledToolMessagesFromCompletion(routingCompletion, undefined, {
             onlyUnknownExternal: true,
             tools: currentChatRequest.tools,
+            webTools,
           });
           currentChatRequest = toolCallsToFinalAnswerRequest({
             ...currentChatRequest,
             messages: currentChatRequest.messages.concat(unsupportedMessages),
-          });
+          }, webTools);
         } else if (wantsInternalRound || (!hasToolCallsRound && hasWebSearchContext(searches, openedPages) && !hasVisibleAssistantContent(routingCompletion))) {
-          currentChatRequest = toolCallsToFinalAnswerRequest(currentChatRequest);
+          currentChatRequest = toolCallsToFinalAnswerRequest(currentChatRequest, webTools);
         } else {
           return finishTurn();
         }
         finalAnswerForced = true;
         roundUsages.push({ usage: mapper.pendingUsage });
         mapper.removeToolItems();
-        for (const event of mapper.beginNextRound()) writeSseEvent(res, event);
+        for (const event of mapper.beginNextRound()) writeEvent(event);
         mapper.holdVisibleTextUntilDone();
       } else {
         roundUsages.push({ usage: mapper.pendingUsage });
-        for (const event of mapper.beginNextRound()) writeSseEvent(res, event);
+        for (const event of mapper.beginNextRound()) writeEvent(event);
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), webToolTimeoutMs(searchConfig));
         let toolResult;
@@ -750,6 +816,8 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
           toolResult = await executeWebSearchCalls({
             completion: completionLike,
             config: searchConfig,
+            webTools,
+            webCache,
             signal: mergeAbortSignals([controller.signal, clientSignal]),
             onSearchStart(search) {
               if (search.action && search.auto) return;
@@ -770,7 +838,7 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
           ...currentChatRequest,
           messages: currentChatRequest.messages.concat(toolResult.messages, commentaryToolMessages(commentaryCalls)),
           tool_choice:
-            currentChatRequest.tool_choice?.function?.name === INTERNAL_WEB_SEARCH_TOOL
+            currentChatRequest.tool_choice?.function?.name === webTools.search && toolResult.searches.length
               ? 'auto'
               : currentChatRequest.tool_choice,
         };
@@ -799,7 +867,7 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
     }
     throw error;
   } finally {
-    clearInterval(heartbeat);
+    heartbeat?.stop();
   }
 }
 
@@ -917,7 +985,7 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
         normalized,
         responseId,
         config,
-      }), loop.searches, normalized, loop.openedPages);
+      }), loop.searches, normalized, loop.openedPages, loop.webTools);
       if (payload.status === 'completed') {
         persistReasoning(assistantMessageFromResponseOutput(payload.output));
       }
@@ -984,13 +1052,13 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
 
     writeSseEvent(res, mapper.createdEvent());
     writeSseEvent(res, mapper.inProgressEvent());
-    let lastEventWriteAt = Date.now();
-    const heartbeatMs = streamHeartbeatMs(config);
-    const heartbeat = setInterval(() => {
-      if (doneSent || Date.now() - lastEventWriteAt < heartbeatMs) return;
-      writeSseEvent(res, mapper.inProgressEvent());
-      lastEventWriteAt = Date.now();
-    }, heartbeatMs);
+    const heartbeat = startStreamHeartbeat({
+      config,
+      res,
+      write: () => {
+        if (!doneSent) writeSseEvent(res, mapper.inProgressEvent());
+      },
+    });
 
     try {
       await relayChatCompletionsResponse({
@@ -1004,7 +1072,7 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
             writeSseEvent(res, responseEvent);
           }
           if (events.length) {
-            lastEventWriteAt = Date.now();
+            heartbeat.activity();
           }
           if (event?.done) writeResponsesDone();
         },
@@ -1013,7 +1081,7 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
       if (clientSignal.aborted) return;
       throw error;
     } finally {
-      clearInterval(heartbeat);
+      heartbeat.stop();
     }
 
     if (mapper.terminalStatus === 'completed') {

@@ -3,11 +3,21 @@ import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+
+async function scenario(name, run) {
+  try {
+    await run();
+  } catch (error) {
+    error.message = `${name}: ${error.message}`;
+    throw error;
+  }
+}
 import { readCodexConfig } from '../src/codex-config.js';
 import { loadConfig } from '../src/config.js';
 import { mergeLocalConfig } from '../src/local-config.js';
 
-test('loads local gateway config and lets env override it', async () => {
+test('gateway configuration precedence and defaults', async () => {
+  await scenario('loads local gateway config and lets env override it', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-config-'));
   try {
     await mkdir(join(dir, 'config'));
@@ -38,6 +48,7 @@ test('loads local gateway config and lets env override it', async () => {
     assert.equal(config.upstreamProvider, 'deepseek');
     assert.equal(config.tavilyWebSearchEnabled, false);
     assert.equal(config.tavilyMaxSearchRounds, 20);
+    assert.equal(config.firecrawlAutoScrapeTopResults, 1);
     assert.equal(config.codexPromptLanguage, 'en');
     assert.equal(config.reasoningCacheEnabled, true);
     assert.equal(config.reasoningCachePath, join(dir, 'state', 'reasoning-cache.jsonl'));
@@ -46,9 +57,8 @@ test('loads local gateway config and lets env override it', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('lets local config and env override reasoning cache settings', async () => {
+  });
+  await scenario('lets local config and env override reasoning cache settings', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-reasoning-cache-config-'));
   try {
     await mkdir(join(dir, 'config'));
@@ -79,9 +89,8 @@ test('lets local config and env override reasoning cache settings', async () => 
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('loads Codex prompt language from local gateway config', async () => {
+  });
+  await scenario('loads Codex prompt language from local gateway config', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-config-prompt-language-'));
   try {
     await mkdir(join(dir, 'config'));
@@ -100,9 +109,8 @@ test('loads Codex prompt language from local gateway config', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('falls back to English for invalid Codex prompt language', async () => {
+  });
+  await scenario('falls back to English for invalid Codex prompt language', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-config-prompt-language-'));
   try {
     await mkdir(join(dir, 'config'));
@@ -121,9 +129,8 @@ test('falls back to English for invalid Codex prompt language', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('keeps Codex prompt language scoped to gateway.local.json', async () => {
+  });
+  await scenario('keeps Codex prompt language scoped to gateway.local.json', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-config-prompt-language-'));
   try {
     await mkdir(join(dir, 'config'));
@@ -138,9 +145,23 @@ test('keeps Codex prompt language scoped to gateway.local.json', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+  });
+  await scenario('loads local gateway config with UTF-8 BOM', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-config-bom-'));
+  try {
+    await mkdir(join(dir, 'config'));
+    const file = join(dir, 'config', 'gateway.local.json');
+    await writeFile(file, `\uFEFF${JSON.stringify({ upstreamApiKey: 'from-bom-file' })}`);
+    const config = loadConfig({ GATEWAY_CONFIG_FILE: file });
+    assert.equal(config.upstreamApiKey, 'from-bom-file');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
 });
 
-test('reads top-level Codex model reasoning effort from config.toml', async () => {
+test('Codex config parsing', async () => {
+  await scenario('reads top-level Codex model reasoning effort from config.toml', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-config-'));
   try {
     const file = join(dir, 'config.toml');
@@ -163,22 +184,8 @@ test('reads top-level Codex model reasoning effort from config.toml', async () =
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('loads local gateway config with UTF-8 BOM', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'gateway-config-bom-'));
-  try {
-    await mkdir(join(dir, 'config'));
-    const file = join(dir, 'config', 'gateway.local.json');
-    await writeFile(file, `\uFEFF${JSON.stringify({ upstreamApiKey: 'from-bom-file' })}`);
-    const config = loadConfig({ GATEWAY_CONFIG_FILE: file });
-    assert.equal(config.upstreamApiKey, 'from-bom-file');
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('keeps quoted # characters when reading top-level Codex config values', async () => {
+  });
+  await scenario('keeps quoted # characters when reading top-level Codex config values', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-config-'));
   try {
     const file = join(dir, 'config.toml');
@@ -195,4 +202,5 @@ test('keeps quoted # characters when reading top-level Codex config values', asy
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+  });
 });

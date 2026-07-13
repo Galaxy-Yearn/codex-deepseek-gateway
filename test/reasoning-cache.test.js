@@ -4,6 +4,15 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+
+async function scenario(name, run) {
+  try {
+    await run();
+  } catch (error) {
+    error.message = `${name}: ${error.message}`;
+    throw error;
+  }
+}
 import { ReasoningCache } from '../src/reasoning-cache.js';
 
 const assistantToolCallMessage = {
@@ -19,7 +28,8 @@ const assistantToolCallMessage = {
   ],
 };
 
-test('appends reasoning records to one file and restores them after restart', async () => {
+test('reasoning cache persistence, bounds, and isolation', async () => {
+  await scenario('appends reasoning records to one file and restores them after restart', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-reasoning-cache-'));
   const persistPath = join(dir, 'reasoning-cache.jsonl');
   try {
@@ -44,9 +54,8 @@ test('appends reasoning records to one file and restores them after restart', as
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('does not append an unchanged reasoning record', async () => {
+  });
+  await scenario('does not append an unchanged reasoning record', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-reasoning-cache-unchanged-'));
   const persistPath = join(dir, 'reasoning-cache.jsonl');
   try {
@@ -58,9 +67,8 @@ test('does not append an unchanged reasoning record', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('stores one record for parallel tool calls and resolves every call id', async () => {
+  });
+  await scenario('stores one record for parallel tool calls and resolves every call id', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-reasoning-cache-parallel-'));
   const persistPath = join(dir, 'reasoning-cache.jsonl');
   try {
@@ -84,9 +92,8 @@ test('stores one record for parallel tool calls and resolves every call id', asy
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('keeps the call-id cache bounded across restart', async () => {
+  });
+  await scenario('keeps the call-id cache bounded across restart', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-reasoning-cache-bounded-'));
   const persistPath = join(dir, 'reasoning-cache.jsonl');
   try {
@@ -105,9 +112,8 @@ test('keeps the call-id cache bounded across restart', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test('isolates returned messages from caller mutations', () => {
+  });
+  await scenario('isolates returned messages from caller mutations', async () => {
   const cache = new ReasoningCache();
   cache.rememberAssistantMessage(assistantToolCallMessage);
 
@@ -118,9 +124,8 @@ test('isolates returned messages from caller mutations', () => {
   const second = cache.getAssistantMessageForToolCall('call_1');
   assert.equal(second.reasoning_content, 'raw thinking');
   assert.equal(second.tool_calls[0].function.arguments, '{"query":"codex"}');
-});
-
-test('enforces the UTF-8 byte limit for one oversized reasoning record', async () => {
+  });
+  await scenario('enforces the UTF-8 byte limit for one oversized reasoning record', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-reasoning-cache-bytes-'));
   const persistPath = join(dir, 'reasoning-cache.jsonl');
   try {
@@ -136,9 +141,11 @@ test('enforces the UTF-8 byte limit for one oversized reasoning record', async (
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+  });
 });
 
-test('migrates the reasoning cache from the previous sessions snapshot and journal', async () => {
+test('reasoning cache migration', async () => {
+  await scenario('migrates the reasoning cache from the previous sessions snapshot and journal', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-reasoning-cache-migrate-'));
   const persistPath = join(dir, 'reasoning-cache.jsonl');
   const legacyPath = join(dir, 'sessions.json');
@@ -172,4 +179,5 @@ test('migrates the reasoning cache from the previous sessions snapshot and journ
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+  });
 });

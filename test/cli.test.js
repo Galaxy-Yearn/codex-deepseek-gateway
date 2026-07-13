@@ -7,17 +7,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+async function scenario(name, run) {
+  try {
+    await run();
+  } catch (error) {
+    error.message = `${name}: ${error.message}`;
+    throw error;
+  }
+}
+
 const require = createRequire(import.meta.url);
 const packageJson = require('../package.json');
 
-test('prints package version', () => {
+test('CLI version and installation lifecycle', async () => {
+  await scenario('prints package version', async () => {
   const output = execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', '--version'], {
     encoding: 'utf8',
   });
   assert.equal(output.trim(), packageJson.version);
-});
-
-test('install copies runtime assets without overwriting local config or reasoning cache', async () => {
+  });
+  await scenario('install copies runtime assets without overwriting local config or reasoning cache', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-cli-install-'));
   try {
     await mkdir(join(dir, 'config'), { recursive: true });
@@ -67,4 +76,5 @@ test('install copies runtime assets without overwriting local config or reasonin
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+  });
 });

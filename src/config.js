@@ -48,7 +48,7 @@ export function loadConfig(env = process.env) {
     firecrawlWebFetchEnabled: parseBoolean(mergedEnv.FIRECRAWL_WEB_FETCH_ENABLED ?? mergedEnv.ENABLE_FIRECRAWL_WEB_FETCH, false),
     firecrawlApiKey: mergedEnv.FIRECRAWL_API_KEY || '',
     firecrawlBaseUrl: mergedEnv.FIRECRAWL_BASE_URL || 'https://api.firecrawl.dev',
-    firecrawlAutoScrapeTopResults: Number(mergedEnv.FIRECRAWL_AUTO_SCRAPE_TOP_RESULTS || 3),
+    firecrawlAutoScrapeTopResults: Number(mergedEnv.FIRECRAWL_AUTO_SCRAPE_TOP_RESULTS || 1),
     firecrawlPageMaxChars: Number(mergedEnv.FIRECRAWL_PAGE_MAX_CHARS || 5000),
     firecrawlResultMaxChars: Number(mergedEnv.FIRECRAWL_RESULT_MAX_CHARS || 12000),
     firecrawlMaxLinks: Number(mergedEnv.FIRECRAWL_MAX_LINKS || 20),

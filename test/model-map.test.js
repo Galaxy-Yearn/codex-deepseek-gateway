@@ -1,0 +1,147 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+
+async function scenario(name, run) {
+  try {
+    await run();
+  } catch (error) {
+    error.message = `${name}: ${error.message}`;
+    throw error;
+  }
+}
+import {
+  DEFAULT_MODEL_ALIASES,
+  deepseekReasoningPayload,
+  isDeprecatedModel,
+  listModels,
+  loadModelAliases,
+  mergeModelLists,
+  normalizeModelList,
+  resolveModelAlias,
+} from '../src/model-map.js';
+
+test('model alias loading and resolution', async () => {
+  await scenario('loads model aliases with defaults, file values, and environment precedence', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-model-map-'));
+  const file = join(dir, 'aliases.json');
+  await writeFile(file, JSON.stringify({
+    'file-alias': 'deepseek-v4-pro',
+    shared: { model: 'file-model', thinking: false },
+  }));
+
+  try {
+    const aliases = loadModelAliases({
+      MODEL_ALIASES_FILE: 'aliases.json',
+      MODEL_ALIASES_JSON: JSON.stringify({
+        'env-alias': { upstream_model: 'env-model', thinking_mode: 'thinking', effort: 'max' },
+        shared: { model: 'env-model' },
+      }),
+    }, dir);
+
+    assert.deepEqual(aliases['deepseek-v4-flash'], DEFAULT_MODEL_ALIASES['deepseek-v4-flash']);
+    assert.equal(aliases['file-alias'], 'deepseek-v4-pro');
+    assert.deepEqual(aliases.shared, { model: 'env-model' });
+    assert.equal(resolveModelAlias('file-alias', { modelAliases: aliases }).upstreamModel, 'deepseek-v4-pro');
+    assert.deepEqual(resolveModelAlias('env-alias', { modelAliases: aliases }), {
+      alias: 'env-alias',
+      upstreamModel: 'env-model',
+      thinking: 'enabled',
+      reasoningEffort: 'max',
+      extraBody: {},
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
+  await scenario('resolves alias shapes and preserves a compatible fallback for unknown models', async () => {
+  const config = {
+    upstreamModel: 'configured-default',
+    modelAliases: {
+      string: 'string-target',
+      object: {
+        upstreamModel: 'object-target',
+        thinkingMode: 'non_thinking',
+        reasoningEffort: 'xhigh',
+        extraBody: { seed: 7 },
+      },
+      invalid: 42,
+    },
+  };
+
+  assert.deepEqual(resolveModelAlias('string', config), {
+    alias: 'string',
+    upstreamModel: 'string-target',
+    thinking: 'auto',
+    extraBody: {},
+  });
+  assert.deepEqual(resolveModelAlias('object', config), {
+    alias: 'object',
+    upstreamModel: 'object-target',
+    thinking: 'disabled',
+    reasoningEffort: 'xhigh',
+    extraBody: { seed: 7 },
+  });
+  assert.deepEqual(resolveModelAlias('unknown', config), {
+    alias: 'unknown',
+    upstreamModel: 'configured-default',
+    thinking: 'auto',
+    reasoningEffort: undefined,
+    extraBody: {},
+  });
+  });
+});
+
+test('reasoning and model catalog mapping', async () => {
+  await scenario('maps Codex reasoning effort and alias overrides to DeepSeek thinking payloads', async () => {
+  const cases = [
+    [{ thinking: 'auto' }, 'low', { thinking: { type: 'disabled' } }],
+    [{ thinking: 'auto' }, 'medium', { thinking: { type: 'enabled' }, reasoning_effort: 'high' }],
+    [{ thinking: 'enabled' }, 'low', { thinking: { type: 'enabled' } }],
+    [{ thinking: 'disabled', reasoningEffort: 'max' }, 'high', { thinking: { type: 'disabled' } }],
+    [{ thinking: 'enabled', reasoningEffort: 'xhigh' }, 'medium', { thinking: { type: 'enabled' }, reasoning_effort: 'max' }],
+    [{ thinking: 'enabled' }, 'unsupported', { thinking: { type: 'enabled' } }],
+  ];
+
+  for (const [alias, effort, expected] of cases) {
+    assert.deepEqual(deepseekReasoningPayload({ alias, reasoning: { effort } }), expected);
+  }
+  });
+  await scenario('normalizes, filters, merges, and lists model catalogs deterministically', async () => {
+  const legacyChat = ['deepseek', 'chat'].join('-');
+  const legacyReasoner = ['deepseek', 'reasoner'].join('-');
+  assert.equal(isDeprecatedModel(legacyChat), true);
+  assert.equal(isDeprecatedModel(legacyReasoner), true);
+  assert.equal(isDeprecatedModel('deepseek-v4-flash'), false);
+
+  const normalized = normalizeModelList({
+    data: [
+      'z-model',
+      { id: 'a-model', created: 10 },
+      { id: legacyChat },
+      { missing: true },
+    ],
+  }, { upstreamProvider: 'deepseek' });
+  assert.deepEqual(normalized, [
+    { id: 'z-model', object: 'model', created: 0 },
+    { id: 'a-model', created: 10, object: 'model', owned_by: 'deepseek' },
+  ]);
+
+  const listed = listModels({
+    upstreamProvider: 'deepseek',
+    modelAliases: { 'z-model': {}, 'a-model': {}, [legacyReasoner]: {} },
+    upstreamModels: ['a-model', 'm-model', legacyChat],
+  });
+  assert.deepEqual(listed.map((model) => model.id), ['a-model', 'm-model', 'z-model']);
+  assert.equal(listed.every((model) => model.owned_by === 'deepseek'), true);
+
+  const merged = mergeModelLists(
+    [{ id: 'z-model', source: 'first' }, { id: 'a-model' }],
+    [{ id: 'z-model', source: 'second' }, { id: 'm-model' }, { id: legacyChat }],
+  );
+  assert.deepEqual(merged.map((model) => model.id), ['a-model', 'm-model', 'z-model']);
+  assert.equal(merged.find((model) => model.id === 'z-model').source, 'first');
+  });
+});
