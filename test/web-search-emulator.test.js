@@ -11,6 +11,7 @@ async function scenario(name, run) {
   }
 }
 import {
+  advanceWebSearchChatRequest,
   annotateMessagePartWithWebCitations,
   applyWebSearchOutputCompatibility,
   assistantMessageFromCompletion,
@@ -18,10 +19,12 @@ import {
   buildWebSearchCallItems,
   containsWebSearchTool,
   executeWebSearchCalls,
+  executeWebSearchRound,
   extractInternalWebSearchCalls,
   hasAnyToolCalls,
   hasKnownExternalToolCalls,
   hasUnknownExternalToolCalls,
+  hasVisibleAssistantContent,
   knownExternalToolCallsCompletion,
   maxWebSearchRounds,
   prepareWebSearchRequest,
@@ -29,6 +32,7 @@ import {
   shouldContinueWebSearchLoop,
   shouldIncludeSearchSources,
   unhandledToolMessagesFromCompletion,
+  webSearchRoundDecision,
 } from '../src/web-search-emulator.js';
 
 function listen(server) {
@@ -259,7 +263,7 @@ test('web-search execution, caching, and provider failures', async () => {
   const finished = [];
 
   try {
-    const result = await executeWebSearchCalls({
+    const result = await executeWebSearchRound({
       completion: calls,
       config,
       webTools: prepared.webTools,
@@ -283,6 +287,17 @@ test('web-search execution, caching, and provider failures', async () => {
     assert.equal(result.openedPages.filter((page) => !page.auto).length, 2);
     assert.match(result.messages[1].content, /Opened page excerpt/);
     assert.match(result.messages[3].content, /Opened page:/);
+    const advanced = advanceWebSearchChatRequest({
+      ...prepared.chatRequest,
+      tool_choice: { type: 'function', function: { name: prepared.webTools.search } },
+    }, {
+      toolResult: result,
+      commentaryCalls: [toolCall('commentary_1', 'commentary', { text: 'Searching.' })],
+      webTools: prepared.webTools,
+    });
+    assert.equal(advanced.messages.length, prepared.chatRequest.messages.length + result.messages.length + 1);
+    assert.equal(advanced.messages.at(-1).tool_call_id, 'commentary_1');
+    assert.equal(advanced.tool_choice, 'auto');
   } finally {
     await close(tavily);
     await close(firecrawl);
@@ -378,5 +393,94 @@ test('web-search Responses compatibility output', async () => {
   assert.equal(output.output.at(-1).content[0].text, 'See Release Notes [1].');
   assert.equal(output.output.at(-1).content[0].annotations[0].url, 'https://example.com/release');
   assert.equal(output.output_text, 'See Release Notes [1].');
+  });
+});
+
+test('web-search per-round routing decisions', async () => {
+  const prepared = prepareWebSearchRequest({
+    normalized: { tools: [{ type: 'web_search' }] },
+    chatRequest: { messages: [{ role: 'user', content: 'Search.' }], tools: [functionTool('lookup')] },
+    config: { tavilyApiKey: 'key' },
+  });
+  const base = {
+    commentaryCalls: [],
+    round: 0,
+    maxRounds: 2,
+    tools: prepared.chatRequest.tools,
+    webTools: prepared.webTools,
+    searches: [],
+    openedPages: [],
+  };
+  const assistantOnly = (content) => ({
+    choices: [{ message: { role: 'assistant', content }, finish_reason: 'stop' }],
+  });
+
+  await scenario('continues internal web rounds until the round budget forces a final answer', async () => {
+    const internalOnly = completion(toolCall('call_search', prepared.webTools.search, { query: 'news' }));
+    assert.deepEqual(webSearchRoundDecision({ ...base, routingCompletion: internalOnly }), { action: 'continue' });
+    assert.deepEqual(
+      webSearchRoundDecision({ ...base, routingCompletion: internalOnly, round: 2 }),
+      { action: 'final_answer', unsupportedMessages: [] },
+    );
+  });
+  await scenario('treats commentary-only rounds as internal rounds', async () => {
+    const commentaryCalls = [toolCall('call_commentary', 'commentary', { text: 'update' })];
+    assert.deepEqual(
+      webSearchRoundDecision({ ...base, routingCompletion: assistantOnly(''), commentaryCalls }),
+      { action: 'continue' },
+    );
+    assert.deepEqual(
+      webSearchRoundDecision({ ...base, routingCompletion: assistantOnly(''), commentaryCalls, round: 2 }),
+      { action: 'final_answer', unsupportedMessages: [] },
+    );
+  });
+  await scenario('prefers known external tool calls over internal and unknown calls', async () => {
+    const mixed = completion(
+      toolCall('call_search', prepared.webTools.search, { query: 'news' }),
+      toolCall('call_known', 'lookup', { q: 'x' }),
+      toolCall('call_unknown', 'missing', {}),
+    );
+    assert.deepEqual(webSearchRoundDecision({ ...base, routingCompletion: mixed }), { action: 'external' });
+    assert.deepEqual(webSearchRoundDecision({ ...base, routingCompletion: mixed, round: 2 }), { action: 'external' });
+  });
+  await scenario('requests a final answer with recovery messages for unknown external calls', async () => {
+    const unknownOnly = completion(toolCall('call_unknown', 'missing', {}));
+    const decision = webSearchRoundDecision({ ...base, routingCompletion: unknownOnly });
+    assert.equal(decision.action, 'final_answer');
+    assert.equal(decision.unsupportedMessages[0].role, 'assistant');
+    assert.deepEqual(
+      decision.unsupportedMessages.slice(1).map((message) => message.tool_call_id),
+      ['call_unknown'],
+    );
+
+    const internalAndUnknown = completion(
+      toolCall('call_search', prepared.webTools.search, { query: 'news' }),
+      toolCall('call_unknown', 'missing', {}),
+    );
+    const capped = webSearchRoundDecision({ ...base, routingCompletion: internalAndUnknown, round: 2 });
+    assert.equal(capped.action, 'final_answer');
+    assert.deepEqual(
+      capped.unsupportedMessages.slice(1).map((message) => message.tool_call_id),
+      ['call_unknown'],
+    );
+  });
+  await scenario('forces a final answer when web context exists without visible content', async () => {
+    assert.deepEqual(
+      webSearchRoundDecision({ ...base, routingCompletion: assistantOnly(''), searches: [{ id: 's1' }] }),
+      { action: 'final_answer', unsupportedMessages: [] },
+    );
+    assert.deepEqual(
+      webSearchRoundDecision({ ...base, routingCompletion: assistantOnly(''), openedPages: [{ id: 'p1' }] }),
+      { action: 'final_answer', unsupportedMessages: [] },
+    );
+  });
+  await scenario('finishes on visible content or when no web context exists', async () => {
+    assert.equal(hasVisibleAssistantContent(assistantOnly('Done.')), true);
+    assert.equal(hasVisibleAssistantContent(assistantOnly('   ')), false);
+    assert.deepEqual(
+      webSearchRoundDecision({ ...base, routingCompletion: assistantOnly('Done.'), searches: [{ id: 's1' }] }),
+      { action: 'finish' },
+    );
+    assert.deepEqual(webSearchRoundDecision({ ...base, routingCompletion: assistantOnly('') }), { action: 'finish' });
   });
 });

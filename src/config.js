@@ -4,6 +4,21 @@ import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from '.
 import { parseBoolean, parseList } from './common.js';
 import { readCodexConfig } from './codex-config.js';
 import { normalizePromptLanguage } from './prompt-language.js';
+import { DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './runtime.js';
+
+export const DEFAULT_COMPACT_MAX_TOKENS = 20000;
+export const COMPACT_MAX_TOKENS_HARD_LIMIT = 100000;
+
+export function normalizeCompactReasoningEffort(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'high' ? 'high' : 'max';
+}
+
+export function normalizeCompactMaxTokens(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return DEFAULT_COMPACT_MAX_TOKENS;
+  return Math.min(Math.floor(number), COMPACT_MAX_TOKENS_HARD_LIMIT);
+}
 
 export function loadConfig(env = process.env) {
   const localConfigPath = resolveLocalConfigPath(env);
@@ -20,10 +35,14 @@ export function loadConfig(env = process.env) {
     upstreamProvider: mergedEnv.UPSTREAM_PROVIDER || 'deepseek',
     upstreamTimeoutMs: Number(mergedEnv.UPSTREAM_TIMEOUT_MS || 120000),
     upstreamMaxTokens: Number(mergedEnv.UPSTREAM_MAX_TOKENS || mergedEnv.DEEPSEEK_MAX_TOKENS || 0),
+    compactReasoningEffort: normalizeCompactReasoningEffort(mergedEnv.COMPACT_REASONING_EFFORT),
+    compactMaxTokens: normalizeCompactMaxTokens(mergedEnv.COMPACT_MAX_TOKENS),
     upstreamModels: parseList(mergedEnv.UPSTREAM_MODELS || mergedEnv.MODELS),
     fetchUpstreamModels: parseBoolean(mergedEnv.FETCH_UPSTREAM_MODELS, false),
     modelsTimeoutMs: Number(mergedEnv.MODELS_TIMEOUT_MS || 5000),
     modelsCacheMs: Number(mergedEnv.MODELS_CACHE_MS || 60000),
+    requestBodyMaxBytes: Number(mergedEnv.REQUEST_BODY_MAX_BYTES || DEFAULT_REQUEST_BODY_MAX_BYTES),
+    shutdownTimeoutMs: Number(mergedEnv.SHUTDOWN_TIMEOUT_MS || DEFAULT_SHUTDOWN_TIMEOUT_MS),
     proxyApiKey: mergedEnv.PROXY_API_KEY || '',
     debugPayload: parseBoolean(mergedEnv.DEBUG_PAYLOAD || mergedEnv.DEBUG_DEEPSEEK_PAYLOAD, false),
     debugPayloadLogPath: mergedEnv.DEBUG_PAYLOAD_LOG_PATH || 'gateway.debug.log',

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import http from 'node:http';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +19,78 @@ async function scenario(name, run) {
 
 const require = createRequire(import.meta.url);
 const packageJson = require('../package.json');
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForHttp(url) {
+  for (let index = 0; index < 40; index += 1) {
+    try {
+      if ((await fetch(url)).ok) return;
+    } catch {
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+  }
+  throw new Error(`Server did not become reachable at ${url}`);
+}
+
+async function stopHttpChild(url, child) {
+  if (!processExists(child.pid)) return;
+  const exited = new Promise((resolveExit) => child.once('exit', resolveExit));
+  try {
+    await fetch(url);
+  } catch {
+  }
+  await Promise.race([exited, new Promise((resolveDelay) => setTimeout(resolveDelay, 1000))]);
+  if (processExists(child.pid)) process.kill(child.pid, 'SIGKILL');
+}
+
+async function prepareFakeLatest(root, version) {
+  const shimDir = join(root, 'bin');
+  const npmLog = join(root, 'npm.json');
+  const fakeNpm = join(root, 'fake-npm.mjs');
+  const globalRoot = join(root, 'global');
+  const globalPackageDir = join(globalRoot, '@galaxy-yearn', 'codex-deepseek-gateway');
+  await mkdir(shimDir, { recursive: true });
+  await cp('bin', join(globalPackageDir, 'bin'), { recursive: true });
+  await cp('src', join(globalPackageDir, 'src'), { recursive: true });
+  await cp('config', join(globalPackageDir, 'config'), { recursive: true });
+  await writeFile(join(globalPackageDir, 'package.json'), JSON.stringify({ ...packageJson, version }));
+  await writeFile(fakeNpm, "import { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst args = process.argv.slice(2);\nconst calls = existsSync(process.env.FAKE_NPM_LOG) ? JSON.parse(readFileSync(process.env.FAKE_NPM_LOG, 'utf8')) : [];\ncalls.push(args);\nwriteFileSync(process.env.FAKE_NPM_LOG, JSON.stringify(calls));\nif (args[0] === 'root') process.stdout.write(process.env.FAKE_NPM_ROOT);\n");
+  if (process.platform === 'win32') {
+    await writeFile(join(shimDir, 'npm.cmd'), `@"${process.execPath}" "%FAKE_NPM_SCRIPT%" %*\r\n`);
+  } else {
+    const npmShim = join(shimDir, 'npm');
+    await writeFile(npmShim, `#!/bin/sh\n"${process.execPath}" "$FAKE_NPM_SCRIPT" "$@"\n`);
+    await chmod(npmShim, 0o755);
+  }
+  return {
+    npmLog,
+    env: {
+      FAKE_NPM_LOG: npmLog,
+      FAKE_NPM_ROOT: globalRoot,
+      FAKE_NPM_SCRIPT: fakeNpm,
+      PATH: `${shimDir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH || ''}`,
+    },
+  };
+}
 
 test('CLI version and installation lifecycle', async () => {
   await scenario('prints package version', async () => {
@@ -75,6 +148,247 @@ test('CLI version and installation lifecycle', async () => {
     });
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+  });
+  await scenario('starts and gracefully stops an installed gateway with a private control token', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-cli-lifecycle-'));
+  const port = await freePort();
+  const env = { ...process.env };
+  delete env.DEEPSEEK_API_KEY;
+  delete env.UPSTREAM_API_KEY;
+  delete env.GATEWAY_CONFIG_FILE;
+  delete env.GATEWAY_SHUTDOWN_TOKEN;
+  try {
+    await mkdir(join(dir, 'config'), { recursive: true });
+    await writeFile(join(dir, 'config', 'gateway.local.json'), JSON.stringify({
+      upstreamApiKey: 'test-key',
+      host: '127.0.0.1',
+      port,
+      shutdownTimeoutMs: 1000,
+    }));
+
+    execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', 'install', '--no-edit', '--dir', dir], {
+      encoding: 'utf8',
+      env,
+      timeout: 15000,
+    });
+    const processRecord = JSON.parse(readFileSync(join(dir, 'gateway.pid'), 'utf8'));
+    assert.equal(processRecord.version, 3);
+    assert.equal(Number.isSafeInteger(processRecord.pid), true);
+    assert.match(processRecord.instanceId, /^[a-f0-9]{32}$/);
+    assert.match(processRecord.controlUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.match(processRecord.shutdownToken, /^[a-f0-9]{64}$/);
+
+    const running = JSON.parse(execFileSync(
+      process.execPath,
+      ['bin/codex-deepseek-gateway.js', 'status', '--json', '--dir', dir],
+      { encoding: 'utf8', env, timeout: 5000 },
+    ));
+    assert.equal(running.state, 'healthy');
+    assert.equal(running.process.authenticated, true);
+    assert.equal(running.endpoint.reachable, true);
+
+    const stopped = execFileSync(
+      process.execPath,
+      ['bin/codex-deepseek-gateway.js', 'stop', '--dir', dir],
+      { encoding: 'utf8', env, timeout: 10000 },
+    );
+    assert.match(stopped, /Gateway stopped/);
+    assert.equal(existsSync(join(dir, 'gateway.pid')), false);
+  } finally {
+    try {
+      execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', 'stop', '--dir', dir], {
+        encoding: 'utf8',
+        env,
+        timeout: 5000,
+      });
+    } catch {
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
+  await scenario('requires explicit force before terminating an unauthenticated legacy PID', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-cli-force-'));
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  try {
+    await mkdir(join(dir, 'config'), { recursive: true });
+    await writeFile(join(dir, 'config', 'gateway.local.json'), JSON.stringify({
+      host: '127.0.0.1',
+      port: await freePort(),
+    }));
+    await writeFile(join(dir, 'gateway.pid'), String(child.pid));
+    assert.equal(processExists(child.pid), true);
+
+    assert.throws(() => execFileSync(
+      process.execPath,
+      ['bin/codex-deepseek-gateway.js', 'stop', '--dir', dir],
+      { encoding: 'utf8', timeout: 5000 },
+    ), /could not be authenticated/);
+    assert.equal(processExists(child.pid), true);
+
+    execFileSync(
+      process.execPath,
+      ['bin/codex-deepseek-gateway.js', 'stop', '--force', '--dir', dir],
+      { encoding: 'utf8', timeout: 5000 },
+    );
+    assert.equal(processExists(child.pid), false);
+  } finally {
+    if (processExists(child.pid)) process.kill(child.pid, 'SIGKILL');
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
+  await scenario('updates through npm latest, reinstalls, and verifies the gateway', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-cli-update-'));
+  const dir = join(root, 'install');
+  const updatedVersion = '9.9.9-test';
+  const fakeLatest = await prepareFakeLatest(root, updatedVersion);
+  const port = await freePort();
+  const upstreamPort = await freePort();
+  const upstream = spawn(process.execPath, ['-e', `const server=require('node:http').createServer((request,response)=>{if(request.url==='/shutdown'){response.end();server.close(()=>process.exit(0));return}response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify({data:[{id:'deepseek-v4-flash'},{id:'deepseek-v4-pro'}]}))});server.listen(${upstreamPort},'127.0.0.1')`], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  const env = {
+    ...process.env,
+    ...fakeLatest.env,
+  };
+  delete env.DEEPSEEK_API_KEY;
+  delete env.UPSTREAM_API_KEY;
+  delete env.GATEWAY_CONFIG_FILE;
+  try {
+    await waitForHttp(`http://127.0.0.1:${upstreamPort}/models`);
+    await mkdir(join(dir, 'config'), { recursive: true });
+    const codexConfigFile = join(root, 'config.toml');
+    await writeFile(codexConfigFile, `[model_providers.deepseek-gateway]\nname = "DeepSeek"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\n`);
+    env.CODEX_CONFIG_FILE = codexConfigFile;
+    const localConfig = {
+      upstreamApiKey: 'test-key',
+      upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}`,
+      host: '127.0.0.1',
+      port,
+      shutdownTimeoutMs: 1000,
+      customUserValue: 'keep',
+    };
+    const reasoningCache = '{"version":1,"callIds":["call_existing"],"message":{"role":"assistant","reasoning_content":"keep","tool_calls":[]}}\n';
+    await writeFile(join(dir, 'config', 'gateway.local.json'), JSON.stringify(localConfig));
+    await mkdir(join(dir, 'state'), { recursive: true });
+    await writeFile(join(dir, 'state', 'reasoning-cache.jsonl'), reasoningCache);
+    execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', 'install', '--no-edit', '--dir', dir], {
+      encoding: 'utf8',
+      env,
+      timeout: 15000,
+    });
+    const oldPid = JSON.parse(readFileSync(join(dir, 'gateway.pid'), 'utf8')).pid;
+
+    const output = execFileSync(
+      process.execPath,
+      ['bin/codex-deepseek-gateway.js', 'update', '--dir', dir],
+      { encoding: 'utf8', env, timeout: 30000 },
+    );
+    assert.deepEqual(JSON.parse(readFileSync(fakeLatest.npmLog, 'utf8')), [
+      ['install', '-g', `${packageJson.name}@latest`],
+      ['root', '-g'],
+    ]);
+    assert.match(output, /Installing @galaxy-yearn\/codex-deepseek-gateway@latest/);
+    assert.match(output, /Gateway status: HEALTHY/);
+    assert.match(output, /Gateway doctor: OK/);
+    assert.match(output, new RegExp(`Version: ${updatedVersion}`));
+    assert.equal(JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version, updatedVersion);
+    const newPid = JSON.parse(readFileSync(join(dir, 'gateway.pid'), 'utf8')).pid;
+    assert.notEqual(newPid, oldPid);
+    assert.equal(processExists(oldPid), false);
+    assert.equal(processExists(newPid), true);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'config', 'gateway.local.json'), 'utf8')), localConfig);
+    assert.equal(readFileSync(join(dir, 'state', 'reasoning-cache.jsonl'), 'utf8'), reasoningCache);
+  } finally {
+    await stopHttpChild(`http://127.0.0.1:${upstreamPort}/shutdown`, upstream);
+    try {
+      execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', 'stop', '--dir', dir], {
+        encoding: 'utf8',
+        env,
+        timeout: 5000,
+      });
+    } catch {
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+  });
+  await scenario('rejects another healthy process as update verification', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-cli-update-foreign-'));
+  const dir = join(root, 'install');
+  const fakeLatest = await prepareFakeLatest(root, '9.9.9-test');
+  const port = await freePort();
+  const foreign = spawn(process.execPath, ['-e', `const server=require('node:http').createServer((request,response)=>{if(request.url==='/shutdown'){response.end();server.close(()=>process.exit(0));return}response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify({ok:true}))});server.listen(${port},'127.0.0.1')`], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  const env = { ...process.env, ...fakeLatest.env };
+  delete env.DEEPSEEK_API_KEY;
+  delete env.UPSTREAM_API_KEY;
+  delete env.GATEWAY_CONFIG_FILE;
+  try {
+    await waitForHttp(`http://127.0.0.1:${port}/health`);
+    await mkdir(join(dir, 'config'), { recursive: true });
+    await writeFile(join(dir, 'config', 'gateway.local.json'), JSON.stringify({
+      upstreamApiKey: 'test-key',
+      host: '127.0.0.1',
+      port,
+    }));
+    execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', 'install', '--no-edit', '--dir', dir], {
+      encoding: 'utf8',
+      env,
+      timeout: 5000,
+    });
+    assert.throws(() => execFileSync(
+      process.execPath,
+      ['bin/codex-deepseek-gateway.js', 'update', '--dir', dir],
+      { encoding: 'utf8', env, timeout: 30000 },
+    ), /gateway status failed with exit code 1/);
+  } finally {
+    await stopHttpChild(`http://127.0.0.1:${port}/shutdown`, foreign);
+    await rm(root, { recursive: true, force: true });
+  }
+  });
+  await scenario('refuses unsafe or unconfigured update targets before invoking npm', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-cli-update-invalid-'));
+  const arbitraryDir = join(root, 'arbitrary');
+  const installedDir = join(root, 'installed');
+  const fakeLatest = await prepareFakeLatest(root, '9.9.9-test');
+  const env = { ...process.env };
+  Object.assign(env, fakeLatest.env);
+  delete env.DEEPSEEK_API_KEY;
+  delete env.UPSTREAM_API_KEY;
+  delete env.GATEWAY_CONFIG_FILE;
+  try {
+    await mkdir(join(arbitraryDir, 'config'), { recursive: true });
+    await mkdir(join(arbitraryDir, 'bin'), { recursive: true });
+    await mkdir(join(arbitraryDir, 'src'), { recursive: true });
+    await writeFile(join(arbitraryDir, 'package.json'), JSON.stringify({ name: 'another-project' }));
+    await writeFile(join(arbitraryDir, 'bin', 'codex-deepseek-gateway.js'), 'keep');
+    await writeFile(join(arbitraryDir, 'src', 'server.js'), 'keep');
+    await writeFile(join(arbitraryDir, 'config', 'gateway.local.json'), JSON.stringify({ upstreamApiKey: 'test-key' }));
+    await writeFile(join(arbitraryDir, 'src', 'keep.txt'), 'keep');
+    assert.throws(() => execFileSync(
+      process.execPath,
+      ['bin/codex-deepseek-gateway.js', 'update', '--dir', arbitraryDir],
+      { encoding: 'utf8', env, timeout: 5000 },
+    ), /Missing runtime/);
+    assert.equal(readFileSync(join(arbitraryDir, 'src', 'keep.txt'), 'utf8'), 'keep');
+    assert.equal(existsSync(fakeLatest.npmLog), false);
+
+    execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', 'install', '--no-edit', '--dir', installedDir], {
+      encoding: 'utf8',
+      env,
+      timeout: 5000,
+    });
+    assert.throws(() => execFileSync(
+      process.execPath,
+      ['bin/codex-deepseek-gateway.js', 'update', '--dir', installedDir],
+      { encoding: 'utf8', env, timeout: 5000 },
+    ), /Missing DeepSeek API key/);
+    assert.equal(existsSync(fakeLatest.npmLog), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
   });
 });

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import { generateId, isObject, normalizeRole, parseJsonObject, safeJsonParse, toText } from './common.js';
+import { CODEX_SUMMARY_PREFIX_START, generateId, isObject, normalizeRole, parseJsonObject, safeJsonParse, toText } from './common.js';
 import {
   deepseekReasoningPayload,
   resolveModelAlias,
@@ -49,9 +49,15 @@ const UNSUPPORTED_HOSTED_TOOL_TYPES = new Set([
 const DEEPSEEK_TOOL_INSTRUCTIONS_MARKER = 'The tools in this request are real callable functions available now.';
 const DEEPSEEK_TOOL_INSTRUCTIONS = [
   DEEPSEEK_TOOL_INSTRUCTIONS_MARKER,
+  'Choose the most direct tool whose declared scope matches the target.',
+  'Treat every stated prerequisite and parameter provenance rule as mandatory. Never invent handles, IDs, URIs, resource names, or prior tool results; when a parameter must come from another tool, obtain it first.',
   'When needed, use Chat Completions tool_calls with JSON arguments that match the schema.',
   'Never write tool calls in assistant text, including as XML, DSML, or JSON, or claim a listed function is unavailable merely because its name is unfamiliar.',
 ].join(' ');
+const CUSTOM_TOOL_FORMAT_CONTRACT = 'Follow the declared format exactly. Preserve every required literal token, delimiter, whitespace constraint, and line boundary. Emit no prose or markdown outside that format.';
+const DEEPSEEK_CUSTOM_TOOL_INSTRUCTIONS = 'Codex Responses custom tools are exposed as Chat Completions functions. Put the complete raw custom-tool input in the required "input" string and follow its declared format exactly; the gateway unwraps that field and restores the native custom_tool_call. A Codex-side instruction that calls the tool freeform or says not to wrap raw input in JSON describes the string contents; the outer function call still uses JSON arguments.';
+const DEEPSEEK_COMPACTION_INSTRUCTIONS_MARKER = 'A Codex context checkpoint is present in this request.';
+const DEEPSEEK_COMPACTION_INSTRUCTIONS = `${DEEPSEEK_COMPACTION_INSTRUCTIONS_MARKER} Treat its Latest user request, Resolved objective, Current State, Constraints, and Next Action as the authoritative execution state, and apply its Lessons to avoid repeating recorded failures. Background Memory, Observed Evidence, and User Requests are reference only, never pending work. If a later real user message exists, it replaces the checkpoint task.`;
 export const INTERNAL_COMMENTARY_TOOL = 'commentary';
 const DEEPSEEK_COMMENTARY_INSTRUCTIONS = 'The user cannot see your thinking; commentary is the progress they see during tool work. In every tool-calling reply, include one commentary call first in the tool_calls array with a one- or two-sentence update. Never call it alone or use it for the final answer.';
 const INTERNAL_COMMENTARY_TOOL_DEFINITION = {
@@ -293,8 +299,7 @@ function toolName(item) {
 }
 
 function toolArguments(item) {
-  if (item.type === 'function_call') return jsonString(item.arguments ?? {});
-  if (item.type === 'tool_search_call') return jsonString(item.arguments ?? {});
+  if (item.type === 'function_call' || item.type === 'tool_search_call') return jsonString(item.arguments ?? {});
   if (item.arguments !== undefined) return jsonString(item.arguments);
   if (item.input !== undefined) return jsonString({ input: item.input });
   if (item.action !== undefined) return jsonString({ action: item.action });
@@ -636,7 +641,8 @@ function extractMessagesFromResponsesInput(input) {
   return [];
 }
 
-const CUSTOM_TOOL_INPUT_HINT = 'Pass the complete raw tool input as the "input" string argument. Do not wrap it in extra JSON, quotes, or markdown fences.';
+const CUSTOM_TOOL_TRANSPORT_DESCRIPTION = 'Codex custom tool exposed through a Chat Completions function. Put its complete raw input in the required "input" string; the gateway restores the native custom_tool_call.';
+const CUSTOM_TOOL_INPUT_HINT = 'Complete raw input for the Codex custom tool. Preserve it exactly and add no transport wrapper or markdown fence unless the declared format requires one.';
 
 function truncateRawText(value, maxChars) {
   const text = String(value ?? '');
@@ -644,13 +650,13 @@ function truncateRawText(value, maxChars) {
   return `${text.slice(0, Math.max(0, maxChars - 4))}\n...`;
 }
 
-function customToolShimParameters() {
+function customToolShimParameters(description) {
   return {
     type: 'object',
     properties: {
       input: {
         type: 'string',
-        description: 'Complete raw input text for this tool.',
+        description,
       },
     },
     required: ['input'],
@@ -661,20 +667,30 @@ function customToolShimParameters() {
 function customToolShim(tool) {
   const format = isObject(tool.format) ? tool.format : {};
   const baseName = toolBaseName(tool, 'custom_tool');
+  const formatType = typeof format.type === 'string' && format.type.trim() ? format.type.trim() : '';
+  const syntax = typeof format.syntax === 'string' && format.syntax.trim() ? format.syntax.trim() : '';
+  const definition = typeof format.definition === 'string' && format.definition.trim()
+    ? format.definition.trim()
+    : '';
+  const sourceDescription = compactStructuredText(tool.description, DEEPSEEK_TOOL_DESCRIPTION_SOFT_CHARS)
+    || `Freeform tool ${baseName}.`;
   const chunks = [
-    compactStructuredText(tool.description, DEEPSEEK_TOOL_DESCRIPTION_SOFT_CHARS) || `Freeform tool ${baseName}.`,
+    CUSTOM_TOOL_TRANSPORT_DESCRIPTION,
+    `Codex-side tool description: ${sourceDescription}`,
+  ];
+  const inputContract = [
     CUSTOM_TOOL_INPUT_HINT,
   ];
-  if (format.syntax) chunks.push(`Input syntax: ${format.syntax}.`);
-  if (typeof format.definition === 'string' && format.definition.trim()) {
-    chunks.push(`Input grammar:\n${format.definition.trim()}`);
-  }
-  const parameters = customToolShimParameters();
   const sourceSchema = isObject(tool.input_schema) ? tool.input_schema : isObject(tool.parameters) ? tool.parameters : null;
   const sourceInputDescription = sourceSchema?.properties?.input?.description;
   if (typeof sourceInputDescription === 'string' && sourceInputDescription) {
-    parameters.properties.input.description = compactStructuredText(sourceInputDescription, DEEPSEEK_SCHEMA_DESCRIPTION_SOFT_CHARS);
+    inputContract.push(compactStructuredText(sourceInputDescription, DEEPSEEK_SCHEMA_DESCRIPTION_SOFT_CHARS));
   }
+  if (formatType) inputContract.push(`Input format: ${formatType}.`);
+  if (syntax) inputContract.push(`Input syntax: ${syntax}.`);
+  if (formatType || syntax || definition) inputContract.push(CUSTOM_TOOL_FORMAT_CONTRACT);
+  if (definition) inputContract.push(`${formatType === 'grammar' ? 'Input grammar' : 'Input format definition'}:\n${definition}`);
+  const parameters = customToolShimParameters(inputContract.join('\n'));
   return {
     type: 'function',
     gateway_custom_tool: true,
@@ -1173,15 +1189,8 @@ function simplifyToolForDeepSeek(tool) {
   };
 }
 
-function hasDeepSeekToolInstructions(messages) {
-  return messages.some((message) => message?.role === 'system' && toText(message.content).includes(DEEPSEEK_TOOL_INSTRUCTIONS_MARKER));
-}
-
-function addDeepSeekToolInstructions(messages, tools) {
-  if (!Array.isArray(tools) || !tools.length || hasDeepSeekToolInstructions(messages)) return messages;
-  const instructions = requestToolsIncludeCommentary(tools)
-    ? `${DEEPSEEK_TOOL_INSTRUCTIONS} ${DEEPSEEK_COMMENTARY_INSTRUCTIONS}`
-    : DEEPSEEK_TOOL_INSTRUCTIONS;
+function addDeepSeekSystemInstructions(messages, marker, instructions) {
+  if (messages.some((message) => message?.role === 'system' && toText(message.content).includes(marker))) return messages;
   if (!messages.length || messages[0]?.role !== 'system') {
     return [{ role: 'system', content: instructions }, ...messages];
   }
@@ -1192,6 +1201,26 @@ function addDeepSeekToolInstructions(messages, tools) {
     },
     ...messages.slice(1),
   ];
+}
+
+function addDeepSeekToolInstructions(messages, tools) {
+  if (!Array.isArray(tools) || !tools.length) return messages;
+  const custom = tools.some((tool) => tool?.gateway_custom_tool);
+  const base = requestToolsIncludeCommentary(tools)
+    ? `${DEEPSEEK_TOOL_INSTRUCTIONS} ${DEEPSEEK_COMMENTARY_INSTRUCTIONS}`
+    : DEEPSEEK_TOOL_INSTRUCTIONS;
+  const instructions = custom ? `${base} ${DEEPSEEK_CUSTOM_TOOL_INSTRUCTIONS}` : base;
+  return addDeepSeekSystemInstructions(messages, DEEPSEEK_TOOL_INSTRUCTIONS_MARKER, instructions);
+}
+
+function addDeepSeekCompactionInstructions(messages) {
+  return messages.some((message) => (
+    message?.role === 'user'
+    && toText(message.content).trim().startsWith(CODEX_SUMMARY_PREFIX_START)
+    && toText(message.content).includes('# Context Checkpoint')
+  ))
+    ? addDeepSeekSystemInstructions(messages, DEEPSEEK_COMPACTION_INSTRUCTIONS_MARKER, DEEPSEEK_COMPACTION_INSTRUCTIONS)
+    : messages;
 }
 
 function isDeepSeekBetaBaseUrl(baseUrl) {
@@ -1376,19 +1405,7 @@ function sanitizeMessagesForChatCompletion(messages, provider = 'generic') {
   return result;
 }
 
-const DEEPSEEK_CONTEXT_WINDOW = 1000000;
-const DEEPSEEK_MAX_OUTPUT_TOKENS = 384000;
-const DEEPSEEK_AUTO_COMPACT_TOKEN_LIMIT = 900000;
-
-function jointOutputTokenBudget(contextWindow, maxOutputTokens, inputTokenLimit) {
-  return Math.max(1, Math.min(maxOutputTokens, contextWindow - inputTokenLimit));
-}
-
-const DEEPSEEK_DEFAULT_MAX_TOKENS = jointOutputTokenBudget(
-  DEEPSEEK_CONTEXT_WINDOW,
-  DEEPSEEK_MAX_OUTPUT_TOKENS,
-  DEEPSEEK_AUTO_COMPACT_TOKEN_LIMIT,
-);
+const DEEPSEEK_DEFAULT_MAX_TOKENS = 100000;
 
 function deepseekDefaultMaxTokens(config = {}) {
   const value = Number(config.upstreamMaxTokens);
@@ -1577,14 +1594,12 @@ function normalizeInstructions(instructions) {
   return toText(instructions);
 }
 
-export function normalizeResponsesRequest(request, { restoreDiscoveredTools = true } = {}) {
+export function normalizeResponsesRequest(request) {
   const messages = extractMessagesFromResponsesInput(request.input ?? request);
   const model = request.model || request.model_id || request.upstream_model || '';
   const instructions = normalizeInstructions(request.instructions);
   const responseFormat = request.response_format || request.text?.format;
-  const tools = restoreDiscoveredTools
-    ? mergeToolsWithToolSearchOutput(request.tools, request.input ?? request)
-    : request.tools;
+  const tools = mergeToolsWithToolSearchOutput(request.tools, request.input ?? request);
   return {
     model,
     messages,
@@ -1774,6 +1789,7 @@ export function toProviderChatCompletionsRequest(chatRequest, config = {}) {
     request.tools = addInternalCommentaryTool(adaptToolsForProvider(request.tools, provider, config), chatRequest.tool_choice);
     assertDeepSeekToolCapacity(request.tools);
     request.messages = addDeepSeekToolInstructions(request.messages, request.tools);
+    if (!config.compactionRequest) request.messages = addDeepSeekCompactionInstructions(request.messages);
     if (request.user !== undefined) {
       request.user_id = request.user;
       delete request.user;
@@ -1929,6 +1945,7 @@ export function createResponseEnvelope({
   normalized,
   completedAt = null,
   incompleteReason = null,
+  error = null,
 }) {
   return createBaseResponse({
     id,
@@ -1941,6 +1958,7 @@ export function createResponseEnvelope({
     normalized,
     completedAt,
     incompleteReason,
+    error,
   });
 }
 
@@ -2067,7 +2085,7 @@ export function expandParallelToolCallsInCompletion(completion) {
   };
 }
 
-export function convertChatCompletionToResponses({ completion: rawCompletion, model, previousResponseId, normalized, responseId = generateId('resp'), config = {} }) {
+export function convertChatCompletionToResponses({ completion: rawCompletion, model, previousResponseId, normalized, responseId = generateId('resp') }) {
   const toolSchemas = buildToolSchemas(normalized?.tools);
   const knownToolNames = new Set([...toolSchemas.keys(), INTERNAL_COMMENTARY_TOOL]);
   const completion = resolveEmittedToolCallNamesInCompletion(
@@ -2114,7 +2132,7 @@ export function convertChatCompletionToResponses({ completion: rawCompletion, mo
       }
       const item = responseItemFromChatToolCall(toolCall, toolNames, customToolNames);
       item.status = outcome.status;
-      normalizeFunctionCallItemArguments(item, toolSchemas, config);
+      normalizeFunctionCallItemArguments(item, toolSchemas);
       output.push(item);
     }
   }
@@ -2219,7 +2237,7 @@ export class ResponsesStreamMapper {
       model: this.model,
       createdAt: this.createdAt,
       status,
-      output: this.output,
+      output: this.output.map(snapshotResponseItem),
       previousResponseId: this.previousResponseId,
       usage: this.usage,
       normalized: this.normalized,
@@ -2585,7 +2603,7 @@ export class ResponsesStreamMapper {
       }
     }
     item.arguments += toolCall.function?.arguments || '';
-    if (functionCallItemNeedsArgumentNormalization(item, this.toolSchemas, this.config)) {
+    if (functionCallItemNeedsArgumentNormalization(item, this.toolSchemas)) {
       this.toolItemsBufferedArguments.add(index);
     }
     const streamedLength = this.toolItemsStreamedArgumentLengths.get(index) || 0;
@@ -2789,7 +2807,7 @@ export class ResponsesStreamMapper {
       item.status = status;
       if (item.type === 'tool_search_call') finalizeToolSearchCallItemArguments(item);
       else if (item.type === 'custom_tool_call') item.input = customToolInputFromArguments(item.arguments);
-      else normalizeFunctionCallItemArguments(item, this.toolSchemas, this.config);
+      else normalizeFunctionCallItemArguments(item, this.toolSchemas);
       const outputIndex = this.output.indexOf(item);
       if (!this.toolItemsAdded.has(index)) {
         this.toolItemsAdded.add(index);
@@ -2841,7 +2859,7 @@ export class ResponsesStreamMapper {
       model: this.model,
       createdAt: this.createdAt,
       status,
-      output: this.output,
+      output: this.output.map(snapshotResponseItem),
       previousResponseId: this.previousResponseId,
       usage: normalizeResponsesUsage(usage),
       normalized: this.normalized,

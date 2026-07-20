@@ -13,6 +13,7 @@ async function scenario(name, run) {
 import {
   buildFirecrawlScrapeRequest,
   callFirecrawlScrape,
+  formatFirecrawlScrapeResult,
   normalizeFirecrawlScrapeResponse,
   normalizeFirecrawlUrl,
 } from '../src/firecrawl.js';
@@ -100,6 +101,11 @@ test('Firecrawl response and provider errors', async () => {
   assert.match(response.content, /include the page title and URL/);
   assert.doesNotMatch(response.content, /source number|Assigned source/i);
   assert.doesNotMatch(response.content, /localhost|<b>|\*\*/);
+  assert.match(formatFirecrawlScrapeResult({
+    url: 'https://example.com/direct',
+    title: 'Direct page',
+    markdown: 'Direct body',
+  }), /Opened page: https:\/\/example\.com\/direct[\s\S]*Page text excerpt:[\s\S]*Direct body/);
   });
   await scenario('executes Firecrawl requests and returns safe validation and provider errors', async () => {
   const requests = [];

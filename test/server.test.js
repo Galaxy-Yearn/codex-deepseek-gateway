@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import http from 'node:http';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -13,9 +14,10 @@ async function scenario(name, run) {
     throw error;
   }
 }
-import { createProxyServer } from '../src/server.js';
+import { closeServerGracefully, createProxyServer } from '../src/server.js';
 import { ReasoningCache } from '../src/reasoning-cache.js';
 import { DEFAULT_MODEL_ALIASES } from '../src/model-map.js';
+import { createControlServer } from '../src/runtime.js';
 
 const legacyChatModel = ['deepseek', 'chat'].join('-');
 const legacyReasoningModel = ['deepseek', 'reasoner'].join('-');
@@ -32,6 +34,29 @@ function listen(server) {
 function close(server) {
   return new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function postChunks(url, chunks) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const request = http.request({
+      host: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    }, (response) => {
+      const responseChunks = [];
+      response.on('data', (chunk) => responseChunks.push(chunk));
+      response.on('end', () => resolve({
+        status: response.statusCode,
+        body: JSON.parse(Buffer.concat(responseChunks).toString('utf8')),
+      }));
+    });
+    request.on('error', reject);
+    for (const chunk of chunks) request.write(chunk);
+    request.end();
   });
 }
 
@@ -244,6 +269,51 @@ test('health, models, authentication, and request validation', async () => {
     await close(upstream);
   }
   });
+  await scenario('rejects oversized Responses and chunked Chat Completions bodies before upstream', async () => {
+  let upstreamCalled = false;
+  const upstream = http.createServer((_req, res) => {
+    upstreamCalled = true;
+    res.writeHead(500).end();
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      requestBodyMaxBytes: 64,
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const responses = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', input: 'x'.repeat(128) }),
+    });
+    assert.equal(responses.status, 413);
+    assert.deepEqual(await responses.json(), {
+      error: { code: 'request_body_too_large', message: 'Request body exceeds 64 bytes' },
+    });
+
+    const chat = await postChunks(`${proxyUrl}/v1/chat/completions`, [
+      '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"',
+      'x'.repeat(128),
+      '"}]}',
+    ]);
+    assert.equal(chat.status, 413);
+    assert.deepEqual(chat.body, {
+      error: { code: 'request_body_too_large', message: 'Request body exceeds 64 bytes' },
+    });
+    assert.equal(upstreamCalled, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
   await scenario('passes raw Chat Completions requests and streams through unchanged', async () => {
   const upstreamRequests = [];
   const upstream = http.createServer(async (req, res) => {
@@ -340,6 +410,123 @@ test('health, models, authentication, and request validation', async () => {
   });
 });
 
+test('graceful shutdown', async () => {
+  await scenario('keeps shutdown control off the public data server', async () => {
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: 'http://127.0.0.1:1',
+      upstreamApiKey: 'test-key',
+      upstreamProvider: 'deepseek',
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/shutdown`, { method: 'POST' });
+    assert.equal(response.status, 404);
+  } finally {
+    await close(proxy);
+  }
+  });
+  await scenario('stops accepting new connections while allowing an in-flight response to finish', async () => {
+  let releaseUpstream;
+  let markUpstreamStarted;
+  const upstreamRelease = new Promise((resolve) => {
+    releaseUpstream = resolve;
+  });
+  const upstreamStarted = new Promise((resolve) => {
+    markUpstreamStarted = resolve;
+  });
+  const upstream = http.createServer(async (req, res) => {
+    for await (const _chunk of req) {
+    }
+    markUpstreamStarted();
+    await upstreamRelease;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'completed' }, finish_reason: 'stop' }] }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const responsePromise = fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', input: 'finish this request' }),
+    });
+    await upstreamStarted;
+    let closed = false;
+    const closing = closeServerGracefully(proxy, 1000).then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closed, false);
+    releaseUpstream();
+    const response = await responsePromise;
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).output_text, 'completed');
+    await closing;
+    assert.equal(closed, true);
+  } finally {
+    releaseUpstream();
+    if (proxy.listening) await close(proxy);
+    await close(upstream);
+  }
+  });
+  await scenario('requires the private token before accepting a shutdown request', async () => {
+  let control;
+  control = createControlServer({
+    token: 'private-token',
+    instanceId: 'instance-1',
+    onShutdown: () => closeServerGracefully(control, 1000),
+    status: { packageVersion: '1.2.3', startedAt: 42, dataUrl: 'http://127.0.0.1:3000' },
+  });
+  const controlUrl = await listen(control);
+
+  try {
+    const rejected = await fetch(`${controlUrl}/shutdown`, {
+      method: 'POST',
+      headers: { 'x-gateway-shutdown-token': 'wrong-token' },
+    });
+    assert.equal(rejected.status, 404);
+
+    const status = await fetch(`${controlUrl}/status`, {
+      headers: { 'x-gateway-shutdown-token': 'private-token' },
+    });
+    assert.deepEqual(await status.json(), {
+      packageVersion: '1.2.3',
+      startedAt: 42,
+      dataUrl: 'http://127.0.0.1:3000',
+      ok: true,
+      pid: process.pid,
+      instanceId: 'instance-1',
+    });
+
+    const closed = once(control, 'close');
+    const accepted = await fetch(`${controlUrl}/shutdown`, {
+      method: 'POST',
+      headers: { 'x-gateway-shutdown-token': 'private-token' },
+    });
+    assert.equal(accepted.status, 202);
+    assert.deepEqual(await accepted.json(), { ok: true });
+    await closed;
+  } finally {
+    if (control.listening) await close(control);
+  }
+  });
+});
+
 test('non-streaming bridge and persistent reasoning recovery', async () => {
   await scenario('proxies non-streaming Responses request to chat completions upstream', async () => {
   let upstreamBody;
@@ -396,7 +583,7 @@ test('non-streaming bridge and persistent reasoning recovery', async () => {
     await close(upstream);
   }
   });
-  await scenario('does not restore historically discovered tools for Codex compaction requests', async () => {
+  await scenario('keeps historically discovered tools out of compact requests', async () => {
   let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
     const chunks = [];
@@ -406,7 +593,21 @@ test('non-streaming bridge and persistent reasoning recovery', async () => {
     res.end(JSON.stringify({
       id: 'chatcmpl_compaction',
       created: 123,
-      choices: [{ message: { role: 'assistant', content: 'compact summary' }, finish_reason: 'stop' }],
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: JSON.stringify({
+            objective: 'Preserve the active task state.',
+            observations: [],
+            state: '',
+            completed: [],
+            in_progress: [],
+            constraints: '',
+            next: 'Continue the active task.',
+          }),
+        },
+        finish_reason: 'stop',
+      }],
     }));
   });
   const upstreamUrl = await listen(upstream);
@@ -444,7 +645,9 @@ test('non-streaming bridge and persistent reasoning recovery', async () => {
     });
     assert.equal(response.status, 200);
     assert.equal(upstreamBody.tools, undefined);
-    assert.equal(upstreamBody.messages[0].content.includes('real callable functions available now'), false);
+    assert.equal(upstreamBody.tool_choice, undefined);
+    assert.deepEqual(upstreamBody.response_format, { type: 'json_object' });
+    assert.equal(upstreamBody.messages.some((message) => message.content.includes('real callable functions available now')), false);
   } finally {
     await close(proxy);
     await close(upstream);

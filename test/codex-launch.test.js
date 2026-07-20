@@ -127,6 +127,22 @@ test('Codex launch configuration and catalogs', async () => {
   const files = ['codex-model-catalog.json', 'codex-model-catalog.zh.json'];
   const expectedSlugs = ['deepseek-v4-flash', 'deepseek-v4-pro'];
   const expectedEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+  const expectedDescriptions = {
+    'codex-model-catalog.json': [
+      'Fast responses without extended reasoning',
+      'Balances speed and reasoning depth for everyday tasks',
+      'Greater reasoning depth for complex problems',
+      'Extra high reasoning depth for complex problems',
+      'Maximum reasoning depth for the hardest problems',
+    ],
+    'codex-model-catalog.zh.json': [
+      '快速响应，不进行扩展推理',
+      '平衡速度与推理深度，适合日常任务',
+      '深度推理，适合复杂问题',
+      '更高的推理深度，适合复杂问题',
+      '最大推理深度，适合最困难的问题',
+    ],
+  };
   const expectedPersonalityKeys = ['personality_default', 'personality_friendly', 'personality_pragmatic'];
 
   for (const file of files) {
@@ -145,7 +161,12 @@ test('Codex launch configuration and catalogs', async () => {
       assert.equal(model.base_instructions, template.replace('{{ personality }}', variables.personality_pragmatic));
       assert.match(template, /commentary\(text:/);
       assert.equal(template.includes('multi_tool_use'), false);
+      assert.equal(template.includes('require_escalated'), false);
+      assert.equal(/do not include `prefix_rule`|不要包含 `prefix_rule`/u.test(template), false);
+      assert.match(template, /active tool schema|当前工具 schema/u);
+      assert.match(template, /narrowest sufficient permission mode|最小充分权限模式/u);
       assert.deepEqual(model.supported_reasoning_levels.map((level) => level.effort), expectedEfforts);
+      assert.deepEqual(model.supported_reasoning_levels.map((level) => level.description), expectedDescriptions[file]);
       assert.equal(expectedEfforts.includes(model.default_reasoning_level), true);
       assert.equal(model.supports_reasoning_summaries, true);
       assert.equal(model.default_reasoning_summary, 'auto');

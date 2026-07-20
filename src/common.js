@@ -1,5 +1,69 @@
 import { randomUUID } from 'node:crypto';
 
+export const CODEX_SUMMARY_PREFIX_START = 'Another language model started to solve this problem and produced a summary of its thinking process.';
+const CODEX_CONTEXTUAL_USER_WRAPPERS = [
+  ['# AGENTS.md instructions', '</INSTRUCTIONS>'],
+  ['<environment_context>', '</environment_context>'],
+  ['<skill>', '</skill>'],
+  ['<user_shell_command>', '</user_shell_command>'],
+  ['<turn_aborted>', '</turn_aborted>'],
+  ['<subagent_notification>', '</subagent_notification>'],
+  ['<recommended_plugins>', '</recommended_plugins>'],
+];
+const LEGACY_EXEC_LIMIT_PREFIX = 'Warning: The maximum number of unified exec processes you can keep open is';
+const LEGACY_APPLY_PATCH_PREFIX = 'Warning: apply_patch was requested via ';
+const LEGACY_APPLY_PATCH_SUFFIX = 'Use the apply_patch tool instead of exec_command.';
+const LEGACY_MODEL_MISMATCH_PREFIX = 'Warning: Your account was flagged for potentially high-risk cyber activity';
+
+function contextualWrapperLength(value) {
+  const text = String(value || '');
+  const lower = text.toLowerCase();
+  for (const [start, end] of CODEX_CONTEXTUAL_USER_WRAPPERS) {
+    if (!lower.startsWith(start.toLowerCase())) continue;
+    const endIndex = lower.indexOf(end.toLowerCase(), start.length);
+    return endIndex < 0 ? 0 : endIndex + end.length;
+  }
+  const external = text.match(/^<external_([^>]+)>/);
+  if (external) {
+    const end = `</external_${external[1]}>`;
+    const endIndex = lower.indexOf(end.toLowerCase(), external[0].length);
+    return endIndex < 0 ? 0 : endIndex + end.length;
+  }
+  const hook = text.match(/^<hook_prompt\s+hook_run_id="[^"]+">/);
+  if (hook) {
+    const end = '</hook_prompt>';
+    const endIndex = lower.indexOf(end, hook[0].length);
+    return endIndex < 0 ? 0 : endIndex + end.length;
+  }
+  const internal = text.match(/^<codex_internal_context source="[a-z][a-z0-9_]*">/);
+  if (internal) {
+    const end = '</codex_internal_context>';
+    const endIndex = lower.indexOf(end, internal[0].length);
+    return endIndex < 0 ? 0 : endIndex + end.length;
+  }
+  if (lower.startsWith('<goal_context>')) {
+    const end = '</goal_context>';
+    const endIndex = lower.indexOf(end, '<goal_context>'.length);
+    return endIndex < 0 ? 0 : endIndex + end.length;
+  }
+  return 0;
+}
+
+export function isCodexContextualUserText(value) {
+  let text = String(value || '').trim();
+  if (!text) return false;
+  if (text.startsWith(LEGACY_EXEC_LIMIT_PREFIX) || text.startsWith(LEGACY_MODEL_MISMATCH_PREFIX)) return true;
+  if (text.startsWith(LEGACY_APPLY_PATCH_PREFIX) && text.endsWith(LEGACY_APPLY_PATCH_SUFFIX)) return true;
+  let matched = false;
+  while (text) {
+    const length = contextualWrapperLength(text);
+    if (!length) return false;
+    matched = true;
+    text = text.slice(length).trim();
+  }
+  return matched;
+}
+
 export function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -41,6 +105,21 @@ export function toText(content) {
   return '';
 }
 
+export function hasPseudoToolCallMarkup(value) {
+  const text = toText(value).trim();
+  if (!text) return false;
+  if (/<[^>]*DSML[^>]*(?:tool_calls|invoke)/i.test(text)) return true;
+  if (/<[^>]*invoke\s+name\s*=/i.test(text)) return true;
+  if (/^\s*```(?:json|xml|dsml)?\s*[\s\S]*\btool_calls\b/i.test(text)) return true;
+  return /^\s*\{[\s\S]*"tool_calls"\s*:/i.test(text);
+}
+
+export function neutralizePseudoToolCallMarkup(value) {
+  return String(value ?? '')
+    .replace(/<([^>]*(?:DSML|\/?invoke\b|tool_calls)[^>]*)>/gi, '⟦$1⟧')
+    .replace(/DSML/gi, 'D·S·M·L');
+}
+
 export function parseBoolean(value, defaultValue = false) {
   if (value == null || value === '') return defaultValue;
   if (typeof value === 'boolean') return value;
@@ -75,22 +154,37 @@ export function joinUrl(baseUrl, path) {
   return `${base}${suffix}`;
 }
 
+export const SSE_PARSER_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+
 export class SseParser {
-  constructor() {
+  constructor({ maxBufferBytes } = {}) {
     this.decoder = new TextDecoder();
     this.buffer = '';
+    this.maxBufferBytes = Number.isFinite(maxBufferBytes) && maxBufferBytes > 0
+      ? maxBufferBytes
+      : SSE_PARSER_MAX_BUFFER_BYTES;
   }
 
   push(chunk) {
     this.buffer += this.decoder.decode(chunk, { stream: true });
     this.buffer = this.buffer.replace(/\r\n/g, '\n');
+    this.enforceBufferLimit();
     return this.drain(false);
   }
 
   end() {
     this.buffer += this.decoder.decode();
     this.buffer = this.buffer.replace(/\r\n/g, '\n');
+    this.enforceBufferLimit();
     return this.drain(true);
+  }
+
+  enforceBufferLimit() {
+    if (this.buffer.length <= this.maxBufferBytes) return;
+    this.buffer = '';
+    const error = new Error(`SSE buffer exceeded ${this.maxBufferBytes} bytes without a frame boundary`);
+    error.code = 'sse_buffer_overflow';
+    throw error;
   }
 
   drain(flush) {

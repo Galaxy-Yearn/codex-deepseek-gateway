@@ -14,6 +14,7 @@ import {
   buildTavilySearchRequest,
   callTavilySearch,
   formatTavilySearchResult,
+  normalizeTavilySearchArgs,
   normalizeTavilySearchResponse,
 } from '../src/tavily.js';
 
@@ -51,6 +52,16 @@ test('Tavily request normalization', async () => {
   assert.deepEqual(request.body.include_domains, ['openai.com', 'developers.openai.com']);
   assert.deepEqual(request.body.exclude_domains, ['example.com', 'spam.test']);
   assert.equal(request.body.time_range, 'week');
+  assert.deepEqual(normalizeTavilySearchArgs(' direct query ', { tavilyMaxResults: 3 }), {
+    ok: true,
+    query: 'direct query',
+    searchDepth: 'basic',
+    maxResults: 3,
+    topic: undefined,
+    timeRange: undefined,
+    includeDomains: [],
+    excludeDomains: [],
+  });
   });
   await scenario('accepts Codex-style web_search search argument', async () => {
   const request = buildTavilySearchRequest({ search: 'crude oil price today' }, { tavilyMaxResults: 5 });

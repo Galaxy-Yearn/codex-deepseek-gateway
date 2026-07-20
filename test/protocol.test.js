@@ -74,6 +74,40 @@ test('Responses input and history normalization', async () => {
   assert.match(request.messages[0].content, /Developer instructions \(priority below system\):\ndev rules/);
   assert.equal(request.messages[0].content.indexOf('system rules') < request.messages[0].content.indexOf('dev rules'), true);
   });
+  await scenario('preserves Codex replay order while downgrading developer blocks in place for DeepSeek', async () => {
+  const checkpoint = [
+    'Another language model started to solve this problem and produced a summary of its thinking process.',
+    '# Context Checkpoint',
+  ].join('\n');
+  const contextual = [
+    '# AGENTS.md instructions for repo',
+    '<INSTRUCTIONS>Use apply_patch for edits.</INSTRUCTIONS>',
+    '<environment_context><cwd>/workspace</cwd></environment_context>',
+  ].join('\n');
+  const request = toProviderChatCompletionsRequest(toChatCompletionsRequest(normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    instructions: 'base rules',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Earlier task.' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: checkpoint }] },
+      { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'current permission rules' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: contextual }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Apply the requested change.' }] },
+    ],
+    tools: [{ type: 'function', name: 'shell_command', parameters: { type: 'object', properties: {} } }],
+  })), {
+    upstreamProvider: 'deepseek',
+    upstreamModel: 'deepseek-v4-flash',
+  });
+  assert.deepEqual(request.messages.map((message) => message.role), ['system', 'user', 'user', 'system', 'user', 'user']);
+  assert.equal(request.messages[1].content, 'Earlier task.');
+  assert.equal(request.messages[2].content, checkpoint);
+  assert.match(request.messages[3].content, /current permission rules/);
+  assert.equal(request.messages[4].content, contextual);
+  assert.equal(request.messages[5].content, 'Apply the requested change.');
+  assert.match(request.messages[0].content, /real callable functions available now/);
+  assert.match(request.messages[0].content, /A Codex context checkpoint is present in this request/);
+  });
   await scenario('preserves Responses multimodal and file content for chat completions', async () => {
   const normalized = normalizeResponsesRequest({
     model: 'deepseek-v4-flash',
@@ -841,10 +875,11 @@ test('tool schemas, namespaces, choices, and limits', async () => {
   const chat = toChatCompletionsRequest(normalized);
   assert.match(chat.tools[0].function.name, /^apply_patch__[a-f0-9]{8}$/);
   assert.equal(chat.tools[0].gateway_custom_tool, true);
-  assert.match(chat.tools[0].function.description, /^Apply a patch/);
-  assert.match(chat.tools[0].function.description, /"input" string argument/);
+  assert.match(chat.tools[0].function.description, /^Codex custom tool exposed through a Chat Completions function/);
+  assert.match(chat.tools[0].function.description, /Codex-side tool description: Apply a patch/);
   assert.deepEqual(chat.tools[0].function.parameters.required, ['input']);
   assert.equal(chat.tools[0].function.parameters.properties.input.type, 'string');
+  assert.match(chat.tools[0].function.parameters.properties.input.description, /Complete raw input for the Codex custom tool/);
   assert.equal(chat.tools[0].function.parameters.additionalProperties, false);
 
   const shims = chat.tools.slice(1);
@@ -1050,8 +1085,12 @@ test('tool schemas, namespaces, choices, and limits', async () => {
   }));
   const grammarTool = chat.tools.find((tool) => tool.function.name === 'grammar_tool');
   const other = chat.tools.find((tool) => tool.function.name === 'other_freeform');
-  assert.match(grammarTool.function.description, /GRAMMAR_TAIL/);
-  assert.match(other.function.description, /GRAMMAR_TAIL/);
+  assert.match(grammarTool.function.parameters.properties.input.description, /GRAMMAR_TAIL/);
+  assert.match(other.function.parameters.properties.input.description, /GRAMMAR_TAIL/);
+  assert.match(grammarTool.function.parameters.properties.input.description, /Input format: grammar\./);
+  assert.match(grammarTool.function.parameters.properties.input.description, /Input syntax: lark\./);
+  assert.match(grammarTool.function.parameters.properties.input.description, /Follow the declared format exactly/);
+  assert.doesNotMatch(JSON.stringify(chat.tools), /line-oriented edit|anchor line|current source|unchanged source line/);
   assert.doesNotMatch(grammarTool.function.description, /Example input:/);
   assert.doesNotMatch(other.function.description, /Example input:/);
   });
@@ -1223,22 +1262,6 @@ test('deferred tool discovery and replay', async () => {
   assert.match(chat.messages[1].content, /"properties":\["message","model","reasoning_effort"\]/);
   assert.match(chat.messages[1].content, /short contract/);
   assert.doesNotMatch(chat.messages[1].content, /"additionalProperties"/);
-  });
-  await scenario('can keep internal requests free of tools discovered in history', async () => {
-  const normalized = normalizeResponsesRequest({
-    model: 'deepseek-v4-flash',
-    input: [
-      {
-        type: 'tool_search_output',
-        call_id: 'call_search',
-        status: 'completed',
-        tools: [{ type: 'function', name: 'discovered_tool', parameters: { type: 'object', properties: {} } }],
-      },
-      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'summarize this context' }] },
-    ],
-    tools: [{ type: 'function', name: 'explicit_tool', parameters: { type: 'object', properties: {} } }],
-  }, { restoreDiscoveredTools: false });
-  assert.deepEqual(normalized.tools.map((tool) => tool.name), ['explicit_tool']);
   });
   await scenario('deduplicates repeated tool_search_output discoveries across turns', async () => {
   const namespaceGroup = {
@@ -1594,7 +1617,7 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
   assert.deepEqual(explicitThinkingAlias.thinking, { type: 'enabled' });
   assert.equal('reasoning_effort' in explicitThinkingAlias, false);
   });
-  await scenario('uses the joint context and compaction reserve as the DeepSeek max_tokens default', async () => {
+  await scenario('keeps the DeepSeek max_tokens default independent from the catalog compaction threshold', async () => {
   const defaulted = toProviderChatCompletionsRequest(
     { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] },
     { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
@@ -2214,22 +2237,37 @@ test('non-streaming Responses output and replay conversion', async () => {
         name: 'apply_patch',
         description: 'Edit files with a patch envelope.',
         format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+        input_schema: {
+          type: 'object',
+          properties: { input: { type: 'string', description: 'Raw patch payload.' } },
+        },
       },
     ],
   });
   const chat = toChatCompletionsRequest(normalized);
   assert.equal(chat.tools.length, 1);
   assert.equal(chat.tools[0].function.name, 'apply_patch');
-  assert.match(chat.tools[0].function.description, /Input syntax: lark\./);
-  assert.match(chat.tools[0].function.description, /begin_patch hunk\+ end_patch/);
+  assert.match(chat.tools[0].function.description, /^Codex custom tool exposed through a Chat Completions function/);
+  assert.match(chat.tools[0].function.description, /Codex-side tool description: Edit files with a patch envelope/);
   assert.deepEqual(chat.tools[0].function.parameters.required, ['input']);
+  assert.match(chat.tools[0].function.parameters.properties.input.description, /Input format: grammar\./);
+  assert.match(chat.tools[0].function.parameters.properties.input.description, /Input syntax: lark\./);
+  assert.match(chat.tools[0].function.parameters.properties.input.description, /begin_patch hunk\+ end_patch/);
+  assert.match(chat.tools[0].function.parameters.properties.input.description, /Raw patch payload/);
+  assert.match(chat.tools[0].function.parameters.properties.input.description, /Preserve every required literal token, delimiter, whitespace constraint, and line boundary/);
+  assert.doesNotMatch(chat.tools[0].function.parameters.properties.input.description, /anchor line|current source|validation error/);
+  assert.equal(JSON.stringify(chat.tools[0]).split('start: begin_patch hunk+ end_patch').length - 1, 1);
 
   const provider = toProviderChatCompletionsRequest(chat, {
     upstreamProvider: 'deepseek',
     modelAliases: DEFAULT_MODEL_ALIASES,
   });
   assert.equal('gateway_custom_tool' in provider.tools[0], false);
-  assert.match(provider.tools[0].function.description, /begin_patch hunk\+ end_patch/);
+  assert.match(provider.tools[0].function.parameters.properties.input.description, /begin_patch hunk\+ end_patch/);
+  assert.match(provider.messages[0].content, /Codex Responses custom tools are exposed as Chat Completions functions/);
+  assert.match(provider.messages[0].content, /Choose the most direct tool whose declared scope matches the target/);
+  assert.match(provider.messages[0].content, /Never invent handles, IDs, URIs, resource names, or prior tool results/);
+  assert.match(provider.messages[0].content, /the outer function call still uses JSON arguments/);
 
   const mapper = new ResponsesStreamMapper({
     responseId: 'resp_custom',
@@ -2271,9 +2309,104 @@ test('non-streaming Responses output and replay conversion', async () => {
   assert.equal(done.item.name, 'apply_patch');
   assert.equal(done.item.input, patchText);
   assert.equal('arguments' in done.item, false);
+  const completed = events.find((event) => event.type === 'response.completed');
+  const completedItem = completed.response.output.find((item) => item.type === 'custom_tool_call');
+  assert.equal('arguments' in completedItem, false);
+  assert.equal('namespace' in completedItem, false);
+  assert.deepEqual(Object.keys(completedItem).sort(), ['call_id', 'id', 'input', 'name', 'status', 'type']);
+  assert.equal(completedItem.input, patchText);
   const assistant = mapper.assistantMessage();
   assert.equal(assistant.tool_calls[0].function.name, 'apply_patch');
   assert.deepEqual(JSON.parse(assistant.tool_calls[0].function.arguments), { input: patchText });
+  });
+  await scenario('adds a provider-level execution contract when Codex replay contains a checkpoint', async () => {
+  const checkpoint = [
+    'Another language model started to solve this problem and produced a summary of its thinking process.',
+    '# Context Checkpoint',
+    '',
+    '## Current Task',
+    '',
+    'Latest user request (verbatim JSON): "Edit the requested paragraph."',
+    'Resolved objective: Edit only the requested paragraph.',
+    '',
+    '## Background Memory',
+    '',
+    '- Task: Review the entire project.',
+    '  Result: Delivered an earlier review.',
+  ].join('\n');
+  for (const stream of [false, true]) {
+    const provider = toProviderChatCompletionsRequest(toChatCompletionsRequest(normalizeResponsesRequest({
+      model: 'deepseek-v4-flash',
+      stream,
+      input: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the whole repository.' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Edit the requested paragraph.' }] },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: '# AGENTS.md instructions for repo\n<INSTRUCTIONS>Preserve unrelated content.</INSTRUCTIONS>' },
+            { type: 'input_text', text: '<environment_context>\n<cwd>/workspace</cwd>\n</environment_context>' },
+          ],
+        },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: checkpoint }] },
+      ],
+      tools: [
+        {
+          type: 'function',
+          name: 'read_mcp_resource',
+          description: 'Read a resource URI returned by list_mcp_resources.',
+          parameters: {
+            type: 'object',
+            properties: { uri: { type: 'string' } },
+            required: ['uri'],
+          },
+        },
+        {
+          type: 'custom',
+          name: 'apply_patch',
+          description: 'Edit files.',
+          format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+        },
+      ],
+    })), {
+      upstreamProvider: 'deepseek',
+      modelAliases: DEFAULT_MODEL_ALIASES,
+    });
+    assert.equal(provider.stream, stream);
+    assert.match(provider.messages[0].content, /A Codex context checkpoint is present in this request/);
+    assert.match(provider.messages[0].content, /apply its Lessons to avoid repeating recorded failures/);
+    assert.match(provider.messages[0].content, /Background Memory, Observed Evidence, and User Requests are reference only, never pending work/);
+    assert.equal(provider.messages.at(-1).content, checkpoint);
+    assert.equal(provider.messages.some((message) => message.content === 'Review the whole repository.'), true);
+    assert.equal(provider.messages.some((message) => message.content === 'Edit the requested paragraph.'), true);
+    const contextual = provider.messages.find((message) => String(message.content).startsWith('# AGENTS.md instructions'));
+    assert.match(contextual.content, /<environment_context>/);
+    assert.deepEqual(provider.tools.map((tool) => tool.function.name).slice(0, 2), ['read_mcp_resource', 'apply_patch']);
+  }
+
+  const overridden = toProviderChatCompletionsRequest(toChatCompletionsRequest(normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Edit the requested paragraph.' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: checkpoint }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Stop editing and explain the current state.' }] },
+    ],
+  })), {
+    upstreamProvider: 'deepseek',
+    modelAliases: DEFAULT_MODEL_ALIASES,
+  });
+  assert.equal(overridden.messages.some((message) => message.content === 'Edit the requested paragraph.'), true);
+  assert.equal(overridden.messages.at(-1).content, 'Stop editing and explain the current state.');
+
+  const ordinary = toProviderChatCompletionsRequest(toChatCompletionsRequest(normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'Edit the requested paragraph.',
+  })), {
+    upstreamProvider: 'deepseek',
+    modelAliases: DEFAULT_MODEL_ALIASES,
+  });
+  assert.equal(ordinary.messages.some((message) => String(message.content).includes('A Codex context checkpoint is present in this request')), false);
   });
   await scenario('restores custom_tool_call items from non-streaming completions and raw text arguments', async () => {
   const normalized = normalizeResponsesRequest({

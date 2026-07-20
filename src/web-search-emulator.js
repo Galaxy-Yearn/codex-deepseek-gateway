@@ -437,6 +437,39 @@ export function knownExternalToolCallsCompletion(completion, tools, webTools) {
   return next;
 }
 
+export function hasVisibleAssistantContent(completion) {
+  const choice = Array.isArray(completion?.choices) ? completion.choices[0] : null;
+  return Boolean(toText(choice?.message?.content).trim());
+}
+
+function hasWebSearchContext(searches, openedPages) {
+  return searches.length > 0 || openedPages.length > 0;
+}
+
+export function webSearchRoundDecision({ routingCompletion, commentaryCalls, round, maxRounds, tools, webTools, searches, openedPages }) {
+  if (hasKnownExternalToolCalls(routingCompletion, tools, webTools)) return { action: 'external' };
+  const wantsInternalWeb = shouldContinueWebSearchLoop(routingCompletion, webTools);
+  const wantsInternalRound = wantsInternalWeb || commentaryCalls.length > 0;
+  const hasToolCalls = hasAnyToolCalls(routingCompletion);
+  if (!wantsInternalRound || round >= maxRounds) {
+    if (hasToolCalls && hasUnknownExternalToolCalls(routingCompletion, tools, webTools)) {
+      return {
+        action: 'final_answer',
+        unsupportedMessages: unhandledToolMessagesFromCompletion(routingCompletion, undefined, {
+          onlyUnknownExternal: true,
+          tools,
+          webTools,
+        }),
+      };
+    }
+    if (wantsInternalRound || (!hasToolCalls && hasWebSearchContext(searches, openedPages) && !hasVisibleAssistantContent(routingCompletion))) {
+      return { action: 'final_answer', unsupportedMessages: [] };
+    }
+    return { action: 'finish' };
+  }
+  return { action: 'continue' };
+}
+
 export function maxWebSearchRounds(config = {}) {
   const value = Number(config.tavilyMaxSearchRounds);
   if (!Number.isFinite(value)) return 20;
@@ -661,6 +694,57 @@ export async function executeWebSearchCalls({ completion, config = {}, webTools,
   }
 
   return { messages, searches, openedPages };
+}
+
+function commentaryToolMessages(commentaryCalls) {
+  return (Array.isArray(commentaryCalls) ? commentaryCalls : []).map((toolCall) => ({
+    role: 'tool',
+    tool_call_id: toolCall.id || generateId('call'),
+    content: 'Delivered to the user.',
+  }));
+}
+
+export function advanceWebSearchChatRequest(currentChatRequest, { toolResult, commentaryCalls, webTools }) {
+  return {
+    ...currentChatRequest,
+    messages: currentChatRequest.messages.concat(toolResult.messages, commentaryToolMessages(commentaryCalls)),
+    tool_choice:
+      currentChatRequest.tool_choice?.function?.name === webTools.search && toolResult.searches.length
+        ? 'auto'
+        : currentChatRequest.tool_choice,
+  };
+}
+
+function webToolTimeoutMs(config = {}) {
+  const tavilyTimeout = Number(config.tavilyTimeoutMs) || 15000;
+  if (!firecrawlReady(config)) return tavilyTimeout;
+  const firecrawlTimeout = Number(config.firecrawlTimeoutMs) || 30000;
+  return Math.max(tavilyTimeout, firecrawlTimeout);
+}
+
+function mergeAbortSignals(signals) {
+  const active = signals.filter(Boolean);
+  if (!active.length) return undefined;
+  if (active.length === 1) return active[0];
+  return AbortSignal.any(active);
+}
+
+export async function executeWebSearchRound({ completion, config = {}, webTools, webCache, clientSignal, onSearchStart, onSearchDone } = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), webToolTimeoutMs(config));
+  try {
+    return await executeWebSearchCalls({
+      completion,
+      config,
+      webTools,
+      webCache,
+      signal: mergeAbortSignals([controller.signal, clientSignal]),
+      onSearchStart,
+      onSearchDone,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export function shouldIncludeSearchSources(normalized) {

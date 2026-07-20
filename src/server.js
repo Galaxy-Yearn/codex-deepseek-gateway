@@ -1,15 +1,23 @@
 import http from 'node:http';
 import { appendFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
-import { generateId, safeJsonParse, toText } from './common.js';
+import { generateId, hasPseudoToolCallMarkup, safeJsonParse, toText } from './common.js';
+import {
+  CompactionError,
+  createCompactionPlan,
+  readCodexCompactionMetadata,
+  runCompactionPlan,
+} from './compaction.js';
 import { listModels, mergeModelLists, normalizeModelList } from './model-map.js';
 import {
   assistantMessageFromResponseOutput,
   bridgedCommentaryToolCallsFromMessage,
   chatToolNamesFromTools,
   convertChatCompletionToResponses,
+  createResponseEnvelope,
   expandParallelToolCallsInCompletion,
   extractToolCallIdsFromMessages,
   normalizeResponsesRequest,
@@ -22,24 +30,37 @@ import {
   unavailableWebSearchToolShims,
 } from './protocol.js';
 import { ReasoningCache } from './reasoning-cache.js';
+import {
+  closeServerGracefully,
+  connectHttpUrl,
+  createControlServer,
+  DEFAULT_REQUEST_BODY_MAX_BYTES,
+  listenServer,
+  positiveInteger,
+  removeRuntimeRecord,
+  writeRuntimeRecord,
+} from './runtime.js';
 import { callChatCompletions, callModels, readJsonResponse, relayChatCompletionsResponse } from './upstream.js';
 import {
+  advanceWebSearchChatRequest,
   annotateMessagePartWithWebCitations,
   applyWebSearchOutputCompatibility,
   buildWebSearchCallItem,
   containsWebSearchTool,
-  executeWebSearchCalls,
-  hasAnyToolCalls,
-  hasKnownExternalToolCalls,
-  hasUnknownExternalToolCalls,
+  executeWebSearchRound,
+  hasVisibleAssistantContent,
   maxWebSearchRounds,
   prepareWebSearchRequest,
   removeWebSearchInstructions,
   shouldIncludeSearchSources,
-  shouldContinueWebSearchLoop,
   knownExternalToolCallsCompletion,
-  unhandledToolMessagesFromCompletion,
+  webSearchRoundDecision,
 } from './web-search-emulator.js';
+
+export { closeServerGracefully } from './runtime.js';
+
+const require = createRequire(import.meta.url);
+const packageJson = require('../package.json');
 
 function sendJson(res, statusCode, payload, headers = {}) {
   if (res.destroyed || res.writableEnded) return;
@@ -50,23 +71,37 @@ function sendJson(res, statusCode, payload, headers = {}) {
   res.end(JSON.stringify(payload));
 }
 
-async function readRequestBody(req) {
+function requestBodyTooLarge(maxBytes) {
+  const error = new Error(`Request body exceeds ${maxBytes} bytes`);
+  error.statusCode = 413;
+  error.code = 'request_body_too_large';
+  return error;
+}
+
+async function readRequestBody(req, configuredMaxBytes) {
+  const maxBytes = positiveInteger(configuredMaxBytes, DEFAULT_REQUEST_BODY_MAX_BYTES);
+  const contentLength = Number(req.headers['content-length']);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    req.resume();
+    throw requestBodyTooLarge(maxBytes);
+  }
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return Buffer.concat(chunks).toString('utf8');
+  let totalBytes = 0;
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.length;
+    if (totalBytes > maxBytes) {
+      req.resume();
+      throw requestBodyTooLarge(maxBytes);
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks, totalBytes).toString('utf8');
 }
 
 function getRequestPath(req) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   return url.pathname;
-}
-
-function codexRequestKind(req) {
-  const value = req.headers['x-codex-turn-metadata'];
-  if (typeof value !== 'string') return '';
-  const parsed = safeJsonParse(value);
-  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') return '';
-  return String(parsed.value.request_kind || '');
 }
 
 function isAuthorized(req, config) {
@@ -78,30 +113,29 @@ function isAuthorized(req, config) {
 
 function prependMissingAssistantToolMessages(messages, reasoningCache) {
   const existingToolCallIds = new Set();
-  const missingToolOutputIds = [];
   for (const message of messages) {
     if (message?.role === 'assistant' && Array.isArray(message.tool_calls)) {
       for (const toolCall of message.tool_calls) {
         if (toolCall?.id) existingToolCallIds.add(toolCall.id);
       }
-      continue;
-    }
-    if (message?.role === 'tool' && message.tool_call_id && !existingToolCallIds.has(message.tool_call_id)) {
-      missingToolOutputIds.push(message.tool_call_id);
     }
   }
-
-  if (!missingToolOutputIds.length) return messages;
-  const prefix = [];
   const inserted = new Set(existingToolCallIds);
-  for (const callId of missingToolOutputIds) {
-    if (inserted.has(callId)) continue;
-    const assistantMessage = reasoningCache.getAssistantMessageForToolCall(callId);
-    if (!assistantMessage) continue;
-    prefix.push(assistantMessage);
-    for (const id of extractToolCallIdsFromMessages([assistantMessage])) inserted.add(id);
+  const restored = [];
+  let changed = false;
+  for (const message of messages) {
+    const callId = message?.role === 'tool' ? message.tool_call_id : '';
+    if (callId && !inserted.has(callId)) {
+      const assistantMessage = reasoningCache.getAssistantMessageForToolCall(callId);
+      if (assistantMessage) {
+        restored.push(assistantMessage);
+        for (const id of extractToolCallIdsFromMessages([assistantMessage])) inserted.add(id);
+        changed = true;
+      }
+    }
+    restored.push(message);
   }
-  return prefix.length ? prefix.concat(messages) : messages;
+  return changed ? restored : messages;
 }
 
 function restoreAssistantReasoningContent(messages, reasoningCache) {
@@ -194,6 +228,11 @@ function logDebugPayload(config, request, context = {}) {
   writeDebugPayloadLine(config, `[codex-deepseek-gateway] upstream request ${JSON.stringify(summary)}\n`);
 }
 
+function logCompactionDiagnostic(config, diagnostic) {
+  if (!config.debugPayload) return;
+  writeDebugPayloadLine(config, `[codex-deepseek-gateway] compact ${JSON.stringify(diagnostic)}\n`);
+}
+
 function resolveReasoningStreamMode(config, upstreamRequest) {
   if (String(config.codexHideAgentReasoning).toLowerCase() === 'true') {
     return { emitReasoningSummary: false, emitReasoningText: false };
@@ -215,13 +254,6 @@ function disableStreaming(request) {
     stream: false,
     stream_options: undefined,
   };
-}
-
-function webToolTimeoutMs(config = {}) {
-  const tavilyTimeout = Number(config.tavilyTimeoutMs) || 15000;
-  if (!config.firecrawlWebFetchEnabled || !config.firecrawlApiKey) return tavilyTimeout;
-  const firecrawlTimeout = Number(config.firecrawlTimeoutMs) || 30000;
-  return Math.max(tavilyTimeout, firecrawlTimeout);
 }
 
 function combineUsage(completions) {
@@ -300,27 +332,15 @@ function completionMessage(completion) {
   return choice?.message || null;
 }
 
-function hasVisibleAssistantContent(completion) {
-  return Boolean(toText(completionMessage(completion)?.content).trim());
-}
-
 function pseudoToolCallContentReason(completion) {
   const text = toText(completionMessage(completion)?.content).trim();
   if (!text) return null;
-  if (/<[^>]*DSML[^>]*tool_calls/i.test(text)) return 'pseudo_tool_call_text_after_web_limit';
-  if (/<[^>]*invoke\s+name\s*=/i.test(text)) return 'pseudo_tool_call_text_after_web_limit';
-  if (/^\s*```(?:json|xml|dsml)?\s*[\s\S]*\btool_calls\b/i.test(text)) return 'pseudo_tool_call_text_after_web_limit';
-  if (/^\s*\{[\s\S]*"tool_calls"\s*:/i.test(text)) return 'pseudo_tool_call_text_after_web_limit';
-  return null;
+  return hasPseudoToolCallMarkup(text) ? 'pseudo_tool_call_text_after_web_limit' : null;
 }
 
 function finalAnswerIncompleteReason(completion) {
   if (!hasVisibleAssistantContent(completion)) return 'no_visible_assistant_content';
   return pseudoToolCallContentReason(completion);
-}
-
-function hasWebSearchContext(searches, openedPages) {
-  return searches.length > 0 || openedPages.length > 0;
 }
 
 function gatewayIncompleteMessageContent(reason) {
@@ -382,21 +402,6 @@ function clientAbortControllerFor(res) {
     if (!res.writableEnded) controller.abort();
   });
   return controller;
-}
-
-function mergeAbortSignals(signals) {
-  const active = signals.filter(Boolean);
-  if (!active.length) return undefined;
-  if (active.length === 1) return active[0];
-  return AbortSignal.any(active);
-}
-
-function commentaryToolMessages(commentaryCalls) {
-  return (Array.isArray(commentaryCalls) ? commentaryCalls : []).map((toolCall) => ({
-    role: 'tool',
-    tool_call_id: toolCall.id || generateId('call'),
-    content: 'Delivered to the user.',
-  }));
 }
 
 function restoreCommentaryToolCalls(completion, commentaryCalls) {
@@ -477,7 +482,22 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
     const commentaryCalls = bridgedCommentaryToolCallsFromMessage(roundChatMessage, currentChatRequest.tools);
     const routingData = stripBridgedCommentaryFromCompletion(data, currentChatRequest.tools);
 
-    if (state.enabled && hasKnownExternalToolCalls(routingData, currentChatRequest.tools, webTools)) {
+    if (!state.enabled) {
+      break;
+    }
+
+    const decision = webSearchRoundDecision({
+      routingCompletion: routingData,
+      commentaryCalls,
+      round,
+      maxRounds,
+      tools: currentChatRequest.tools,
+      webTools,
+      searches,
+      openedPages,
+    });
+
+    if (decision.action === 'external') {
       finalCompletion = restoreCommentaryToolCalls(
         knownExternalToolCallsCompletion(routingData, currentChatRequest.tools, webTools),
         commentaryCalls,
@@ -486,63 +506,31 @@ async function runWebSearchChatLoop({ rawRequest, normalized, chatRequest, confi
       break;
     }
 
-    if (!state.enabled) {
+    if (decision.action === 'finish') {
       break;
     }
 
-    const wantsInternalWeb = shouldContinueWebSearchLoop(routingData, webTools);
-    const wantsInternalRound = wantsInternalWeb || commentaryCalls.length > 0;
-    const hasToolCalls = hasAnyToolCalls(routingData);
-
-    if (!wantsInternalRound || round >= maxRounds) {
-      if (hasToolCalls && hasUnknownExternalToolCalls(routingData, currentChatRequest.tools, webTools)) {
-        const unsupportedMessages = unhandledToolMessagesFromCompletion(routingData, undefined, {
-          onlyUnknownExternal: true,
-          tools: currentChatRequest.tools,
-          webTools,
-        });
-        const finalAnswerError = await requestFinalAnswer({
-          ...currentChatRequest,
-          messages: currentChatRequest.messages.concat(unsupportedMessages),
-        });
-        if (finalAnswerError) return finalAnswerError;
-        break;
-      }
-
-      if (wantsInternalRound || (!hasToolCalls && hasWebSearchContext(searches, openedPages) && !hasVisibleAssistantContent(routingData))) {
-        const finalAnswerError = await requestFinalAnswer(currentChatRequest);
-        if (finalAnswerError) return finalAnswerError;
-        break;
-      }
-      break;
-    }
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), webToolTimeoutMs(searchConfig));
-    let toolResult;
-    try {
-      toolResult = await executeWebSearchCalls({
-        completion: data,
-        config: searchConfig,
-        webTools,
-        webCache,
-        signal: mergeAbortSignals([controller.signal, clientSignal]),
-        onSearchStart,
-        onSearchDone,
+    if (decision.action === 'final_answer') {
+      const finalAnswerError = await requestFinalAnswer({
+        ...currentChatRequest,
+        messages: currentChatRequest.messages.concat(decision.unsupportedMessages),
       });
-    } finally {
-      clearTimeout(timeout);
+      if (finalAnswerError) return finalAnswerError;
+      break;
     }
+
+    const toolResult = await executeWebSearchRound({
+      completion: data,
+      config: searchConfig,
+      webTools,
+      webCache,
+      clientSignal,
+      onSearchStart,
+      onSearchDone,
+    });
     searches.push(...toolResult.searches);
     openedPages.push(...(toolResult.openedPages || []));
-    currentChatRequest = {
-      ...currentChatRequest,
-      messages: currentChatRequest.messages.concat(toolResult.messages, commentaryToolMessages(commentaryCalls)),
-      tool_choice:
-        currentChatRequest.tool_choice?.function?.name === webTools.search && toolResult.searches.length
-          ? 'auto'
-          : currentChatRequest.tool_choice,
-    };
+    currentChatRequest = advanceWebSearchChatRequest(currentChatRequest, { toolResult, commentaryCalls, webTools });
   }
 
   const usages = completions.map((completion) => completion?.usage).filter(Boolean);
@@ -594,6 +582,142 @@ function startStreamHeartbeat({ config, res, write }) {
 function writeSseEvent(res, event) {
   if (res.writableEnded || res.destroyed) return;
   res.write(serializeResponsesSseEvent(event));
+}
+
+function compactionErrorDetails(error) {
+  if (error instanceof CompactionError) {
+    return {
+      code: error.code,
+      message: error.message,
+      statusCode: error.statusCode,
+    };
+  }
+  return {
+    code: 'compact_failed',
+    message: error?.message || 'Compact request failed.',
+    statusCode: 500,
+  };
+}
+
+async function handleCompactionResponses({
+  request,
+  normalized,
+  chatRequest,
+  metadata,
+  config,
+  res,
+  clientSignal,
+}) {
+  let plan;
+  try {
+    plan = createCompactionPlan({
+      rawRequest: request,
+      normalized,
+      chatRequest,
+      metadata,
+      config,
+    });
+  } catch (error) {
+    const details = compactionErrorDetails(error);
+    sendJson(res, details.statusCode, { error: { code: details.code, message: details.message } });
+    return;
+  }
+
+  if (!plan.upstreamRequest.model) {
+    sendJson(res, 400, { error: { message: 'Missing model' } });
+    return;
+  }
+  if (!config.upstreamApiKey) {
+    sendJson(res, 500, { error: { message: 'Missing UPSTREAM_API_KEY' } });
+    return;
+  }
+
+  const responseId = generateId('resp');
+  const run = () => runCompactionPlan(plan, {
+    signal: clientSignal,
+    onDiagnostic: (diagnostic) => logCompactionDiagnostic(config, diagnostic),
+  });
+
+  if (!request.stream) {
+    try {
+      const result = await run();
+      const payload = convertChatCompletionToResponses({
+        completion: result.completion,
+        model: result.upstreamRequest.model,
+        normalized: plan.responseNormalized,
+        responseId,
+        config,
+      });
+      sendJson(res, 200, payload);
+    } catch (error) {
+      if (clientSignal.aborted) return;
+      const details = compactionErrorDetails(error);
+      const payload = createResponseEnvelope({
+        id: responseId,
+        model: plan.upstreamRequest.model,
+        status: 'failed',
+        normalized: plan.responseNormalized,
+        completedAt: Date.now() / 1000,
+        error: { code: details.code, message: details.message },
+      });
+      sendJson(res, 200, payload);
+    }
+    return;
+  }
+
+  const mapper = new ResponsesStreamMapper({
+    responseId,
+    model: plan.upstreamRequest.model,
+    createdAt: Math.floor(Date.now() / 1000),
+    normalized: plan.responseNormalized,
+    config,
+    emitReasoningSummary: false,
+    emitReasoningText: false,
+    knownToolNames: [],
+  });
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+  });
+  writeSseEvent(res, mapper.createdEvent());
+  writeSseEvent(res, mapper.inProgressEvent());
+  const heartbeat = startStreamHeartbeat({
+    config,
+    res,
+    write: () => writeSseEvent(res, mapper.inProgressEvent()),
+  });
+
+  try {
+    const result = await run();
+    if (clientSignal.aborted) return;
+    for (const event of mapper.mapChatEvent({ data: result.completion })) {
+      writeSseEvent(res, event);
+      heartbeat.activity();
+    }
+    for (const event of mapper.mapChatEvent({ done: true })) {
+      writeSseEvent(res, event);
+      heartbeat.activity();
+    }
+    writeSseEvent(res, { done: true });
+    res.end();
+  } catch (error) {
+    if (clientSignal.aborted) return;
+    const details = compactionErrorDetails(error);
+    const response = mapper.response('failed');
+    response.completed_at = Math.floor(Date.now() / 1000);
+    response.error = { code: details.code, message: details.message };
+    writeSseEvent(res, {
+      type: 'response.failed',
+      sequence_number: mapper.nextSequence(),
+      response,
+    });
+    writeSseEvent(res, { done: true });
+    res.end();
+  } finally {
+    heartbeat.stop();
+  }
 }
 
 function webSearchSseWriter({ writeEvent, mapper, outputIndexBySearch, includeSources = false }) {
@@ -772,7 +896,18 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
         return finishTurn();
       }
 
-      if (hasKnownExternalToolCalls(routingCompletion, currentChatRequest.tools, webTools)) {
+      const decision = webSearchRoundDecision({
+        routingCompletion,
+        commentaryCalls,
+        round,
+        maxRounds,
+        tools: currentChatRequest.tools,
+        webTools,
+        searches,
+        openedPages,
+      });
+
+      if (decision.action === 'external') {
         const kept = knownExternalToolCallsCompletion(routingCompletion, currentChatRequest.tools, webTools);
         const keptIds = new Set(
           (kept.choices?.[0]?.message?.tool_calls || []).map((toolCall) => toolCall.id).filter(Boolean),
@@ -781,26 +916,15 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
         return finishTurn();
       }
 
-      const wantsInternalWeb = shouldContinueWebSearchLoop(routingCompletion, webTools);
-      const wantsInternalRound = wantsInternalWeb || commentaryCalls.length > 0;
-      const hasToolCallsRound = hasAnyToolCalls(routingCompletion);
+      if (decision.action === 'finish') {
+        return finishTurn();
+      }
 
-      if (!wantsInternalRound || round >= maxRounds) {
-        if (hasToolCallsRound && hasUnknownExternalToolCalls(routingCompletion, currentChatRequest.tools, webTools)) {
-          const unsupportedMessages = unhandledToolMessagesFromCompletion(routingCompletion, undefined, {
-            onlyUnknownExternal: true,
-            tools: currentChatRequest.tools,
-            webTools,
-          });
-          currentChatRequest = toolCallsToFinalAnswerRequest({
-            ...currentChatRequest,
-            messages: currentChatRequest.messages.concat(unsupportedMessages),
-          }, webTools);
-        } else if (wantsInternalRound || (!hasToolCallsRound && hasWebSearchContext(searches, openedPages) && !hasVisibleAssistantContent(routingCompletion))) {
-          currentChatRequest = toolCallsToFinalAnswerRequest(currentChatRequest, webTools);
-        } else {
-          return finishTurn();
-        }
+      if (decision.action === 'final_answer') {
+        currentChatRequest = toolCallsToFinalAnswerRequest({
+          ...currentChatRequest,
+          messages: currentChatRequest.messages.concat(decision.unsupportedMessages),
+        }, webTools);
         finalAnswerForced = true;
         roundUsages.push({ usage: mapper.pendingUsage });
         mapper.removeToolItems();
@@ -809,39 +933,25 @@ async function runStreamingWebSearchTurn({ rawRequest, normalized, chatRequest, 
       } else {
         roundUsages.push({ usage: mapper.pendingUsage });
         for (const event of mapper.beginNextRound()) writeEvent(event);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), webToolTimeoutMs(searchConfig));
-        let toolResult;
-        try {
-          toolResult = await executeWebSearchCalls({
-            completion: completionLike,
-            config: searchConfig,
-            webTools,
-            webCache,
-            signal: mergeAbortSignals([controller.signal, clientSignal]),
-            onSearchStart(search) {
-              if (search.action && search.auto) return;
-              streamSearchItems.add(search);
-              searchWriter.start(search);
-            },
-            onSearchDone(search) {
-              if (!streamSearchItems.has(search)) return;
-              searchWriter.done(search);
-            },
-          });
-        } finally {
-          clearTimeout(timeout);
-        }
+        const toolResult = await executeWebSearchRound({
+          completion: completionLike,
+          config: searchConfig,
+          webTools,
+          webCache,
+          clientSignal,
+          onSearchStart(search) {
+            if (search.action && search.auto) return;
+            streamSearchItems.add(search);
+            searchWriter.start(search);
+          },
+          onSearchDone(search) {
+            if (!streamSearchItems.has(search)) return;
+            searchWriter.done(search);
+          },
+        });
         searches.push(...toolResult.searches);
         openedPages.push(...(toolResult.openedPages || []));
-        currentChatRequest = {
-          ...currentChatRequest,
-          messages: currentChatRequest.messages.concat(toolResult.messages, commentaryToolMessages(commentaryCalls)),
-          tool_choice:
-            currentChatRequest.tool_choice?.function?.name === webTools.search && toolResult.searches.length
-              ? 'auto'
-              : currentChatRequest.tool_choice,
-        };
+        currentChatRequest = advanceWebSearchChatRequest(currentChatRequest, { toolResult, commentaryCalls, webTools });
       }
 
       if (clientSignal?.aborted) {
@@ -906,7 +1016,7 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
   }
 
   async function handleResponsesWithState(req, res) {
-    const raw = await readRequestBody(req);
+    const raw = await readRequestBody(req, config.requestBodyMaxBytes);
     const parsed = safeJsonParse(raw);
     if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
       sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
@@ -914,13 +1024,27 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
     }
 
     const request = parsed.value;
-    const normalized = normalizeResponsesRequest(request, {
-      restoreDiscoveredTools: codexRequestKind(req) !== 'compaction',
-    });
+    const compactionState = readCodexCompactionMetadata(request, req.headers);
+    const normalized = normalizeResponsesRequest(request);
     normalized.messages = prependMissingAssistantToolMessages(normalized.messages, reasoningCache);
     normalized.messages = restoreAssistantReasoningContent(normalized.messages, reasoningCache);
 
     const chatRequest = toChatCompletionsRequest(normalized);
+    const clientAbort = clientAbortControllerFor(res);
+    const clientSignal = clientAbort.signal;
+    if (compactionState.isCompaction) {
+      await handleCompactionResponses({
+        request,
+        normalized,
+        chatRequest,
+        metadata: compactionState.metadata,
+        config,
+        res,
+        clientSignal,
+      });
+      return;
+    }
+
     const useWebSearchEmulator = hasTavilyWebSearch(config, normalized);
     if (!useWebSearchEmulator) {
       const existingToolNames = new Set(chatToolNamesFromTools(chatRequest.tools));
@@ -928,8 +1052,6 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
         .filter((tool) => !existingToolNames.has(tool.function.name));
       if (webShims.length) chatRequest.tools = [...(chatRequest.tools ?? []), ...webShims];
     }
-    const clientAbort = clientAbortControllerFor(res);
-    const clientSignal = clientAbort.signal;
     let upstreamRequest = toProviderChatCompletionsRequest(chatRequest, config);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || normalized.model;
 
@@ -1114,7 +1236,7 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
       }
 
       if (req.method === 'POST' && path === '/v1/chat/completions') {
-        const body = safeJsonParse(await readRequestBody(req));
+        const body = safeJsonParse(await readRequestBody(req, config.requestBodyMaxBytes));
         if (!body.ok) {
           sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
           return;
@@ -1158,11 +1280,75 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
   });
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
-if (isMain) {
+function reportShutdownFailure(error) {
+  process.stderr.write(`[codex-deepseek-gateway] graceful shutdown failed: ${error.message || error}\n`);
+  process.exitCode = 1;
+}
+
+function installShutdownSignals(shutdown) {
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+}
+
+async function runMain() {
   const config = loadConfig();
   const server = createProxyServer({ config });
-  server.listen(config.port, config.host, () => {
+  const runtimePath = process.env.GATEWAY_RUNTIME_FILE || '';
+  const instanceId = process.env.GATEWAY_INSTANCE_ID || '';
+  const shutdownToken = process.env.GATEWAY_SHUTDOWN_TOKEN || '';
+  const startedAt = Date.now();
+  const dataUrl = connectHttpUrl(config.host, config.port);
+  let controlServer = null;
+  let shutdownPromise = null;
+  const shutdown = () => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = Promise.all([
+      closeServerGracefully(server, config.shutdownTimeoutMs),
+      controlServer ? closeServerGracefully(controlServer, config.shutdownTimeoutMs) : Promise.resolve(),
+    ]).finally(() => removeRuntimeRecord(runtimePath, instanceId));
+    return shutdownPromise;
+  };
+  const handleShutdown = () => {
+    shutdown().catch(reportShutdownFailure);
+  };
+  installShutdownSignals(handleShutdown);
+
+  try {
+    await listenServer(server, config.port, config.host);
+    if (runtimePath && instanceId && shutdownToken) {
+      controlServer = createControlServer({
+        token: shutdownToken,
+        instanceId,
+        onShutdown: handleShutdown,
+        status: {
+          packageVersion: packageJson.version,
+          startedAt,
+          dataUrl,
+        },
+      });
+      const address = await listenServer(controlServer, 0, '127.0.0.1');
+      writeRuntimeRecord(runtimePath, {
+        version: 3,
+        pid: process.pid,
+        instanceId,
+        controlUrl: `http://127.0.0.1:${address.port}`,
+        shutdownToken,
+        startedAt,
+        packageVersion: packageJson.version,
+        dataUrl,
+      });
+    }
     process.stdout.write(`listening on http://${config.host}:${config.port}\n`);
+  } catch (error) {
+    await shutdown().catch(reportShutdownFailure);
+    throw error;
+  }
+}
+
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMain) {
+  runMain().catch((error) => {
+    process.stderr.write(`${error.message || error}\n`);
+    process.exitCode = 1;
   });
 }

@@ -46,38 +46,64 @@ function defaultCodexConfigPath(env = process.env) {
   return join(home, 'config.toml');
 }
 
-export function readCodexConfig(env = process.env) {
+function parseCodexConfig(env, providerId = '') {
   const filePath = defaultCodexConfigPath(env);
   const result = {
+    filePath,
+    exists: Boolean(filePath && existsSync(filePath)),
     modelProvider: '',
     model: '',
     modelReasoningEffort: '',
     modelReasoningSummary: '',
     modelSupportsReasoningSummaries: '',
     hideAgentReasoning: '',
+    provider: null,
   };
-  if (!filePath || !existsSync(filePath)) return result;
+  if (!result.exists) return result;
 
+  const providerSection = providerId ? `model_providers.${providerId}` : '';
+  const provider = {};
+  let section = '';
   const text = readFileSync(filePath, 'utf8');
-  let inTopLevel = true;
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
-    if (line.startsWith('[')) {
-      inTopLevel = false;
+    const sectionMatch = line.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) {
+      section = sectionMatch[1].trim();
       continue;
     }
-    if (!inTopLevel) continue;
     const match = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
     if (!match) continue;
     const [, key, rawValue] = match;
     const value = unquoteTomlString(stripInlineTomlComment(rawValue));
-    if (key === 'model_provider') result.modelProvider = value;
-    if (key === 'model') result.model = value;
-    if (key === 'model_reasoning_effort') result.modelReasoningEffort = value;
-    if (key === 'model_reasoning_summary') result.modelReasoningSummary = value;
-    if (key === 'model_supports_reasoning_summaries') result.modelSupportsReasoningSummaries = value;
-    if (key === 'hide_agent_reasoning') result.hideAgentReasoning = value;
+    if (!section) {
+      if (key === 'model_provider') result.modelProvider = value;
+      if (key === 'model') result.model = value;
+      if (key === 'model_reasoning_effort') result.modelReasoningEffort = value;
+      if (key === 'model_reasoning_summary') result.modelReasoningSummary = value;
+      if (key === 'model_supports_reasoning_summaries') result.modelSupportsReasoningSummaries = value;
+      if (key === 'hide_agent_reasoning') result.hideAgentReasoning = value;
+    } else if (section === providerSection) {
+      provider[key] = value;
+    }
   }
+  if (providerSection && Object.keys(provider).length) result.provider = provider;
   return result;
+}
+
+export function readCodexConfig(env = process.env) {
+  const parsed = parseCodexConfig(env);
+  return {
+    modelProvider: parsed.modelProvider,
+    model: parsed.model,
+    modelReasoningEffort: parsed.modelReasoningEffort,
+    modelReasoningSummary: parsed.modelReasoningSummary,
+    modelSupportsReasoningSummaries: parsed.modelSupportsReasoningSummaries,
+    hideAgentReasoning: parsed.hideAgentReasoning,
+  };
+}
+
+export function inspectCodexConfig(env = process.env, providerId = 'deepseek-gateway') {
+  return parseCodexConfig(env, providerId);
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import {
   copyFileSync,
   cpSync,
@@ -7,7 +8,6 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
-  writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
@@ -15,7 +15,20 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/config.js';
 import { newConversation } from '../src/codex-launch.js';
 import { DEFAULT_SESSION_LIMIT, sessions } from '../src/codex-sessions.js';
-import { toProviderChatCompletionsRequest } from '../src/protocol.js';
+import {
+  formatGatewayDoctor,
+  formatGatewayStatus,
+  inspectGatewayDoctor,
+  inspectGatewayStatus,
+} from '../src/diagnostics.js';
+import {
+  connectHttpUrl,
+  DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  positiveInteger,
+  readRuntimeRecord,
+  removeRuntimeRecord,
+  SHUTDOWN_TOKEN_HEADER,
+} from '../src/runtime.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -30,6 +43,7 @@ function usage() {
 
 Usage:
   codex-deepseek-gateway install
+  codex-deepseek-gateway update
   codex-deepseek-gateway start
   codex-deepseek-gateway stop
   codex-deepseek-gateway status
@@ -42,6 +56,7 @@ Options:
   -v, --version   Print package version
   --dir <path>     Install directory, defaults to ~/.codex/deepseek-gateway
   --no-edit        Do not open the local config file after install
+  --force          With stop/update, force termination when graceful control is unavailable
   --all            With sessions, include sessions outside the current project
   --provider <id>  With new/sessions, target model_provider override
   --model <id>     With new/sessions, target model override
@@ -50,13 +65,14 @@ Options:
   --exec <id>      With sessions, run the generated codex resume command
   --limit <n>      With sessions, max rows to print or show, defaults to ${DEFAULT_SESSION_LIMIT}
   --print          With sessions, print resume commands instead of picker
+  --json           With status/doctor, print the stable JSON report
 
 Prompt language is configured in gateway.local.json with codexPromptLanguage.
 `);
 }
 
 function parseArgs(argv) {
-  const options = { dir: defaultInstallDir(), noEdit: false, all: false };
+  const options = { dir: defaultInstallDir(), noEdit: false, all: false, force: false };
   const rest = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -71,6 +87,8 @@ function parseArgs(argv) {
       options.noEdit = true;
     } else if (arg === '--all') {
       options.all = true;
+    } else if (arg === '--force') {
+      options.force = true;
     } else if (arg === '--provider') {
       const value = argv[index + 1];
       if (!value) throw new Error(`${arg} requires a provider id`);
@@ -98,6 +116,8 @@ function parseArgs(argv) {
       index += 1;
     } else if (arg === '--print') {
       options.print = true;
+    } else if (arg === '--json') {
+      options.json = true;
     } else {
       rest.push(arg);
     }
@@ -123,9 +143,15 @@ function serverPath(installDir) {
 }
 
 function hasRuntimeMarkers(installDir) {
-  return existsSync(join(installDir, 'package.json')) &&
-    existsSync(join(installDir, 'bin', 'codex-deepseek-gateway.js')) &&
-    existsSync(join(installDir, 'src', 'server.js'));
+  const manifestPath = join(installDir, 'package.json');
+  if (!existsSync(manifestPath) ||
+    !existsSync(join(installDir, 'bin', 'codex-deepseek-gateway.js')) ||
+    !existsSync(join(installDir, 'src', 'server.js'))) return false;
+  try {
+    return JSON.parse(readFileSync(manifestPath, 'utf8')).name === packageJson.name;
+  } catch {
+    return false;
+  }
 }
 
 function loadInstalledConfig(installDir) {
@@ -133,7 +159,7 @@ function loadInstalledConfig(installDir) {
 }
 
 function endpoint(config, path = '') {
-  return `http://${config.host}:${config.port}${path}`;
+  return connectHttpUrl(config.host, config.port, path);
 }
 
 function isConfigured(installDir) {
@@ -156,6 +182,49 @@ async function health(config) {
   }
 }
 
+async function requestControl(url, token, method) {
+  if (!url || !token) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: { [SHUTDOWN_TOKEN_HEADER]: token },
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let body = null;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+    }
+    return { status: response.status, body };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function controlStatus(record) {
+  if (!record.controlUrl || !record.shutdownToken) return false;
+  const result = await requestControl(`${record.controlUrl.replace(/\/$/, '')}/status`, record.shutdownToken, 'GET');
+  return result?.status === 200 &&
+    result.body?.ok === true &&
+    Number(result.body.pid) === record.pid &&
+    result.body.instanceId === record.instanceId;
+}
+
+async function requestShutdown(config, record) {
+  const url = record.controlUrl
+    ? `${record.controlUrl.replace(/\/$/, '')}/shutdown`
+    : record.shutdownToken
+    ? endpoint(config, '/shutdown')
+    : '';
+  const result = await requestControl(url, record.shutdownToken, 'POST');
+  return result?.status === 202;
+}
+
 function processExists(pid) {
   if (!pid) return false;
   try {
@@ -166,54 +235,24 @@ function processExists(pid) {
   }
 }
 
-function killProcess(pid) {
+function forceKillProcess(pid) {
   if (!pid || pid === process.pid) return;
   try {
-    if (process.platform === 'win32') {
-      execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-    } else {
-      process.kill(pid);
-    }
+    process.kill(pid, 'SIGKILL');
   } catch {
   }
 }
 
-function findWindowsPidOnPort(port) {
-  if (process.platform !== 'win32') return 0;
-  try {
-    const output = execFileSync('netstat.exe', ['-ano', '-p', 'tcp'], { encoding: 'utf8', windowsHide: true });
-    const escapedPort = String(port).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`(?:127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\]|\\[::\\]):${escapedPort}\\s+[^\\s]+\\s+LISTENING\\s+(\\d+)`, 'i');
-    for (const line of output.split(/\r?\n/)) {
-      const match = line.match(pattern);
-      if (match) return Number(match[1]) || 0;
-    }
-  } catch {
+async function waitForProcessExit(pid, timeoutMs) {
+  const attempts = Math.max(1, Math.ceil(timeoutMs / 100));
+  for (let index = 0; index < attempts && processExists(pid); index += 1) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   }
-  return 0;
+  return !processExists(pid);
 }
 
-function processCommandLine(pid) {
-  if (process.platform !== 'win32' || !pid) return '';
-  try {
-    const output = execFileSync(
-      'wmic.exe',
-      ['process', 'where', `ProcessId=${pid}`, 'get', 'CommandLine', '/value'],
-      { encoding: 'utf8', windowsHide: true },
-    );
-    const match = output.match(/CommandLine=(.*)/s);
-    return match ? match[1].trim() : '';
-  } catch {
-    return '';
-  }
-}
-
-function readPid(installDir) {
-  try {
-    return Number(readFileSync(pidPath(installDir), 'utf8').trim()) || 0;
-  } catch {
-    return 0;
-  }
+function readProcessRecord(installDir) {
+  return readRuntimeRecord(pidPath(installDir));
 }
 
 function copyRuntime(installDir) {
@@ -264,6 +303,74 @@ async function install(options) {
   await start(options);
 }
 
+function runChild(command, args, label, capture = false) {
+  return new Promise((resolveChild, rejectChild) => {
+    const child = spawn(command, args, {
+      stdio: capture ? ['ignore', 'pipe', 'inherit'] : 'inherit',
+      windowsHide: true,
+    });
+    let stdout = '';
+    if (capture) {
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+      });
+    }
+    child.once('error', (error) => rejectChild(new Error(`Failed to run ${label}: ${error.message}`)));
+    child.once('close', (code, signal) => {
+      if (code === 0) {
+        resolveChild(stdout);
+      } else {
+        rejectChild(new Error(`${label} failed${signal ? ` with signal ${signal}` : ` with exit code ${code}`}`));
+      }
+    });
+  });
+}
+
+function npmProcess(args) {
+  if (process.platform === 'win32') {
+    return {
+      command: process.env.ComSpec || 'cmd.exe',
+      args: ['/d', '/s', '/c', ['npm', ...args].join(' ')],
+    };
+  }
+  return { command: 'npm', args };
+}
+
+function globalPackage(globalRoot) {
+  const packageDir = join(globalRoot, ...packageJson.name.split('/'));
+  const manifestPath = join(packageDir, 'package.json');
+  if (!existsSync(manifestPath)) throw new Error(`Updated package is missing at ${packageDir}`);
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const relativeBin = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin?.['codex-deepseek-gateway'];
+  if (!relativeBin) throw new Error('Updated package does not expose the codex-deepseek-gateway command');
+  const cliPath = resolve(packageDir, relativeBin);
+  if (!existsSync(cliPath)) throw new Error(`Updated gateway CLI is missing at ${cliPath}`);
+  return { cliPath };
+}
+
+async function update(options) {
+  if (!hasRuntimeMarkers(options.dir)) {
+    throw new Error(`Missing runtime at ${options.dir}. Run install first.`);
+  }
+  if (!isConfigured(options.dir)) {
+    throw new Error(`Missing DeepSeek API key in ${configPath(options.dir)} or DEEPSEEK_API_KEY. Run install first.`);
+  }
+  await stop(options);
+  const target = `${packageJson.name}@latest`;
+  print(`Installing ${target} ...\n`);
+  const npmInstall = npmProcess(['install', '-g', target]);
+  await runChild(npmInstall.command, npmInstall.args, 'npm install');
+  const npmRoot = npmProcess(['root', '-g']);
+  const globalRoot = (await runChild(npmRoot.command, npmRoot.args, 'npm root', true)).trim();
+  if (!globalRoot) throw new Error('npm root returned an empty global package path');
+  const updatedPackage = globalPackage(globalRoot);
+  const dirArgs = ['--dir', options.dir];
+  await runChild(process.execPath, [updatedPackage.cliPath, 'install', '--no-edit', ...dirArgs], 'gateway install');
+  await runChild(process.execPath, [updatedPackage.cliPath, 'status', ...dirArgs], 'gateway status');
+  await runChild(process.execPath, [updatedPackage.cliPath, 'doctor', ...dirArgs], 'gateway doctor');
+}
+
 async function start(options) {
   if (!existsSync(options.dir)) {
     throw new Error(`Missing runtime at ${options.dir}. Run install first.`);
@@ -276,66 +383,96 @@ async function start(options) {
     throw new Error(`Missing DeepSeek API key in ${configPath(options.dir)} or DEEPSEEK_API_KEY`);
   }
   const config = loadInstalledConfig(options.dir);
+  const existingRecord = readProcessRecord(options.dir);
   const currentHealth = await health(config);
+  const existingProcess = processExists(existingRecord.pid);
+  const managedProcess = existingProcess && (
+    await controlStatus(existingRecord) ||
+    (!existingRecord.controlUrl && currentHealth?.ok)
+  );
+  if (managedProcess) {
+    print('Gateway is already running.\n');
+    return;
+  }
+  if (existingProcess) {
+    throw new Error(`Recorded PID ${existingRecord.pid} cannot be authenticated. Inspect ${pidPath(options.dir)} before starting another gateway.`);
+  }
   if (currentHealth?.ok) {
-    const pid = readPid(options.dir);
-    const message = processExists(pid)
-      ? 'Gateway is already running.\n'
-      : `Gateway is already reachable at ${endpoint(config)}. Another install may already be running.\n`;
-    print(message);
+    print(`Gateway is already reachable at ${endpoint(config)}. Another install may already be running.\n`);
     return;
   }
 
   mkdirSync(options.dir, { recursive: true });
   const out = 'ignore';
+  const shutdownToken = randomBytes(32).toString('hex');
+  const instanceId = randomBytes(16).toString('hex');
+  const runtimeFile = pidPath(options.dir);
+  removeRuntimeRecord(runtimeFile);
   print(`Starting gateway on ${endpoint(config)} ...\n`);
   const child = spawn(process.execPath, [serverPath(options.dir)], {
     cwd: options.dir,
     detached: true,
+    env: {
+      ...process.env,
+      GATEWAY_INSTANCE_ID: instanceId,
+      GATEWAY_RUNTIME_FILE: runtimeFile,
+      GATEWAY_SHUTDOWN_TOKEN: shutdownToken,
+    },
     stdio: ['ignore', out, out],
     windowsHide: true,
   });
-  writeFileSync(pidPath(options.dir), String(child.pid));
   child.unref();
 
   for (let index = 0; index < 20; index += 1) {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
-    const ready = await health(config);
-    if (ready?.ok) {
+    const record = readProcessRecord(options.dir);
+    const ready = record.pid === child.pid &&
+      record.instanceId === instanceId &&
+      await controlStatus(record) &&
+      Boolean((await health(config))?.ok);
+    if (ready) {
       print(`Gateway started. PID ${child.pid}\n`);
       return;
     }
+    if (!processExists(child.pid)) break;
   }
+  if (processExists(child.pid)) {
+    forceKillProcess(child.pid);
+    await waitForProcessExit(child.pid, 2000);
+  }
+  removeRuntimeRecord(runtimeFile, instanceId);
   throw new Error(`Gateway did not become reachable on ${endpoint(config)}`);
 }
 
 async function stop(options) {
   const config = loadInstalledConfig(options.dir);
-  const pid = readPid(options.dir);
-  const hadManagedPid = processExists(pid);
-  let killedPortProcess = false;
-  if (processExists(pid)) {
-    killProcess(pid);
-    for (let index = 0; index < 20 && processExists(pid); index += 1) {
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  const record = readProcessRecord(options.dir);
+  const pid = record.pid;
+  const pidRunning = processExists(pid);
+  if (pidRunning) {
+    const graceful = await requestShutdown(config, record);
+    if (!graceful && !options.force) {
+      throw new Error(`Gateway process ${pid} could not be authenticated for graceful shutdown. Re-run stop with --force only after verifying ${pidPath(options.dir)}.`);
     }
-  }
-  const portPid = findWindowsPidOnPort(config.port);
-  if (portPid && portPid !== pid) {
-    const commandLine = processCommandLine(portPid);
-    if (commandLine.includes(serverPath(options.dir))) {
-      killProcess(portPid);
-      killedPortProcess = true;
-      for (let index = 0; index < 20 && processExists(portPid); index += 1) {
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    if (graceful) {
+      const waitMs = positiveInteger(config.shutdownTimeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS) + 2000;
+      if (!await waitForProcessExit(pid, waitMs) && !options.force) {
+        throw new Error(`Gateway process ${pid} did not exit after graceful shutdown. Re-run stop with --force to terminate it.`);
       }
     }
+    if (processExists(pid) && options.force) {
+      forceKillProcess(pid);
+      await waitForProcessExit(pid, 2000);
+    }
+    if (processExists(pid)) {
+      throw new Error(`Gateway process ${pid} is still running.`);
+    }
   }
-  rmSync(pidPath(options.dir), { force: true });
+  removeRuntimeRecord(pidPath(options.dir), record.instanceId);
   const running = await health(config);
   if (!running?.ok) {
     print('Gateway stopped.\n');
-  } else if (!hadManagedPid && !killedPortProcess) {
+  } else if (!pidRunning) {
     print(`No gateway process is recorded for this install. ${endpoint(config)} is still reachable, likely from another install.\n`);
   } else {
     print(`Gateway may still be running on ${endpoint(config)}.\n`);
@@ -343,82 +480,15 @@ async function stop(options) {
 }
 
 async function status(options) {
-  const config = loadInstalledConfig(options.dir);
-  const pid = readPid(options.dir);
-  const running = await health(config);
-  const versionPath = join(options.dir, 'package.json');
-  const installedVersion = existsSync(versionPath) ? JSON.parse(readFileSync(versionPath, 'utf8')).version : '';
-  print(JSON.stringify({
-    installed: existsSync(options.dir),
-    installDir: options.dir,
-    configPath: configPath(options.dir),
-    pid,
-    pidRunning: processExists(pid),
-    reachable: Boolean(running?.ok),
-    url: endpoint(config),
-    version: installedVersion || packageJson.version,
-  }, null, 2));
-  print('\n');
+  const report = await inspectGatewayStatus({ installDir: options.dir, cliVersion: packageJson.version });
+  print(options.json ? `${JSON.stringify(report, null, 2)}\n` : formatGatewayStatus(report));
+  if (report.state !== 'healthy') process.exitCode = 1;
 }
 
 async function doctor(options) {
-  const config = loadInstalledConfig(options.dir);
-  const codexConfigUsingGateway = config.codexModelProvider === 'deepseek-gateway';
-  const model = codexConfigUsingGateway && config.codexModel ? config.codexModel : 'deepseek-v4-pro';
-  const upstreamRequest = toProviderChatCompletionsRequest(
-    {
-      model,
-      messages: [{ role: 'user', content: 'ping' }],
-      stream: true,
-    },
-    config,
-  );
-  const supportsReasoningSummaries = String(config.codexModelSupportsReasoningSummaries).toLowerCase() === 'true';
-  const summaryMode = String(config.codexReasoningSummary || '').toLowerCase();
-  const hideAgentReasoning = String(config.codexHideAgentReasoning).toLowerCase() === 'true';
-  const thinkingEnabled = upstreamRequest.thinking?.type === 'enabled';
-  const summaryEnabled = Boolean(summaryMode) &&
-    summaryMode !== 'none' &&
-    summaryMode !== 'disabled' &&
-    summaryMode !== 'off' &&
-    summaryMode !== 'false';
-  const codexReasoningSummaryEnabled = supportsReasoningSummaries && summaryEnabled;
-  const gatewayStreamingReasoningSummary = !hideAgentReasoning && thinkingEnabled;
-  const reasoningDisplayMode = hideAgentReasoning
-    ? 'hidden'
-    : thinkingEnabled && codexReasoningSummaryEnabled
-    ? 'summary'
-    : thinkingEnabled
-    ? 'upstream-only'
-    : 'disabled';
-  print(JSON.stringify({
-    packageVersion: packageJson.version,
-    installDir: options.dir,
-    localConfig: configPath(options.dir),
-    codexConfigUsingGateway,
-    codexModelProvider: config.codexModelProvider || null,
-    codexModel: config.codexModel || null,
-    codexReasoningEffort: config.codexReasoningEffort || null,
-    codexReasoningSummary: config.codexReasoningSummary || null,
-    codexModelSupportsReasoningSummaries: config.codexModelSupportsReasoningSummaries || null,
-    codexHideAgentReasoning: config.codexHideAgentReasoning || null,
-    codexPromptLanguage: config.codexPromptLanguage,
-    codexModelCatalog: join(options.dir, 'config', config.codexPromptLanguage === 'zh' ? 'codex-model-catalog.zh.json' : 'codex-model-catalog.json'),
-    sampleModel: model,
-    upstreamModel: upstreamRequest.model,
-    deepseekThinking: upstreamRequest.thinking || null,
-    deepseekReasoningEffort: upstreamRequest.reasoning_effort || null,
-    codexReasoningSummaryEnabled,
-    gatewayStreamingReasoningSummary,
-    reasoningDisplayMode,
-    tavilyWebSearchEnabled: Boolean(config.tavilyWebSearchEnabled),
-    tavilyWebSearchReady: Boolean(config.tavilyWebSearchEnabled && config.tavilyApiKey),
-    firecrawlWebFetchEnabled: Boolean(config.firecrawlWebFetchEnabled),
-    firecrawlWebFetchReady: Boolean(config.firecrawlWebFetchEnabled && config.firecrawlApiKey),
-    firecrawlAutoScrapeTopResults: config.firecrawlAutoScrapeTopResults,
-    hint: 'The gateway exposes model aliases on /v1/models. The launcher passes model_catalog_json for Codex multi-agent validation; plain codex commands must pass that override themselves.',
-  }, null, 2));
-  print('\n');
+  const report = await inspectGatewayDoctor({ installDir: options.dir, cliVersion: packageJson.version });
+  print(options.json ? `${JSON.stringify(report, null, 2)}\n` : formatGatewayDoctor(report));
+  if (report.overallStatus === 'fail') process.exitCode = 1;
 }
 
 async function uninstall(options) {
@@ -432,11 +502,7 @@ async function uninstall(options) {
   if (!hasRuntimeMarkers(options.dir)) {
     throw new Error(`Refusing to remove ${options.dir}: it does not look like a codex-deepseek-gateway install directory.`);
   }
-  try {
-    await stop(options);
-  } catch (error) {
-    process.stderr.write(`Warning: could not stop gateway before uninstall: ${error.message || error}\n`);
-  }
+  await stop(options);
   rmSync(options.dir, { recursive: true, force: true });
   print(`Removed ${options.dir}\n`);
 }
@@ -451,7 +517,7 @@ async function main() {
     usage();
     return;
   }
-  const commands = { install, start, stop, status, doctor, new: newConversation, sessions, uninstall };
+  const commands = { install, update, start, stop, status, doctor, new: newConversation, sessions, uninstall };
   const handler = commands[command];
   if (!handler) {
     throw new Error(`Unknown command: ${command}`);
@@ -461,5 +527,5 @@ async function main() {
 
 main().catch((error) => {
   process.stderr.write(`${error.message || error}\n`);
-  process.exit(1);
+  process.exitCode = 1;
 });

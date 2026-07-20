@@ -12,11 +12,16 @@ gateway.pid
 *.pid
 state/*
 !state/reasoning-cache.example.jsonl
+
+# Local maintenance and review material
 AGENTS.md
 CLAUDE.md
 CORE_BRIDGE_REVIEW.md
+compact-design.md
+compact-principles.md
 system-prompt.md
 .agents/
+.session-review/
 promotion-doc/
 
 # Logs and generated output
