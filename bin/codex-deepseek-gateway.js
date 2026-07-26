@@ -10,7 +10,7 @@ import {
   rmSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/config.js';
 import { newConversation } from '../src/codex-launch.js';
@@ -29,13 +29,27 @@ import {
   removeRuntimeRecord,
   SHUTDOWN_TOKEN_HEADER,
 } from '../src/runtime.js';
+import { findAvailableUpdate } from '../src/update-check.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const packageJson = require('../package.json');
+const UPDATE_CHECKED_ENV = 'CODEX_DEEPSEEK_GATEWAY_UPDATE_CHECKED';
 
 function print(message = '') {
   process.stdout.write(message);
+}
+
+async function notifyAvailableUpdate() {
+  if (process.stderr.isTTY !== true || process.env[UPDATE_CHECKED_ENV] === '1') return;
+  const latestVersion = await findAvailableUpdate({
+    packageName: packageJson.name,
+    currentVersion: packageJson.version,
+  });
+  if (!latestVersion) return;
+  process.stderr.write(
+    `New version ${latestVersion} available. Run \`codex-deepseek-gateway update\` to update.\n`,
+  );
 }
 
 function usage() {
@@ -61,7 +75,7 @@ Options:
   --provider <id>  With new/sessions, target model_provider override
   --model <id>     With new/sessions, target model override
   --reasoning-effort <level>
-                  With new/sessions, target Codex reasoning effort
+                  With new/sessions, target DeepSeek reasoning level
   --exec <id>      With sessions, run the generated codex resume command
   --limit <n>      With sessions, max rows to print or show, defaults to ${DEFAULT_SESSION_LIMIT}
   --print          With sessions, print resume commands instead of picker
@@ -255,6 +269,27 @@ function readProcessRecord(installDir) {
   return readRuntimeRecord(pidPath(installDir));
 }
 
+function pathWithin(parent, target) {
+  const rel = relative(resolve(parent), resolve(target));
+  return rel === '' || (rel && !rel.startsWith('..') && !isAbsolute(rel));
+}
+
+function clearDebugPayloadLogs(installDir) {
+  const paths = new Set([join(installDir, 'gateway.debug.log')]);
+  try {
+    const config = loadInstalledConfig(installDir);
+    if (config.debugPayloadLogPath) {
+      const logPath = resolve(installDir, config.debugPayloadLogPath);
+      if (pathWithin(installDir, logPath)) paths.add(logPath);
+    }
+  } catch {
+  }
+  for (const logPath of paths) {
+    rmSync(logPath, { force: true });
+    rmSync(`${logPath}.1`, { force: true });
+  }
+}
+
 function copyRuntime(installDir) {
   mkdirSync(join(installDir, 'bin'), { recursive: true });
   mkdirSync(join(installDir, 'src'), { recursive: true });
@@ -294,6 +329,7 @@ function openConfig(file) {
 
 async function install(options) {
   copyRuntime(options.dir);
+  clearDebugPayloadLogs(options.dir);
   print(`Installed to ${options.dir}\n`);
   if (!isConfigured(options.dir)) {
     print(`Edit this file and put your DeepSeek API key:\n  ${configPath(options.dir)}\n`);
@@ -303,9 +339,10 @@ async function install(options) {
   await start(options);
 }
 
-function runChild(command, args, label, capture = false) {
+function runChild(command, args, label, capture = false, env = process.env) {
   return new Promise((resolveChild, rejectChild) => {
     const child = spawn(command, args, {
+      env,
       stdio: capture ? ['ignore', 'pipe', 'inherit'] : 'inherit',
       windowsHide: true,
     });
@@ -366,9 +403,10 @@ async function update(options) {
   if (!globalRoot) throw new Error('npm root returned an empty global package path');
   const updatedPackage = globalPackage(globalRoot);
   const dirArgs = ['--dir', options.dir];
-  await runChild(process.execPath, [updatedPackage.cliPath, 'install', '--no-edit', ...dirArgs], 'gateway install');
-  await runChild(process.execPath, [updatedPackage.cliPath, 'status', ...dirArgs], 'gateway status');
-  await runChild(process.execPath, [updatedPackage.cliPath, 'doctor', ...dirArgs], 'gateway doctor');
+  const childEnv = { ...process.env, [UPDATE_CHECKED_ENV]: '1' };
+  await runChild(process.execPath, [updatedPackage.cliPath, 'install', '--no-edit', ...dirArgs], 'gateway install', false, childEnv);
+  await runChild(process.execPath, [updatedPackage.cliPath, 'status', ...dirArgs], 'gateway status', true, childEnv);
+  await runChild(process.execPath, [updatedPackage.cliPath, 'doctor', ...dirArgs], 'gateway doctor', true, childEnv);
 }
 
 async function start(options) {
@@ -509,6 +547,7 @@ async function uninstall(options) {
 
 async function main() {
   const { command, options } = parseArgs(process.argv.slice(2));
+  await notifyAvailableUpdate();
   if (options.version) {
     print(`${packageJson.version}\n`);
     return;

@@ -6,12 +6,45 @@ import { clearScreenDown, cursorTo } from 'node:readline';
 import { readCodexConfig } from './codex-config.js';
 import { readLocalConfigFile } from './local-config.js';
 import { catalogFileForPromptLanguage, normalizePromptLanguage } from './prompt-language.js';
+import { displayWidth, padDisplay, truncateDisplay } from './terminal-text.js';
 
 export const DEFAULT_PROVIDER = 'deepseek-gateway';
-export const REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+export const REASONING_EFFORTS = ['low', 'high', 'max'];
 const SELECTED_ROW = '\x1b[38;2;57;100;254m';
 const MUTED_TEXT = '\x1b[90m';
 const RESET_STYLE = '\x1b[0m';
+const PICKER_COPY = {
+  en: {
+    browse: 'browse',
+    back: 'back',
+    confirm: 'confirm',
+    quit: 'quit',
+    modelTitle: 'Choose gateway model',
+    reasoningTitle: (model) => `Choose DeepSeek reasoning level for ${model}`,
+    sessionTitle: 'Choose Codex session',
+    noSessions: 'No matching sessions found.',
+    newSession: 'new',
+    sessionColumns: ['Date', 'Provider', 'Title'],
+    showing: (first, last, total) => `Showing ${first}-${last} of ${total}`,
+    unknownProvider: '(unknown)',
+    missingModel: (aliasesPath) => `No gateway models found in ${aliasesPath}\n`,
+  },
+  zh: {
+    browse: '选择',
+    back: '返回',
+    confirm: '确认',
+    quit: '退出',
+    modelTitle: '选择网关模型',
+    reasoningTitle: (model) => `为 ${model} 选择 DeepSeek 推理强度`,
+    sessionTitle: '选择 Codex 会话',
+    noSessions: '没有匹配的会话。',
+    newSession: '新建',
+    sessionColumns: ['日期', '提供方', '标题'],
+    showing: (first, last, total) => `显示 ${first}-${last}，共 ${total} 项`,
+    unknownProvider: '(未知)',
+    missingModel: (aliasesPath) => `在 ${aliasesPath} 未找到网关模型\n`,
+  },
+};
 const require = createRequire(import.meta.url);
 const CODEX_PLATFORM_PACKAGE_BY_TARGET = {
   'x86_64-unknown-linux-musl': '@openai/codex-linux-x64',
@@ -56,11 +89,34 @@ function readPromptLanguage(installDir) {
   return normalizePromptLanguage(localConfig.CODEX_PROMPT_LANGUAGE);
 }
 
+function readPickerCatalog(file) {
+  const catalog = readJsonObject(file);
+  const modelDescriptions = {};
+  const reasoningDescriptions = {};
+  for (const model of Array.isArray(catalog.models) ? catalog.models : []) {
+    const slug = String(model?.slug || '').trim();
+    if (!slug) continue;
+    modelDescriptions[slug] = String(model.description || '').trim();
+    reasoningDescriptions[slug] = Object.fromEntries(
+      (Array.isArray(model.supported_reasoning_levels) ? model.supported_reasoning_levels : [])
+        .map((level) => [String(level?.effort || '').trim(), String(level?.description || '').trim()])
+        .filter(([effort]) => effort),
+    );
+  }
+  return { modelDescriptions, reasoningDescriptions };
+}
+
+export function pickerCopy(language) {
+  return PICKER_COPY[normalizePromptLanguage(language)];
+}
+
 export function createLaunchContext(options) {
   const codexHome = defaultCodexHome();
   const models = gatewayModels(options.dir);
   const codexConfig = readCodexConfig();
   const promptLanguage = readPromptLanguage(options.dir);
+  const modelCatalogPath = join(options.dir, 'config', catalogFileForPromptLanguage(promptLanguage));
+  const pickerCatalog = readPickerCatalog(modelCatalogPath);
   const provider = options.provider || DEFAULT_PROVIDER;
   const configModel = codexConfig.modelProvider === DEFAULT_PROVIDER && models.includes(codexConfig.model) ? codexConfig.model : '';
   const configReasoningEffort = codexConfig.modelProvider === provider ? codexConfig.modelReasoningEffort : '';
@@ -68,18 +124,21 @@ export function createLaunchContext(options) {
     all: options.all,
     codexHome,
     installDir: options.dir,
-    modelCatalogPath: join(options.dir, 'config', catalogFileForPromptLanguage(promptLanguage)),
+    modelCatalogPath,
+    modelDescriptions: pickerCatalog.modelDescriptions,
     models,
     promptLanguage,
     projectRoot: findProjectRoot(process.cwd()),
     provider,
+    reasoningDescriptions: pickerCatalog.reasoningDescriptions,
     model: options.model || configModel || models[0] || '',
     reasoningEffort: options.reasoningEffort || configReasoningEffort || 'low',
   };
 }
 
 export function missingModelMessage(context) {
-  return `No gateway models found in ${join(context.installDir, 'config', 'model-aliases.json')}\n`;
+  const aliasesPath = join(context.installDir, 'config', 'model-aliases.json');
+  return pickerCopy(context.promptLanguage).missingModel(aliasesPath);
 }
 
 function configOverrideArgs(context) {
@@ -285,45 +344,74 @@ function pickerControl(key, label) {
   return description ? `${control} ${MUTED_TEXT}${description}${RESET_STYLE}` : control;
 }
 
-function pickerControls(shortcuts = []) {
+function pickerControls(shortcuts = [], language = 'en') {
+  const copy = pickerCopy(language);
   const labels = shortcuts
     .map((shortcut) => pickerControl(shortcut.displayKey || shortcut.key, shortcut.label))
     .filter(Boolean);
   return [
     ...labels,
-    pickerControl('↑/↓', 'browse'),
-    pickerControl('←', 'back'),
-    pickerControl('Enter', 'confirm'),
-    pickerControl('Esc', 'quit'),
+    pickerControl('↑/↓', copy.browse),
+    pickerControl('←', copy.back),
+    pickerControl('Enter', copy.confirm),
+    pickerControl('Esc', copy.quit),
   ].join('    ');
+}
+
+function terminalWidth() {
+  return process.stdout.columns || 80;
+}
+
+export function pickerChoiceRows(choices, descriptions = {}, width = terminalWidth()) {
+  const values = choices.map((choice) => String(choice));
+  const nameWidth = Math.max(0, ...values.map(displayWidth));
+  const budget = Math.max(0, width - 2);
+  const nameColumnWidth = Math.min(nameWidth, budget);
+  const descriptionWidth = budget - nameColumnWidth - 2;
+  return values.map((value) => {
+    const description = String(descriptions[value] || '').trim();
+    if (!description || descriptionWidth < 4) return truncateDisplay(value, budget);
+    const name = padDisplay(value, nameColumnWidth);
+    const truncatedDescription = truncateDisplay(description, descriptionWidth);
+    return `${name}  ${MUTED_TEXT}${truncatedDescription}${RESET_STYLE}`;
+  });
+}
+
+function selectedPickerRow(row) {
+  return String(row).replace(/\x1b\[[0-9;]*m/g, '');
 }
 
 function renderRow(state, absoluteIndex) {
   if (absoluteIndex < state.offset || absoluteIndex >= state.offset + state.visibleRows.length) return;
   const visibleIndex = absoluteIndex - state.offset;
   cursorTo(process.stdout, 0, rowOffset(state.header) + visibleIndex);
-  const row = `${absoluteIndex === state.selected ? '>' : ' '} ${state.rows[absoluteIndex]}`;
-  const styled = absoluteIndex === state.selected ? `${SELECTED_ROW}${row}${RESET_STYLE}` : row;
+  const isSelected = absoluteIndex === state.selected;
+  const rowText = isSelected ? selectedPickerRow(state.rows[absoluteIndex]) : state.rows[absoluteIndex];
+  const row = `${isSelected ? '>' : ' '} ${rowText}`;
+  const styled = isSelected ? `${SELECTED_ROW}${row}${RESET_STYLE}` : row;
   print(`\x1b[2K${styled}`);
 }
 
 function pickerLines(state) {
-  const { title, rows, selected, header, emptyMessage, shortcuts } = state;
+  const { title, rows, selected, header, emptyMessage, shortcuts, language } = state;
+  const copy = pickerCopy(language);
   const window = pickerWindow(rows, selected, state.windowSize, state.offset);
   state.offset = window.offset;
   state.visibleRows = window.rows;
   const lines = [title, ''];
-  if (header) lines.push(`  ${header}`, `  ${MUTED_TEXT}${'─'.repeat(header.length)}${RESET_STYLE}`);
+  if (header) lines.push(`  ${header}`, `  ${MUTED_TEXT}${'─'.repeat(displayWidth(header))}${RESET_STYLE}`);
   for (const [visibleIndex, rowText] of state.visibleRows.entries()) {
     const absoluteIndex = state.offset + visibleIndex;
-    const row = `${absoluteIndex === selected ? '>' : ' '} ${rowText}`;
-    lines.push(absoluteIndex === selected ? `${SELECTED_ROW}${row}${RESET_STYLE}` : row);
+    const isSelected = absoluteIndex === selected;
+    const visibleText = isSelected ? selectedPickerRow(rowText) : rowText;
+    const row = `${isSelected ? '>' : ' '} ${visibleText}`;
+    lines.push(isSelected ? `${SELECTED_ROW}${row}${RESET_STYLE}` : row);
   }
   if (!rows.length && emptyMessage) lines.push(`  ${emptyMessage}`);
   if (rows.length > state.visibleRows.length) {
-    lines.push('', `  Showing ${state.offset + 1}-${state.offset + state.visibleRows.length} of ${rows.length}`);
+    lines.push('', `  ${copy.showing(state.offset + 1, state.offset + state.visibleRows.length, rows.length)}`);
   }
-  lines.push('', `  ${pickerControls(shortcuts)}`);
+  lines.push('', `  ${pickerControls(shortcuts, language)}`);
   return lines;
 }
 
@@ -366,6 +454,7 @@ export async function pick(title, rows, header = '', options = {}) {
     shortcuts,
     windowSize: options.windowSize,
     emptyMessage: options.emptyMessage,
+    language: normalizePromptLanguage(options.language),
     offset: 0,
     visibleRows: [],
     renderedLineCount: 0,
@@ -422,13 +511,18 @@ export async function withPickerScreen(callback) {
 }
 
 export async function pickModel(context) {
-  const result = await pick('Choose gateway model', context.models);
+  const copy = pickerCopy(context.promptLanguage);
+  const rows = pickerChoiceRows(context.models, context.modelDescriptions, terminalWidth());
+  const result = await pick(copy.modelTitle, rows, '', { language: context.promptLanguage });
   if (result.action === 'select') context.model = context.models[result.index];
   return result.action;
 }
 
 export async function pickReasoning(context) {
-  const result = await pick(`Choose Codex reasoning effort for ${context.model}`, REASONING_EFFORTS);
+  const copy = pickerCopy(context.promptLanguage);
+  const descriptions = context.reasoningDescriptions?.[context.model];
+  const rows = pickerChoiceRows(REASONING_EFFORTS, descriptions, terminalWidth());
+  const result = await pick(copy.reasoningTitle(context.model), rows, '', { language: context.promptLanguage });
   if (result.action === 'select') context.reasoningEffort = REASONING_EFFORTS[result.index];
   return result.action;
 }

@@ -35,8 +35,7 @@ Put your DeepSeek API key in `~/.codex/deepseek-gateway/config/gateway.local.jso
 
 ```json
 {
-  "upstreamApiKey": "sk-...",
-  "codexPromptLanguage": "en"
+  "upstreamApiKey": "sk-..."
 }
 ```
 
@@ -65,7 +64,7 @@ The top-level model settings can stay out of `config.toml`: on every launch the 
 ```toml
 model_provider = "deepseek-gateway"
 model = "deepseek-v4-pro"
-model_reasoning_effort = "xhigh"
+model_reasoning_effort = "max"
 model_supports_reasoning_summaries = true
 model_reasoning_summary = "auto"
 ```
@@ -81,9 +80,9 @@ codex-deepseek-gateway new       # start a new conversation
 codex-deepseek-gateway sessions  # pick and resume a session from the current project
 ```
 
-Both commands launch Codex with the provider overrides described above and load the packaged model catalog: the DeepSeek models, system prompts (English or Chinese, per `codexPromptLanguage`), reasoning levels, and personalities that ship with the gateway.
+Both commands launch Codex with the provider overrides described above and load the packaged model catalog: the DeepSeek models, system prompts, reasoning levels, and personalities that ship with the gateway.
 
-Without options, `new` asks for a model, then a Codex reasoning effort. `sessions` shows a session picker first (Up/Down to browse, `n` to start a new conversation instead), then model and effort.
+Without options, `new` asks for a model, then a DeepSeek reasoning level. `sessions` shows a session picker first (Up/Down to browse, `n` to start a new conversation instead), then model and reasoning level.
 
 Useful non-interactive forms:
 
@@ -94,19 +93,31 @@ codex-deepseek-gateway sessions --all               # include sessions from all 
 codex-deepseek-gateway sessions --exec <id-or-row>  # resume by row number or session id
 ```
 
-Inside a launcher-started Codex TUI, `/model` switches between the packaged DeepSeek models and reasoning efforts, and `/personality` switches between the catalog personalities.
+Inside a launcher-started Codex TUI, `/model` switches between the packaged DeepSeek models and reasoning levels, and `/personality` switches between the catalog personalities.
+
+### Language
+
+Set `codexPromptLanguage` in `~/.codex/deepseek-gateway/config/gateway.local.json`:
+
+```json
+{
+  "codexPromptLanguage": "zh"
+}
+```
+
+`en` (the default) uses the English packaged prompts, personalities, model and reasoning descriptions, and `new` / `sessions` picker interface; `zh` uses their Chinese versions. Invalid values fall back to `en`. This setting does not translate Codex's own native TUI. Changes take effect the next time you run `new` or `sessions`; an open Codex session cannot switch catalogs live and must be reopened.
 
 ### Models and Reasoning
 
-The gateway ships two model aliases, `deepseek-v4-flash` and `deepseek-v4-pro`. Codex reasoning effort maps to DeepSeek thinking mode:
+The gateway ships two model aliases, `deepseek-v4-flash` and `deepseek-v4-pro`. The packaged catalog exposes exactly three reasoning levels aligned with DeepSeek V4:
 
-| Codex effort | DeepSeek request |
+| Reasoning level | DeepSeek request |
 | --- | --- |
 | `low` | `thinking.type = disabled` |
-| `medium` | `thinking.type = enabled`, `reasoning_effort = high` |
 | `high` | `thinking.type = enabled`, `reasoning_effort = high` |
-| `xhigh` | `thinking.type = enabled`, `reasoning_effort = max` |
 | `max` | `thinking.type = enabled`, `reasoning_effort = max` |
+
+`high` is DeepSeek V4's standard thinking effort; `max` is intended for the most complex agentic work.
 
 DeepSeek's chain of thought is shown in full in the Codex TUI, and the raw `reasoning_content` is preserved for model history.
 
@@ -142,7 +153,7 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
   "debugPayload": false,
   "tavilyApiKey": "",
   "tavilyWebSearchEnabled": false,
-  "tavilyMaxSearchRounds": 20,
+  "webSearchMaxRounds": 60,
   "firecrawlApiKey": "",
   "firecrawlWebFetchEnabled": false
 }
@@ -152,14 +163,17 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
 - `upstreamBaseUrl` — DeepSeek API endpoint; see the [DeepSeek API documentation](https://api-docs.deepseek.com/).
 - `upstreamMaxTokens` — cap on DeepSeek output tokens; `0` uses the catalog's default ~100K budget.
 - `host`, `port` — gateway listen address.
-- `codexPromptLanguage` — prompt catalog language, `en` or `zh`; invalid values fall back to `en`.
+- `codexPromptLanguage` — packaged catalog and launcher language; see [Language](#language).
 - `compactReasoningEffort` — thinking effort used for compaction, `high` or `max`.
 - `compactMaxTokens` — compaction output budget, capped at 100000.
 - `reasoningCacheEnabled` — set `false` to disable the reasoning cache described below.
 - `debugPayload` — log per-request mapping summaries to `gateway.debug.log` (rotated at 5 MB).
 - `tavilyApiKey`, `tavilyWebSearchEnabled` — [Tavily](https://docs.tavily.com/documentation/quickstart) web search backend (see Web Search).
-- `tavilyMaxSearchRounds` — web search rounds per turn, hard cap `40`.
+- `webSearchMaxRounds` — web search rounds per turn; default `60`, hard cap `80`.
 - `firecrawlApiKey`, `firecrawlWebFetchEnabled` — [Firecrawl](https://docs.firecrawl.dev/introduction) page-reading backend (see Web Search).
+- `webSearchMaxSearches`, `webSearchMaxPages` — provider-operation budgets per turn; defaults are `30` Tavily searches and `50` Firecrawl page reads, capped at `50` and `80` respectively. Automatic and model-requested page reads share the same page budget.
+- `webSearchMaxToolChars`, `webSearchTurnTimeoutMs`, `webSearchConcurrency` — total tool-text, wall-clock, and concurrency budgets; defaults are `240000`, `180000`, and `3`, with tool text capped at `400000` characters.
+- `firecrawlMaxAgeMs`, `firecrawlStoreInCache` — Firecrawl freshness and storage policy; the default cache window is two days and fresh Tavily filters automatically use a shorter window.
 
 Two support files under the install directory are managed for you:
 
@@ -186,7 +200,7 @@ If you also want opened-page reading, create a [Firecrawl API key](https://www.f
 }
 ```
 
-Codex `web_search` / `web_search_preview` requests are then executed through Tavily; with Firecrawl configured, DeepSeek can also open pages and search within them, and each search reads the top result automatically. Streaming stays live through every search round. `tavilyMaxSearchRounds` limits search rounds per turn; at the cap, the gateway withholds the web tools for one final turn so the model answers with what it has.
+Codex `web_search` / `web_search_preview` requests are executed through Tavily. With Firecrawl configured, searches are enriched with useful page text, and DeepSeek can open known pages or find text inside them. Per-turn limits are configurable above. This feature is text-only; see [Limits](#limits) for its scope.
 
 ## Upgrade
 
@@ -197,6 +211,8 @@ codex-deepseek-gateway update
 ```
 
 `update` requires an installed gateway with an API key configured. It stops the gateway, installs and runs the latest npm package, preserves your `gateway.local.json`, reinstalls the local runtime, then runs `status` and `doctor` to verify the version, process identity, health, and configuration. Once it completes, start your Codex sessions again with `codex-deepseek-gateway new` or `codex-deepseek-gateway sessions`.
+
+Interactive `codex-deepseek-gateway` commands check npm for a newer version and suggest `codex-deepseek-gateway update` when one is available. The check is skipped for non-interactive use and never causes the original command to fail.
 
 ## Uninstall
 
@@ -239,7 +255,7 @@ Run `codex-deepseek-gateway --help` for all options.
 ## Limits
 
 - Chat Completions is not a full Responses API replacement. Codex hosted tools without a local executor are declared to DeepSeek as plain function tools rather than executed; web search is the only hosted tool the gateway executes itself.
-- Tavily/Firecrawl web emulation is text-focused: no browser control, screenshots, raw HTML, cookies, crawl jobs, or private-network access.
+- Tavily/Firecrawl web emulation is text-focused and does not claim OpenAI hosted web_search parity for cached/indexed modes, image search content, browser control, screenshots, raw HTML, cookies, crawl jobs, or private-network access.
 - OpenAI `file_id` values are passed through; the gateway cannot fetch private OpenAI-hosted files.
 - Plain `codex` commands do not load the packaged model catalog; use `new` / `sessions`.
 - After resume, Codex may duplicate the displayed tail of certain long Markdown turns. History is not duplicated; this is an upstream Codex TUI display issue.

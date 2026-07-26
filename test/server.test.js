@@ -235,6 +235,19 @@ test('health, models, authentication, and request validation', async () => {
     assert.equal(invalidChat.status, 400);
     assert.deepEqual(await invalidChat.json(), { error: { message: 'Invalid JSON body' } });
 
+    const invalidReasoning = await fetch(`${configuredUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', input: 'hello', reasoning: { effort: 'medium' } }),
+    });
+    assert.equal(invalidReasoning.status, 400);
+    assert.deepEqual(await invalidReasoning.json(), {
+      error: {
+        code: 'invalid_reasoning_effort',
+        message: 'Unsupported DeepSeek reasoning effort "medium". Expected one of: low, high, max',
+      },
+    });
+
     const missingModel = await fetch(`${configuredUrl}/v1/responses`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -913,7 +926,7 @@ test('non-streaming bridge and persistent reasoning recovery', async () => {
     const first = await fetch(`${proxyUrl}/v1/responses`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-v4-flash', input: 'find x', tools, reasoning: { effort: 'medium' } }),
+      body: JSON.stringify({ model: 'deepseek-v4-flash', input: 'find x', tools, reasoning: { effort: 'high' } }),
     });
     assert.equal(first.status, 200);
     const firstBody = await first.json();
@@ -925,7 +938,7 @@ test('non-streaming bridge and persistent reasoning recovery', async () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         model: 'deepseek-v4-flash',
-        reasoning: { effort: 'medium' },
+        reasoning: { effort: 'high' },
         tools,
         input: [
           { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'find x' }] },
@@ -1147,7 +1160,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
       tavilyBaseUrl: tavilyUrl,
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
-      tavilyMaxSearchRounds: 2,
+      webSearchMaxRounds: 2,
       tavilyMaxResults: 5,
       tavilySearchDepth: 'basic',
     },
@@ -1191,9 +1204,9 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     assert.equal(upstreamBodies[0].tools.some((tool) => tool.function?.name === 'web_search'), true);
     assert.equal(upstreamBodies[0].stream, false);
     assert.equal(upstreamBodies[1].messages.at(-1).role, 'tool');
-    assert.match(upstreamBodies[1].messages.at(-1).content, /Search query: Codex web search Tavily/);
+    assert.match(upstreamBodies[1].messages.at(-1).content, /Web search results for: Codex web search Tavily/);
     assert.match(upstreamBodies[1].messages.at(-1).content, /Source 1: Tavily Search API/);
-    assert.match(upstreamBodies[1].messages.at(-1).content, /source title and URL/);
+    assert.match(upstreamBodies[1].messages.at(-1).content, /URL: https:\/\/docs\.tavily\.com\/search/);
     assert.doesNotMatch(upstreamBodies[1].messages.at(-1).content, /cite them as \[1\].*Do not write Markdown links or raw source URLs/);
     assert.doesNotMatch(upstreamBodies[1].messages.at(-1).content, /RAW CONTENT SHOULD NOT REACH MODEL|raw_content/);
   } finally {
@@ -1315,7 +1328,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     res.end(JSON.stringify({
       success: true,
       data: {
-        markdown: '# Firecrawl\n\nOpened page text for DeepSeek.',
+        markdown: '# Firecrawl\n\nOpened page text for DeepSeek with firecrawl integration details. '.repeat(12),
         links: [{ title: 'Nested Link', url: 'https://example.com/nested' }],
         metadata: { title: 'Opened Firecrawl Page', sourceURL: 'https://example.com/firecrawl' },
       },
@@ -1359,12 +1372,13 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(firecrawlBody.url, 'https://example.com/firecrawl');
-    assert.deepEqual(firecrawlBody.formats, ['markdown', 'links']);
+    assert.deepEqual(firecrawlBody.formats, ['markdown']);
     assert.equal(upstreamBodies[0].tools.some((tool) => tool.function?.name === 'web_open_page'), true);
     const toolContent = upstreamBodies[1].messages.at(-1).content;
-    assert.match(toolContent, /Opened page excerpt:/);
+    assert.match(toolContent, /Opened page matches:/);
+    assert.doesNotMatch(toolContent, /Opened page excerpt:/);
     assert.match(toolContent, /Opened page text for DeepSeek/);
-    assert.match(toolContent, /Source 1 link 1: Nested Link/);
+    assert.doesNotMatch(toolContent, /Nested Link/);
     assert.equal(body.output[0].type, 'web_search_call');
     assert.deepEqual(body.output[1].content[0].annotations, [
       {
@@ -1638,10 +1652,21 @@ test('non-streaming web-search orchestration and compatibility', async () => {
   try {
     const response = await fetch(`${proxyUrl}/v1/responses`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-codex-turn-metadata': JSON.stringify({ request_kind: 'turn' }),
+      },
       body: JSON.stringify({
         model: 'codex',
         input: 'Assign this to a sub-agent and use web if needed.',
+        previous_response_id: 'resp_previous',
+        prompt_cache_key: 'cache_debug',
+        client_metadata: {
+          session_id: 'session_debug',
+          thread_id: 'thread_debug',
+          turn_id: 'turn_debug',
+          'x-codex-window-id': 'window_debug',
+        },
         tools: [
           { type: 'web_search' },
           {
@@ -1682,6 +1707,13 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     const debugEntries = debugLines.map((line) => JSON.parse(line.replace(/^\[codex-deepseek-gateway\] upstream request /, '')));
     const round = debugEntries.find((entry) => entry.stage === 'web_search_round_0');
     assert.ok(round);
+    assert.equal(round.session_id, 'session_debug');
+    assert.equal(round.thread_id, 'thread_debug');
+    assert.equal(round.turn_id, 'turn_debug');
+    assert.equal(round.window_id, 'window_debug');
+    assert.equal(round.request_kind, 'turn');
+    assert.equal(round.previous_response_id, 'resp_previous');
+    assert.equal(round.prompt_cache_key, 'cache_debug');
     assert.equal(round.codex_tools.some((tool) => tool.type === 'web_search'), true);
     assert.equal(round.codex_tools.some((tool) => tool.type === 'namespace' && tool.name === 'multi_agent_v1'), true);
     assert.equal(round.chat_tools.some((tool) => tool.name === 'multi_agent_v1__spawn_agent'), true);
@@ -1704,9 +1736,9 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     if (upstreamBodies.length === 3) {
       assert.equal(body.tool_choice, undefined);
       assert.equal(body.tools, undefined);
-      assert.equal(body.messages.some((message) => String(message.content || '').includes('Use web_search for live web information.')), false);
+      assert.equal(body.messages.some((message) => String(message.content || '').includes('Use web_search when current web facts are needed')), false);
       assert.equal(body.messages.at(-1).role, 'user');
-      assert.match(body.messages.at(-1).content, /Web tools are now unavailable/);
+      assert.match(body.messages.at(-1).content, /No more web searches or page reads can be run in this turn/);
       assert.equal(body.messages.some((message) => message.role === 'tool'), true);
       res.end(JSON.stringify({
         choices: [{ message: { role: 'assistant', content: 'Final answer from the completed search [1].' }, finish_reason: 'stop' }],
@@ -1750,7 +1782,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
       tavilyApiKey: 'tvly-test',
       tavilyBaseUrl: tavilyUrl,
       tavilyWebSearchEnabled: true,
-      tavilyMaxSearchRounds: 1,
+      webSearchMaxRounds: 1,
     },
     reasoningCache: new ReasoningCache(),
   });
@@ -1847,7 +1879,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
       tavilyApiKey: 'tvly-test',
       tavilyBaseUrl: tavilyUrl,
       tavilyWebSearchEnabled: true,
-      tavilyMaxSearchRounds: 1,
+      webSearchMaxRounds: 1,
     },
     reasoningCache: new ReasoningCache(),
   });
@@ -1868,13 +1900,115 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     assert.equal(upstreamBodies.length, 3);
     assert.equal(body.status, 'completed');
     assert.equal(body.incomplete_details, null);
-    assert.match(body.output_text, /Gateway incomplete/);
+    assert.match(body.output_text, /Incomplete response/);
     assert.equal(body.output_text.includes('DSML'), false);
     assert.equal(body.output_text.includes('tavily_search'), false);
   } finally {
     await close(proxy);
     await close(upstream);
     await close(tavily);
+  }
+  });
+  await scenario('keeps non-web tools available after web tools are disabled', async () => {
+  const upstreamBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstreamBodies.push(body);
+    const toolNames = (body.tools || []).map((tool) => tool.function?.name).filter(Boolean);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (toolNames.includes('web_search')) {
+      assert.equal(toolNames.includes('apply_patch'), true);
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{ id: 'call_search', type: 'function', function: { name: 'web_search', arguments: '{"query":"latest"}' } }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+      }));
+      return;
+    }
+    assert.equal(toolNames.includes('web_search'), false);
+    assert.equal(toolNames.includes('web_open_page'), false);
+    assert.equal(toolNames.includes('web_find_in_page'), false);
+    assert.equal(toolNames.includes('apply_patch'), true);
+    assert.match(body.messages.at(-1).content, /Continue the task using completed web results/);
+    assert.doesNotMatch(body.messages.at(-1).content, /Answer now using only completed tool results/);
+    res.end(JSON.stringify({
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_patch',
+            type: 'function',
+            function: {
+              name: 'apply_patch',
+              arguments: JSON.stringify({
+                edits: [{ type: 'replace_text', file: 'notes.md', old: 'old text', new: 'new text' }],
+              }),
+            },
+          }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: 'http://127.0.0.1:9',
+      tavilyWebSearchEnabled: true,
+      tavilyTimeoutMs: 5000,
+      webSearchMaxRounds: 0,
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'search then edit',
+        tools: [
+          { type: 'web_search_preview' },
+          {
+            type: 'custom',
+            name: 'apply_patch',
+            description: 'Edit files.',
+            format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+          },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(upstreamBodies.length, 2);
+    assert.equal(body.output_text, '');
+    assert.equal(body.output.some((item) => item.type === 'web_search_call'), false);
+    const patch = body.output.find((item) => item.type === 'custom_tool_call' && item.name === 'apply_patch');
+    assert.equal(patch.call_id, 'call_patch');
+    assert.match(patch.input, /\*\*\* Begin Patch/);
+    assert.match(patch.input, /\*\*\* Update File: notes\.md/);
+    assert.match(patch.input, /-old text/);
+    assert.match(patch.input, /\+new text/);
+    assert.doesNotMatch(body.output_text, /Incomplete response/);
+  } finally {
+    await close(proxy);
+    await close(upstream);
   }
   });
   await scenario('allows model-driven multi-round web search before final answer', async () => {
@@ -1944,7 +2078,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
       tavilyApiKey: 'tvly-test',
       tavilyBaseUrl: tavilyUrl,
       tavilyWebSearchEnabled: true,
-      tavilyMaxSearchRounds: 8,
+      webSearchMaxRounds: 8,
     },
     reasoningCache: new ReasoningCache(),
   });
@@ -2033,7 +2167,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
       tavilyApiKey: 'tvly-test',
       tavilyBaseUrl: tavilyUrl,
       tavilyWebSearchEnabled: true,
-      tavilyMaxSearchRounds: 2,
+      webSearchMaxRounds: 2,
     },
     reasoningCache: new ReasoningCache(),
   });
@@ -2054,7 +2188,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     assert.equal(upstreamBodies.length, 3);
     assert.equal(body.status, 'completed');
     assert.equal(body.incomplete_details, null);
-    assert.match(body.output_text, /Gateway incomplete/);
+    assert.match(body.output_text, /Incomplete response/);
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2114,7 +2248,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     assert.equal(body.tool_choice, undefined);
     assert.equal(body.tools, undefined);
     assert.equal(body.messages.at(-2).role, 'tool');
-    assert.match(body.messages.at(-2).content, /not available through this gateway/);
+    assert.match(body.messages.at(-2).content, /not available in this turn/);
     res.end(JSON.stringify({
       choices: [{ message: { role: 'assistant', content: 'Final answer from available source [1].' }, finish_reason: 'stop' }],
     }));
@@ -2137,7 +2271,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
       tavilyApiKey: 'tvly-test',
       tavilyBaseUrl: tavilyUrl,
       tavilyWebSearchEnabled: true,
-      tavilyMaxSearchRounds: 2,
+      webSearchMaxRounds: 2,
     },
     reasoningCache: new ReasoningCache(),
   });
@@ -2206,7 +2340,7 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     const toolNames = upstreamBodies[0].tools.map((tool) => tool.function.name);
     assert.deepEqual(toolNames, ['shell_command', 'web_search', 'commentary']);
     const shim = upstreamBodies[0].tools.find((tool) => tool.function.name === 'web_search');
-    assert.match(shim.function.description, /no search provider configured/);
+    assert.match(shim.function.description, /no search provider is configured/);
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2480,6 +2614,11 @@ test('streaming web-search rounds, usage, and commentary', async () => {
         model: 'codex',
         input: 'search',
         stream: true,
+        client_metadata: {
+          session_id: 'session_usage',
+          thread_id: 'thread_usage',
+          turn_id: 'turn_usage',
+        },
         tools: [{ type: 'web_search_preview' }],
       }),
     });
@@ -2522,12 +2661,27 @@ test('streaming web-search rounds, usage, and commentary', async () => {
     const usageLine = (await readFile(debugPath, 'utf8')).split(/\r?\n/)
       .find((line) => line.startsWith('[codex-deepseek-gateway] web search usage '));
     const usage = JSON.parse(usageLine.replace('[codex-deepseek-gateway] web search usage ', ''));
+    assert.equal(usage.session_id, 'session_usage');
+    assert.equal(usage.thread_id, 'thread_usage');
+    assert.equal(usage.turn_id, 'turn_usage');
     assert.equal(usage.stage, 'web_search_stream');
     assert.equal(usage.rounds, 2);
     assert.equal(usage.aggregate.prompt_tokens, 70);
     assert.equal(usage.aggregate.completion_tokens, 12);
     assert.equal(usage.final.prompt_tokens, 60);
     assert.equal(usage.final.completion_tokens, 7);
+    assert.equal(usage.web.providerCalls, 1);
+    assert.equal(usage.web.counts.searches, 1);
+    assert.equal(usage.web.operations[0].provider, 'tavily');
+    assert.equal(usage.web.operations[0].source, 'explicit');
+    assert.equal(usage.web.operations[0].query, 'latest');
+    assert.match(usage.web.operations[0].itemId, /^ws_/);
+    assert.deepEqual(usage.web.operations[0].options, {
+      searchDepth: 'basic',
+      maxResults: 5,
+      includeDomains: 0,
+      excludeDomains: 0,
+    });
     assert.equal(frames.at(-1).data, '[DONE]');
 
   } finally {
@@ -2575,7 +2729,7 @@ test('streaming web-search rounds, usage, and commentary', async () => {
       tavilyBaseUrl: 'http://127.0.0.1:9',
       tavilyWebSearchEnabled: true,
       tavilyTimeoutMs: 5000,
-      tavilyMaxSearchRounds: 0,
+      webSearchMaxRounds: 0,
     },
     reasoningCache: new ReasoningCache(),
   });
@@ -2596,10 +2750,116 @@ test('streaming web-search rounds, usage, and commentary', async () => {
     const text = await response.text();
     const frames = parseResponsesSse(text);
     const completed = frames.find((frame) => frame.event === 'response.completed');
-    assert.match(completed.data.response.output_text, /Gateway incomplete: after web tools were disabled/);
+    assert.match(completed.data.response.output_text, /Incomplete response: after web tools were disabled/);
     assert.equal(completed.data.response.output.some((item) => item.type === 'function_call'), false);
     assert.equal(completed.data.response.output.some((item) => item.type === 'web_search_call'), false);
     assert.doesNotMatch(completed.data.response.output_text, /DSML tool_calls/);
+    assert.equal(frames.at(-1).data, '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+  await scenario('streams non-web tool calls after web tools are disabled', async () => {
+  const upstreamBodies = [];
+  const sse = (res, payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstreamBodies.push(body);
+    const toolNames = (body.tools || []).map((tool) => tool.function?.name).filter(Boolean);
+    res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+    if (toolNames.includes('web_search')) {
+      assert.equal(toolNames.includes('apply_patch'), true);
+      sse(res, {
+        choices: [{
+          delta: {
+            tool_calls: [{ index: 0, id: 'call_search', type: 'function', function: { name: 'web_search', arguments: '{"query":"latest"}' } }],
+          },
+          finish_reason: null,
+        }],
+      });
+      sse(res, { choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+    assert.equal(toolNames.includes('web_search'), false);
+    assert.equal(toolNames.includes('web_open_page'), false);
+    assert.equal(toolNames.includes('web_find_in_page'), false);
+    assert.equal(toolNames.includes('apply_patch'), true);
+    assert.match(body.messages.at(-1).content, /Continue the task using completed web results/);
+    sse(res, {
+      choices: [{
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: 'call_patch',
+            type: 'function',
+            function: {
+              name: 'apply_patch',
+              arguments: JSON.stringify({
+                edits: [{ type: 'replace_text', file: 'notes.md', old: 'old text', new: 'new text' }],
+              }),
+            },
+          }],
+        },
+        finish_reason: null,
+      }],
+    });
+    sse(res, { choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
+    res.write('data: [DONE]\n\n');
+    res.end();
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamModel: 'deepseek-v4-flash',
+      upstreamProvider: 'deepseek',
+      upstreamTimeoutMs: 5000,
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: 'http://127.0.0.1:9',
+      tavilyWebSearchEnabled: true,
+      tavilyTimeoutMs: 5000,
+      webSearchMaxRounds: 0,
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'search then edit',
+        stream: true,
+        tools: [
+          { type: 'web_search_preview' },
+          {
+            type: 'custom',
+            name: 'apply_patch',
+            description: 'Edit files.',
+            format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+          },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    const frames = parseResponsesSse(text);
+    assert.equal(upstreamBodies.length, 2);
+    const completed = frames.find((frame) => frame.event === 'response.completed').data.response;
+    assert.equal(completed.output.some((item) => item.type === 'web_search_call'), false);
+    const patch = completed.output.find((item) => item.type === 'custom_tool_call' && item.name === 'apply_patch');
+    assert.equal(patch.call_id, 'call_patch');
+    assert.match(patch.input, /\*\*\* Update File: notes\.md/);
+    assert.equal(completed.output_text, '');
+    assert.doesNotMatch(completed.output_text, /Incomplete response/);
     assert.equal(frames.at(-1).data, '[DONE]');
   } finally {
     await close(proxy);
@@ -2645,7 +2905,7 @@ test('streaming web-search rounds, usage, and commentary', async () => {
         model: 'codex',
         input: 'say hello',
         stream: true,
-        reasoning: { effort: 'medium' },
+        reasoning: { effort: 'high' },
         tools: [{ type: 'web_search_preview' }],
       }),
     });
@@ -2724,7 +2984,7 @@ test('streaming web-search rounds, usage, and commentary', async () => {
         model: 'codex',
         input: 'read both files',
         stream: true,
-        reasoning: { effort: 'medium' },
+        reasoning: { effort: 'high' },
         tools: [
           { type: 'web_search_preview' },
           {
@@ -2938,6 +3198,841 @@ test('streaming web-search rounds, usage, and commentary', async () => {
   });
 });
 
+test('apply_patch correction rounds', async () => {
+  const applyPatchTool = {
+    type: 'custom',
+    name: 'apply_patch',
+    description: 'Edit files.',
+    format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+  };
+  const shellTool = {
+    type: 'function',
+    name: 'shell_command',
+    description: 'Run a shell command.',
+    parameters: {
+      type: 'object',
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  };
+  const applyPatchCall = (id, edits) => ({
+    id,
+    type: 'function',
+    function: { name: 'apply_patch', arguments: JSON.stringify({ edits }) },
+  });
+  const toolCallCompletion = (toolCalls) => JSON.stringify({
+    choices: [
+      {
+        message: { role: 'assistant', content: '', tool_calls: toolCalls },
+        finish_reason: 'tool_calls',
+      },
+    ],
+  });
+  const textCompletion = (content) => JSON.stringify({
+    choices: [{ message: { role: 'assistant', content }, finish_reason: 'stop' }],
+  });
+  const jsonUpstream = (handler) => {
+    const bodies = [];
+    const server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      bodies.push(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(handler(body, bodies.length));
+    });
+    return { server, bodies };
+  };
+  const gatewayConfig = (upstreamUrl, overrides = {}) => ({
+    upstreamBaseUrl: upstreamUrl,
+    upstreamApiKey: 'test-key',
+    upstreamModel: 'deepseek-v4-flash',
+    upstreamProvider: 'deepseek',
+    upstreamTimeoutMs: 5000,
+    ...overrides,
+  });
+
+  await scenario('distinguishes unused and first-try valid apply_patch diagnostics', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'gateway-patch-debug-'));
+  const debugPath = join(tempDir, 'debug.log');
+  let request = 0;
+  const { server: upstream } = jsonUpstream(() => {
+    request += 1;
+    return request === 1
+      ? textCompletion('No edit needed.')
+      : toolCallCompletion([applyPatchCall('call_debug_valid', [{ type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' }])]);
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, { debugPayload: true, debugPayloadLogPath: debugPath }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    for (const input of ['inspect the file', 'edit the file']) {
+      const response = await fetch(`${proxyUrl}/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'codex', input, tools: [applyPatchTool] }),
+      });
+      assert.equal(response.status, 200);
+      await response.json();
+    }
+    const log = await readFile(debugPath, 'utf8');
+    const diagnostics = log.split(/\r?\n/)
+      .filter((entry) => entry.startsWith('[codex-deepseek-gateway] apply patch usage '))
+      .map((entry) => JSON.parse(entry.replace('[codex-deepseek-gateway] apply patch usage ', '')).apply_patch);
+    assert.equal(diagnostics.length, 2);
+    assert.deepEqual(diagnostics[0], {
+      calls: 0,
+      validCalls: 0,
+      invalidCalls: 0,
+      correctionRounds: 0,
+      exhausted: false,
+      validationOutcome: 'not_called',
+      errorCategories: [],
+    });
+    assert.deepEqual(diagnostics[1], {
+      calls: 1,
+      validCalls: 1,
+      invalidCalls: 0,
+      correctionRounds: 0,
+      exhausted: false,
+      validationOutcome: 'valid_first_try',
+      errorCategories: [],
+    });
+  } finally {
+    await close(proxy);
+    await close(upstream);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+  });
+
+  await scenario('replaces an invalid apply_patch round with a corrected call on the non-streaming web-enabled path', async () => {
+  const { server: upstream, bodies: upstreamBodies } = jsonUpstream((body) => {
+    if (!body.messages.some((message) => message.role === 'tool')) {
+      return toolCallCompletion([
+        applyPatchCall('call_bad_patch', [{ type: 'replace_text', file: 'a.txt', new: 'new' }]),
+        { id: 'call_shell_first', type: 'function', function: { name: 'shell_command', arguments: '{"command":"ls"}' } },
+      ]);
+    }
+    return toolCallCompletion([
+      applyPatchCall('call_good_patch', [{ type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' }]),
+      { id: 'call_shell_again', type: 'function', function: { name: 'shell_command', arguments: '{"command":"ls"}' } },
+    ]);
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, {
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: 'https://tavily.invalid',
+      tavilyWebSearchEnabled: true,
+    }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'edit the file',
+        tools: [{ type: 'web_search' }, applyPatchTool, shellTool],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(upstreamBodies.length, 2);
+    const secondMessages = upstreamBodies[1].messages;
+    const assistantEcho = secondMessages.find(
+      (message) => message.role === 'assistant' && message.tool_calls?.some((toolCall) => toolCall.id === 'call_bad_patch'),
+    );
+    assert.ok(assistantEcho);
+    assert.equal(assistantEcho.tool_calls.some((toolCall) => toolCall.id === 'call_shell_first'), true);
+    const diagnostic = secondMessages.find((message) => message.role === 'tool' && message.tool_call_id === 'call_bad_patch');
+    assert.match(diagnostic.content, /apply_patch was not executed\./);
+    assert.match(diagnostic.content, /edits\[0\] replace_text: "old" must be non-empty/);
+    assert.match(diagnostic.content, /re-issue all intended tool calls/);
+    const shellNotice = secondMessages.find((message) => message.role === 'tool' && message.tool_call_id === 'call_shell_first');
+    assert.match(shellNotice.content, /No tools were executed this round/);
+    assert.match(shellNotice.content, /re-issue all intended tool calls/);
+    const customCalls = body.output.filter((item) => item.type === 'custom_tool_call');
+    assert.equal(customCalls.length, 1);
+    assert.equal(customCalls[0].call_id, 'call_good_patch');
+    assert.equal(customCalls[0].input, '*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch');
+    const shellCalls = body.output.filter((item) => item.type === 'function_call' && item.name === 'shell_command');
+    assert.equal(shellCalls.length, 1);
+    assert.equal(shellCalls[0].call_id, 'call_shell_again');
+    assert.equal(body.output.some((item) => item.type === 'custom_tool_call' && !item.input), false);
+    assert.equal(JSON.stringify(body.output).includes('call_bad_patch'), false);
+    assert.equal(JSON.stringify(body.output).includes('call_shell_first'), false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('corrects invalid apply_patch through streaming rounds when web search is not configured', async () => {
+  const { server: upstream, bodies: upstreamBodies } = jsonUpstream((body) => {
+    if (!body.messages.some((message) => message.role === 'tool')) {
+      return toolCallCompletion([
+        applyPatchCall('call_blank', [{ type: 'insert_text_after', file: 'f.txt', anchor: 'x' }]),
+      ]);
+    }
+    return toolCallCompletion([
+      applyPatchCall('call_fixed', [{ type: 'insert_text_after', file: 'f.txt', anchor: 'x', content: '' }]),
+    ]);
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'insert a blank line',
+        stream: true,
+        tools: [applyPatchTool],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const frames = parseResponsesSse(await response.text());
+    assert.equal(upstreamBodies.length, 2);
+    const diagnostic = upstreamBodies[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'call_blank');
+    assert.match(diagnostic.content, /apply_patch was not executed\./);
+    assert.match(diagnostic.content, /edits\[0\] insert_text_after: "content" is required/);
+    const doneCustomItems = frames
+      .filter((frame) => frame.event === 'response.output_item.done')
+      .map((frame) => frame.data.item)
+      .filter((item) => item.type === 'custom_tool_call');
+    assert.equal(doneCustomItems.length, 1);
+    assert.equal(doneCustomItems[0].call_id, 'call_fixed');
+    assert.equal(doneCustomItems[0].input, '*** Begin Patch\n*** Update File: f.txt\n@@\n x\n+\n*** End Patch');
+    const completed = frames.find((frame) => frame.event === 'response.completed').data.response;
+    const completedCustomItems = completed.output.filter((item) => item.type === 'custom_tool_call');
+    assert.equal(completedCustomItems.length, 1);
+    assert.equal(completedCustomItems[0].call_id, 'call_fixed');
+    assert.equal(completedCustomItems[0].input.length > 0, true);
+    assert.equal(JSON.stringify(frames).includes('call_blank'), false);
+    assert.equal(frames.at(-1).data, '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('corrects invalid apply_patch through streaming rounds while web search is enabled', async () => {
+  const { server: upstream, bodies: upstreamBodies } = jsonUpstream((body) => {
+    if (!body.messages.some((message) => message.role === 'tool')) {
+      return toolCallCompletion([
+        applyPatchCall('call_bad_stream', [{ type: 'modify', file: 'a.txt' }]),
+      ]);
+    }
+    return toolCallCompletion([
+      applyPatchCall('call_good_stream', [{ type: 'delete_text', file: 'a.txt', old: 'stale' }]),
+    ]);
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, {
+      tavilyApiKey: 'tvly-test',
+      tavilyBaseUrl: 'https://tavily.invalid',
+      tavilyWebSearchEnabled: true,
+    }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'delete the stale line',
+        stream: true,
+        tools: [{ type: 'web_search' }, applyPatchTool],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const frames = parseResponsesSse(await response.text());
+    assert.equal(upstreamBodies.length, 2);
+    const diagnostic = upstreamBodies[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'call_bad_stream');
+    assert.match(diagnostic.content, /edits\[0\]: unknown type "modify"/);
+    const doneCustomItems = frames
+      .filter((frame) => frame.event === 'response.output_item.done')
+      .map((frame) => frame.data.item)
+      .filter((item) => item.type === 'custom_tool_call');
+    assert.equal(doneCustomItems.length, 1);
+    assert.equal(doneCustomItems[0].call_id, 'call_good_stream');
+    assert.equal(doneCustomItems[0].input, '*** Begin Patch\n*** Update File: a.txt\n@@\n-stale\n*** End Patch');
+    const completed = frames.find((frame) => frame.event === 'response.completed').data.response;
+    assert.equal(completed.output.some((item) => item.type === 'custom_tool_call' && !item.input), false);
+    assert.equal(JSON.stringify(frames).includes('call_bad_stream'), false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('gives one correction round then exhausts persistently invalid apply_patch regardless of webSearchMaxRounds', async () => {
+  const { server: upstream, bodies: upstreamBodies } = jsonUpstream(() => toolCallCompletion([
+    applyPatchCall('call_always_bad', [{ type: 'replace_text', file: 'a.txt', new: 'x' }]),
+  ]));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, { webSearchMaxRounds: 0 }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'edit the file',
+        tools: [applyPatchTool],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(upstreamBodies.length, 3);
+    const correctionNotice = upstreamBodies[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'call_always_bad');
+    assert.match(correctionNotice.content, /apply_patch was not executed\./);
+    assert.match(correctionNotice.content, /re-issue all intended tool calls/);
+    assert.doesNotMatch(correctionNotice.content, /No correction rounds remain/);
+    const exhaustedNotice = upstreamBodies[2].messages.filter((message) => message.role === 'tool' && message.tool_call_id === 'call_always_bad').at(-1);
+    assert.match(exhaustedNotice.content, /apply_patch was not executed\./);
+    assert.match(exhaustedNotice.content, /No correction rounds remain/);
+    assert.equal(body.status, 'completed');
+    assert.equal(body.output.some((item) => item.type === 'custom_tool_call'), false);
+    assert.equal(body.output.some((item) => item.type === 'function_call'), false);
+    const message = body.output.find((item) => item.type === 'message');
+    assert.match(message.content[0].text, /Incomplete response/);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('exhausts persistently invalid apply_patch after one streaming correction round regardless of webSearchMaxRounds', async () => {
+  const { server: upstream, bodies: upstreamBodies } = jsonUpstream(() => toolCallCompletion([
+    applyPatchCall('call_stream_always_bad', [{ type: 'replace_text', file: 'a.txt', new: 'x' }]),
+  ]));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, { webSearchMaxRounds: 0 }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'edit the file',
+        stream: true,
+        tools: [applyPatchTool],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const frames = parseResponsesSse(await response.text());
+    assert.equal(upstreamBodies.length, 3);
+    const correctionNotice = upstreamBodies[1].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'call_stream_always_bad');
+    assert.match(correctionNotice.content, /apply_patch was not executed\./);
+    assert.match(correctionNotice.content, /re-issue all intended tool calls/);
+    assert.doesNotMatch(correctionNotice.content, /No correction rounds remain/);
+    assert.equal(upstreamBodies[2].messages.some((message) => message.role === 'tool' && /No correction rounds remain/.test(message.content)), true);
+    const completed = frames.find((frame) => frame.event === 'response.completed').data.response;
+    assert.equal(completed.output.some((item) => item.type === 'custom_tool_call'), false);
+    assert.equal(completed.output.some((item) => item.type === 'function_call'), false);
+    assert.match(completed.output_text, /Incomplete response/);
+    assert.equal(frames.at(-1).data, '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('assigns ids to id-less upstream tool calls so invalid apply_patch never leaks empty-input items', async () => {
+  const { server: upstream, bodies: upstreamBodies } = jsonUpstream(() => toolCallCompletion([
+    {
+      type: 'function',
+      function: {
+        name: 'apply_patch',
+        arguments: JSON.stringify({ edits: [{ type: 'replace_text', file: 'a.txt', new: 'x' }] }),
+      },
+    },
+  ]));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, { webSearchMaxRounds: 0 }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: 'edit the file',
+        tools: [applyPatchTool],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(upstreamBodies.length, 3);
+    const assistantEcho = upstreamBodies[1].messages.find(
+      (message) => message.role === 'assistant' && Array.isArray(message.tool_calls),
+    );
+    assert.ok(assistantEcho.tool_calls[0].id);
+    const diagnostic = upstreamBodies[1].messages.find((message) => message.role === 'tool');
+    assert.equal(diagnostic.tool_call_id, assistantEcho.tool_calls[0].id);
+    assert.match(diagnostic.content, /apply_patch was not executed\./);
+    assert.match(diagnostic.content, /edits\[0\] replace_text: "old" must be non-empty/);
+    assert.equal(body.status, 'completed');
+    assert.equal(body.output.some((item) => item.type === 'custom_tool_call'), false);
+    assert.equal(body.output.some((item) => item.type === 'function_call'), false);
+    assert.match(body.output.find((item) => item.type === 'message').content[0].text, /Incomplete response/);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('logs bounded patch-only correction diagnostics without labeling them as web search', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'gateway-patch-debug-'));
+  const debugPath = join(tempDir, 'debug.log');
+  const { server: upstream } = jsonUpstream((body) => (
+    body.messages.some((message) => message.role === 'tool')
+      ? toolCallCompletion([applyPatchCall('call_debug_good', [{ type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' }])])
+      : toolCallCompletion([applyPatchCall('call_debug_bad', [{ type: 'replace_text', file: 'a.txt', new: 'new' }])])
+  ));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, { debugPayload: true, debugPayloadLogPath: debugPath }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: 'edit the file', tools: [applyPatchTool] }),
+    });
+    assert.equal(response.status, 200);
+    await response.json();
+    const log = await readFile(debugPath, 'utf8');
+    assert.doesNotMatch(log, /\[codex-deepseek-gateway\] web search usage /);
+    const line = log.split(/\r?\n/).find((entry) => entry.startsWith('[codex-deepseek-gateway] apply patch usage '));
+    const usage = JSON.parse(line.replace('[codex-deepseek-gateway] apply patch usage ', ''));
+    assert.equal(usage.stage, 'apply_patch');
+    assert.equal(usage.rounds, 2);
+    assert.equal(usage.apply_patch.calls, 2);
+    assert.equal(usage.apply_patch.validCalls, 1);
+    assert.equal(usage.apply_patch.invalidCalls, 1);
+    assert.equal(usage.apply_patch.correctionRounds, 1);
+    assert.equal(usage.apply_patch.exhausted, false);
+    assert.equal(usage.apply_patch.validationOutcome, 'corrected');
+    assert.deepEqual(usage.apply_patch.errorCategories, ['schema']);
+    assert.doesNotMatch(log, /test-key|"old":"old"/);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+  });
+
+  await scenario('logs streaming patch correction exhaustion independently of web diagnostics', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'gateway-patch-debug-'));
+  const debugPath = join(tempDir, 'debug.log');
+  const { server: upstream } = jsonUpstream(() => toolCallCompletion([
+    applyPatchCall('call_debug_always_bad', [{ type: 'modify', file: 'a.txt' }]),
+  ]));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, { debugPayload: true, debugPayloadLogPath: debugPath }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: 'edit the file', stream: true, tools: [applyPatchTool] }),
+    });
+    assert.equal(response.status, 200);
+    parseResponsesSse(await response.text());
+    const log = await readFile(debugPath, 'utf8');
+    assert.doesNotMatch(log, /\[codex-deepseek-gateway\] web search usage /);
+    const line = log.split(/\r?\n/).find((entry) => entry.startsWith('[codex-deepseek-gateway] apply patch usage '));
+    const usage = JSON.parse(line.replace('[codex-deepseek-gateway] apply patch usage ', ''));
+    assert.equal(usage.stage, 'apply_patch_stream');
+    assert.equal(usage.rounds, 3);
+    assert.equal(usage.apply_patch.calls, 3);
+    assert.equal(usage.apply_patch.validCalls, 0);
+    assert.equal(usage.apply_patch.invalidCalls, 3);
+    assert.equal(usage.apply_patch.correctionRounds, 1);
+    assert.equal(usage.apply_patch.exhausted, true);
+    assert.equal(usage.apply_patch.validationOutcome, 'exhausted');
+    assert.deepEqual(usage.apply_patch.errorCategories, ['edit_type']);
+    assert.doesNotMatch(log, /test-key|"type":"modify"/);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+  });
+});
+
+test('apply_patch structured argument replay restoration', async () => {
+  const applyPatchTool = {
+    type: 'custom',
+    name: 'apply_patch',
+    description: 'Edit files.',
+    format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+  };
+  const applyPatchEnvTool = {
+    type: 'custom',
+    name: 'apply_patch',
+    description: 'Edit files.',
+    format: {
+      type: 'grammar',
+      syntax: 'lark',
+      definition: [
+        'start: begin_patch environment_id? hunk+ end_patch',
+        'environment_id: "*** Environment ID: " filename LF',
+        'begin_patch: "*** Begin Patch" LF',
+        'end_patch: "*** End Patch" LF?',
+      ].join('\n'),
+    },
+  };
+  const shellTool = {
+    type: 'function',
+    name: 'shell_command',
+    description: 'Run a shell command.',
+    parameters: {
+      type: 'object',
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  };
+  const structuredCall = (id, args) => ({
+    id,
+    type: 'function',
+    function: { name: 'apply_patch', arguments: JSON.stringify(args) },
+  });
+  const toolCallCompletion = (toolCalls) => JSON.stringify({
+    choices: [{ message: { role: 'assistant', content: '', tool_calls: toolCalls }, finish_reason: 'tool_calls' }],
+  });
+  const textCompletion = (text) => JSON.stringify({
+    choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+  });
+  const jsonUpstream = (handler) => {
+    const bodies = [];
+    const server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      bodies.push(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(handler(body, bodies.length));
+    });
+    return { server, bodies };
+  };
+  const gatewayConfig = (upstreamUrl, overrides = {}) => ({
+    upstreamBaseUrl: upstreamUrl,
+    upstreamApiKey: 'test-key',
+    upstreamModel: 'deepseek-v4-flash',
+    upstreamProvider: 'deepseek',
+    upstreamTimeoutMs: 5000,
+    ...overrides,
+  });
+  const replayInput = (item) => [
+    JSON.parse(JSON.stringify(item)),
+    { type: 'custom_tool_call_output', call_id: item.call_id, output: 'applied' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] },
+  ];
+  const failedReplayInput = (item) => [
+    JSON.parse(JSON.stringify(item)),
+    {
+      type: 'custom_tool_call_output',
+      call_id: item.call_id,
+      output: 'apply_patch verification failed: Failed to find expected lines in a.txt:\n# Title',
+    },
+  ];
+  const assistantApplyPatchCall = (body) => {
+    const message = (body.messages || []).find((entry) => entry.role === 'assistant' && Array.isArray(entry.tool_calls));
+    return message?.tool_calls?.find((toolCall) => toolCall.function?.name === 'apply_patch');
+  };
+
+  await scenario('restores structured edits with an environment id after a real non-streaming replay round-trip', async () => {
+  const edits = [{ type: 'add_file', file: 'env.md', content: 'ok' }];
+  const { server: upstream, bodies } = jsonUpstream((body) => (
+    assistantApplyPatchCall(body)
+      ? textCompletion('done')
+      : toolCallCompletion([structuredCall('call_env_replay', { environment_id: 'workspace', edits })])
+  ));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({ config: gatewayConfig(upstreamUrl), reasoningCache: new ReasoningCache() });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const first = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: 'edit the file', tools: [applyPatchEnvTool] }),
+    });
+    assert.equal(first.status, 200);
+    const firstBody = await first.json();
+    const item = firstBody.output.find((entry) => entry.type === 'custom_tool_call');
+    assert.ok(item);
+    assert.equal(item.arguments, undefined);
+    assert.match(item.input, /\*\*\* Environment ID: workspace/);
+
+    const second = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: replayInput(item), tools: [applyPatchEnvTool] }),
+    });
+    assert.equal(second.status, 200);
+    assert.equal(bodies.length, 2);
+    const restored = assistantApplyPatchCall(bodies[1]);
+    assert.ok(restored);
+    const restoredArgs = JSON.parse(restored.function.arguments);
+    assert.deepEqual(restoredArgs.edits, edits);
+    assert.equal(restoredArgs.environment_id, 'workspace');
+    assert.equal(restoredArgs.input, undefined);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('restores structured edits after a real streaming replay round-trip', async () => {
+  const edits = [{ type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' }];
+  const { server: upstream, bodies } = jsonUpstream((body) => (
+    assistantApplyPatchCall(body)
+      ? textCompletion('done')
+      : toolCallCompletion([structuredCall('call_stream_replay', { edits })])
+  ));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({ config: gatewayConfig(upstreamUrl), reasoningCache: new ReasoningCache() });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const first = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: 'edit the file', stream: true, tools: [applyPatchTool] }),
+    });
+    assert.equal(first.status, 200);
+    const frames = parseResponsesSse(await first.text());
+    const completed = frames.find((frame) => frame.event === 'response.completed').data.response;
+    const item = completed.output.find((entry) => entry.type === 'custom_tool_call');
+    assert.ok(item);
+    assert.equal(item.arguments, undefined);
+    assert.equal(item.input, '*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch');
+
+    const second = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: replayInput(item), tools: [applyPatchTool] }),
+    });
+    assert.equal(second.status, 200);
+    assert.equal(bodies.length, 2);
+    const restored = assistantApplyPatchCall(bodies[1]);
+    assert.ok(restored);
+    const restoredArgs = JSON.parse(restored.function.arguments);
+    assert.deepEqual(restoredArgs.edits, edits);
+    assert.equal(restoredArgs.environment_id, undefined);
+    assert.equal(restoredArgs.input, undefined);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('emits a deterministic shell compatibility call after a replayed native BOM-style match failure', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'gateway-bom-debug-'));
+  const debugPath = join(tempDir, 'debug.log');
+  const edits = [{ type: 'replace_text', file: 'a.txt', old: '# Title', new: '# Updated' }];
+  const { server: upstream, bodies } = jsonUpstream(() => toolCallCompletion([structuredCall('call_bom_replay', { edits })]));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: gatewayConfig(upstreamUrl, { debugPayload: true, debugPayloadLogPath: debugPath }),
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const first = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: 'edit the file', tools: [applyPatchTool, shellTool] }),
+    });
+    assert.equal(first.status, 200);
+    const item = (await first.json()).output.find((entry) => entry.type === 'custom_tool_call');
+    assert.ok(item);
+
+    const second = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: failedReplayInput(item), tools: [applyPatchTool, shellTool] }),
+    });
+    assert.equal(second.status, 200);
+    const secondBody = await second.json();
+    assert.equal(bodies.length, 1);
+    const shell = secondBody.output.find((entry) => entry.type === 'function_call' && entry.name === 'shell_command');
+    assert.ok(shell);
+    assert.match(shell.call_id, /^call_dsgw_bom_/);
+    const args = JSON.parse(shell.arguments);
+    assert.match(args.command, /apply-patch-bom\.js/);
+    assert.doesNotMatch(args.command, /# Title|# Updated/);
+
+    const third = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: [
+          item,
+          failedReplayInput(item)[1],
+          shell,
+          {
+            type: 'function_call_output',
+            call_id: shell.call_id,
+            output: 'Exit code: 2\nOutput:\nUTF-8 BOM compatibility not applied (content_mismatch): exact text was not found.',
+          },
+        ],
+        tools: [applyPatchTool, shellTool],
+      }),
+    });
+    assert.equal(third.status, 200);
+    await third.json();
+    assert.equal(bodies.length, 2);
+    const log = await readFile(debugPath, 'utf8');
+    const attempted = log.split(/\r?\n/).find((entry) => entry.startsWith('[codex-deepseek-gateway] apply patch compatibility '));
+    const completed = log.split(/\r?\n/).find((entry) => entry.startsWith('[codex-deepseek-gateway] apply patch compatibility result '));
+    assert.ok(attempted);
+    assert.ok(completed);
+    const diagnostic = JSON.parse(completed.replace('[codex-deepseek-gateway] apply patch compatibility result ', ''));
+    assert.equal(diagnostic.compatibility_call_id, shell.call_id);
+    assert.equal(diagnostic.outcome, 'content_mismatch');
+    assert.equal(diagnostic.applied, false);
+    assert.doesNotMatch(log, /# Title|# Updated/);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+  });
+
+  await scenario('streams the deterministic BOM compatibility call without another provider request', async () => {
+  const edits = [{ type: 'replace_text', file: 'a.txt', old: '# Title', new: '# Updated' }];
+  const { server: upstream, bodies } = jsonUpstream(() => toolCallCompletion([structuredCall('call_bom_stream_replay', { edits })]));
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({ config: gatewayConfig(upstreamUrl), reasoningCache: new ReasoningCache() });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const first = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: 'edit the file', tools: [applyPatchTool, shellTool] }),
+    });
+    const item = (await first.json()).output.find((entry) => entry.type === 'custom_tool_call');
+    assert.ok(item);
+
+    const second = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex',
+        input: failedReplayInput(item),
+        stream: true,
+        tools: [applyPatchTool, shellTool],
+      }),
+    });
+    assert.equal(second.status, 200);
+    const frames = parseResponsesSse(await second.text());
+    assert.equal(bodies.length, 1);
+    const shell = frames
+      .filter((frame) => frame.event === 'response.output_item.done')
+      .map((frame) => frame.data.item)
+      .find((entry) => entry.type === 'function_call' && entry.name === 'shell_command');
+    assert.ok(shell);
+    assert.match(shell.call_id, /^call_dsgw_bom_/);
+    assert.equal(frames.some((frame) => frame.event === 'response.completed'), true);
+    assert.equal(frames.at(-1).data, '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+  });
+
+  await scenario('leaves the degenerate input wrapper when the reasoning cache misses the call', async () => {
+  const edits = [{ type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' }];
+  const { server: upstream, bodies } = jsonUpstream((body) => (
+    assistantApplyPatchCall(body)
+      ? textCompletion('done')
+      : toolCallCompletion([structuredCall('call_miss', { edits })])
+  ));
+  const upstreamUrl = await listen(upstream);
+  const warmProxy = createProxyServer({ config: gatewayConfig(upstreamUrl), reasoningCache: new ReasoningCache() });
+  const freshProxy = createProxyServer({ config: gatewayConfig(upstreamUrl), reasoningCache: new ReasoningCache() });
+  const warmProxyUrl = await listen(warmProxy);
+  const freshProxyUrl = await listen(freshProxy);
+
+  try {
+    const first = await fetch(`${warmProxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: 'edit the file', tools: [applyPatchTool] }),
+    });
+    assert.equal(first.status, 200);
+    const item = (await first.json()).output.find((entry) => entry.type === 'custom_tool_call');
+    assert.ok(item);
+
+    const second = await fetch(`${freshProxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex', input: replayInput(item), tools: [applyPatchTool] }),
+    });
+    assert.equal(second.status, 200);
+    assert.equal(bodies.length, 2);
+    const unrestored = assistantApplyPatchCall(bodies[1]);
+    assert.ok(unrestored);
+    const unrestoredArgs = JSON.parse(unrestored.function.arguments);
+    assert.equal(unrestoredArgs.input, item.input);
+    assert.equal(Array.isArray(unrestoredArgs.edits), false);
+  } finally {
+    await close(warmProxy);
+    await close(freshProxy);
+    await close(upstream);
+  }
+  });
+});
+
 test('streaming Responses lifecycle and terminal behavior', async () => {
   await scenario('returns upstream stream errors before opening Responses SSE', async () => {
   const upstream = http.createServer(async (_req, res) => {
@@ -3055,7 +4150,7 @@ test('streaming Responses lifecycle and terminal behavior', async () => {
       upstreamModel: 'deepseek-v4-pro',
       upstreamProvider: 'deepseek',
       upstreamTimeoutMs: 5000,
-      codexReasoningEffort: 'xhigh',
+      codexReasoningEffort: 'max',
     },
     reasoningCache: new ReasoningCache(),
   });
@@ -3065,7 +4160,7 @@ test('streaming Responses lifecycle and terminal behavior', async () => {
     const response = await fetch(`${proxyUrl}/v1/responses`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-v4-pro', input: 'ping', reasoning: { effort: 'xhigh' }, stream: true }),
+      body: JSON.stringify({ model: 'deepseek-v4-pro', input: 'ping', reasoning: { effort: 'max' }, stream: true }),
     });
     assert.equal(response.status, 200);
     const text = await response.text();

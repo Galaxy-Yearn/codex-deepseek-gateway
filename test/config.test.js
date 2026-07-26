@@ -54,8 +54,19 @@ test('gateway configuration precedence and defaults', async () => {
     assert.equal(config.requestBodyMaxBytes, 1048576);
     assert.equal(config.shutdownTimeoutMs, 4000);
     assert.equal(config.tavilyWebSearchEnabled, false);
-    assert.equal(config.tavilyMaxSearchRounds, 20);
+    assert.equal(config.webSearchMaxRounds, 60);
+    assert.equal(config.tavilyChunksPerSource, 3);
+    assert.equal(config.tavilyResultMaxChars, 12000);
     assert.equal(config.firecrawlAutoScrapeTopResults, 1);
+    assert.equal(config.firecrawlPageMaxChars, 10000);
+    assert.equal(config.firecrawlResultMaxChars, 20000);
+    assert.equal(config.firecrawlMaxAgeMs, 172800000);
+    assert.equal(config.firecrawlStoreInCache, true);
+    assert.equal(config.webSearchMaxSearches, 30);
+    assert.equal(config.webSearchMaxPages, 50);
+    assert.equal(config.webSearchMaxToolChars, 240000);
+    assert.equal(config.webSearchTurnTimeoutMs, 180000);
+    assert.equal(config.webSearchConcurrency, 3);
     assert.equal(config.codexPromptLanguage, 'en');
     assert.equal(config.reasoningCacheEnabled, true);
     assert.equal(config.reasoningCachePath, join(dir, 'state', 'reasoning-cache.jsonl'));
@@ -232,7 +243,7 @@ test('Codex config parsing', async () => {
     await writeFile(file, [
       'model_provider = "deepseek-gateway"',
       'model = "deepseek-v4-pro"',
-      'model_reasoning_effort = "xhigh"',
+      'model_reasoning_effort = "max"',
       'model_supports_reasoning_summaries = true',
       'model_reasoning_summary = "auto"',
       '',
@@ -242,7 +253,7 @@ test('Codex config parsing', async () => {
     const config = readCodexConfig({ CODEX_CONFIG_FILE: file });
     assert.equal(config.modelProvider, 'deepseek-gateway');
     assert.equal(config.model, 'deepseek-v4-pro');
-    assert.equal(config.modelReasoningEffort, 'xhigh');
+    assert.equal(config.modelReasoningEffort, 'max');
     assert.equal(config.modelSupportsReasoningSummaries, 'true');
     assert.equal(config.modelReasoningSummary, 'auto');
   } finally {

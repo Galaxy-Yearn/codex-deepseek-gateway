@@ -138,14 +138,19 @@ export function parseList(value) {
     .filter(Boolean);
 }
 
-export function mapDeepSeekReasoningEffort(effort) {
-  if (!effort) return undefined;
-  const normalized = String(effort).toLowerCase().replaceAll('_', '-');
-  if (normalized === 'low') return undefined;
-  if (normalized === 'none' || normalized === 'disabled' || normalized === 'off' || normalized === 'false') return undefined;
-  if (normalized === 'xhigh' || normalized === 'max') return 'max';
-  if (normalized === 'medium' || normalized === 'high') return 'high';
-  return undefined;
+function isControlCodePoint(codePoint) {
+  return (codePoint >= 0 && codePoint <= 31) || (codePoint >= 127 && codePoint <= 159);
+}
+
+export function normalizeSearchQuery(value, maxChars) {
+  const source = String(value ?? '');
+  let stripped = '';
+  for (const character of source) {
+    stripped += isControlCodePoint(character.codePointAt(0)) ? ' ' : character;
+  }
+  const text = stripped.replace(/\s+/g, ' ').trim();
+  if (!maxChars || text.length <= maxChars) return text;
+  return text.slice(0, maxChars).trim();
 }
 
 export function joinUrl(baseUrl, path) {

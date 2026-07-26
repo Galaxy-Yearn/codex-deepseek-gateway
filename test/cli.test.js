@@ -115,6 +115,8 @@ test('CLI version and installation lifecycle', async () => {
     await writeFile(localConfigPath, JSON.stringify(localConfig, null, 2));
     await writeFile(reasoningCachePath, reasoningCache);
     await writeFile(join(dir, 'src-stale.txt'), 'leave unrelated files alone');
+    await writeFile(join(dir, 'gateway.debug.log'), 'old debug');
+    await writeFile(join(dir, 'gateway.debug.log.1'), 'older debug');
     await mkdir(join(dir, 'src'), { recursive: true });
     await writeFile(join(dir, 'src', 'stale.js'), 'stale');
     await writeFile(join(dir, 'config', 'model-aliases.json'), JSON.stringify({ stale: { model: 'stale' } }));
@@ -133,6 +135,8 @@ test('CLI version and installation lifecycle', async () => {
     assert.equal(existsSync(join(dir, 'bin', 'codex-deepseek-gateway.js')), true);
     assert.equal(existsSync(join(dir, 'src', 'server.js')), true);
     assert.equal(existsSync(join(dir, 'src', 'stale.js')), false);
+    assert.equal(existsSync(join(dir, 'gateway.debug.log')), false);
+    assert.equal(existsSync(join(dir, 'gateway.debug.log.1')), false);
     assert.equal(existsSync(join(dir, 'config', 'codex-model-catalog.json')), true);
     assert.equal(existsSync(join(dir, 'config', 'codex-model-catalog.zh.json')), true);
     assert.equal(existsSync(join(dir, 'config', 'frontend-design-guidance', 'en.md')), true);
@@ -290,9 +294,9 @@ test('CLI version and installation lifecycle', async () => {
       ['root', '-g'],
     ]);
     assert.match(output, /Installing @galaxy-yearn\/codex-deepseek-gateway@latest/);
-    assert.match(output, /Gateway status: HEALTHY/);
-    assert.match(output, /Gateway doctor: OK/);
-    assert.match(output, new RegExp(`Version: ${updatedVersion}`));
+    assert.doesNotMatch(output, /Gateway status:/);
+    assert.doesNotMatch(output, /Gateway doctor:/);
+    assert.doesNotMatch(output, new RegExp(`Version: ${updatedVersion}`));
     assert.equal(JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version, updatedVersion);
     const newPid = JSON.parse(readFileSync(join(dir, 'gateway.pid'), 'utf8')).pid;
     assert.notEqual(newPid, oldPid);
@@ -388,6 +392,229 @@ test('CLI version and installation lifecycle', async () => {
     ), /Missing DeepSeek API key/);
     assert.equal(existsSync(fakeLatest.npmLog), false);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+  });
+  await scenario('help output, unknown commands, and invalid options fail fast', async () => {
+  const runCli = (args) => execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', ...args], {
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  for (const helpArgs of [['help'], []]) {
+    const usage = runCli(helpArgs);
+    assert.match(usage, /Usage:/);
+    assert.match(usage, /codex-deepseek-gateway sessions/);
+    assert.match(usage, /codex-deepseek-gateway uninstall/);
+    assert.match(usage, /--reasoning-effort <level>/);
+  }
+  const failures = [
+    [['frobnicate'], /Unknown command: frobnicate/],
+    [['--dir'], /--dir requires a path/],
+    [['sessions', '--limit', '0'], /--limit requires a positive integer/],
+    [['sessions', '--model'], /--model requires a model id/],
+    [['sessions', '--provider'], /--provider requires a provider id/],
+    [['sessions', '--reasoning-effort'], /--reasoning-effort requires a reasoning effort/],
+    [['sessions', '--exec'], /--exec requires a session id/],
+    [['new', '--print'], /--print is only supported with sessions/],
+  ];
+  for (const [args, pattern] of failures) {
+    let failure;
+    try {
+      runCli(args);
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.status, 1, args.join(' '));
+    assert.match(String(failure.stderr), pattern);
+  }
+  });
+  await scenario('start guards missing runtimes, missing keys, and occupied endpoints', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-cli-start-'));
+  const env = { ...process.env };
+  delete env.DEEPSEEK_API_KEY;
+  delete env.UPSTREAM_API_KEY;
+  delete env.GATEWAY_CONFIG_FILE;
+  const runCli = (args) => execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', ...args], {
+    encoding: 'utf8',
+    env,
+    timeout: 20000,
+  });
+  const dir = join(root, 'install');
+  try {
+    let failure;
+    try {
+      runCli(['start', '--dir', join(root, 'missing')]);
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.status, 1);
+    assert.match(String(failure.stderr), /Missing runtime at .*\. Run install first\./);
+
+    const installed = runCli(['install', '--no-edit', '--dir', dir]);
+    assert.match(installed, /Edit this file and put your DeepSeek API key:/);
+    failure = undefined;
+    try {
+      runCli(['start', '--dir', dir]);
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.status, 1);
+    assert.match(String(failure.stderr), /Missing DeepSeek API key/);
+
+    failure = undefined;
+    try {
+      runCli(['doctor', '--json', '--dir', dir]);
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.status, 1);
+    const doctorReport = JSON.parse(String(failure.stdout));
+    assert.equal(doctorReport.overallStatus, 'fail');
+    assert.equal(doctorReport.checks['config.gateway'].status, 'fail');
+    assert.match(doctorReport.checks['config.gateway'].summary, /DeepSeek API key is missing/);
+    assert.equal(doctorReport.checks['upstream.models'].status, 'skipped');
+
+    const unroutablePort = await freePort();
+    await writeFile(join(dir, 'config', 'gateway.local.json'), JSON.stringify({
+      upstreamApiKey: 'test-key',
+      host: '203.0.113.99',
+      port: unroutablePort,
+    }));
+    failure = undefined;
+    try {
+      runCli(['start', '--dir', dir]);
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.status, 1);
+    assert.match(String(failure.stderr), /Gateway did not become reachable on http:\/\/203\.0\.113\.99:\d+/);
+    assert.equal(existsSync(join(dir, 'gateway.pid')), false);
+
+    const port = await freePort();
+    await writeFile(join(dir, 'config', 'gateway.local.json'), JSON.stringify({
+      upstreamApiKey: 'test-key',
+      host: '127.0.0.1',
+      port,
+      shutdownTimeoutMs: 1000,
+    }));
+    assert.match(runCli(['start', '--dir', dir]), /Gateway started\. PID \d+/);
+    assert.match(runCli(['start', '--dir', dir]), /Gateway is already running\./);
+    assert.match(runCli(['stop', '--dir', dir]), /Gateway stopped\./);
+    assert.match(runCli(['stop', '--dir', dir]), /Gateway stopped\./);
+
+    const orphan = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      await writeFile(join(dir, 'gateway.pid'), String(orphan.pid));
+      failure = undefined;
+      try {
+        runCli(['start', '--dir', dir]);
+      } catch (error) {
+        failure = error;
+      }
+      assert.equal(failure?.status, 1);
+      assert.match(String(failure.stderr), new RegExp(`Recorded PID ${orphan.pid} cannot be authenticated`));
+    } finally {
+      if (processExists(orphan.pid)) process.kill(orphan.pid, 'SIGKILL');
+    }
+    await rm(join(dir, 'gateway.pid'), { force: true });
+
+    const foreignPort = await freePort();
+    const foreign = spawn(process.execPath, ['-e', `const server=require('node:http').createServer((request,response)=>{if(request.url==='/shutdown'){response.end();server.close(()=>process.exit(0));return}response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify({ok:true}))});server.listen(${foreignPort},'127.0.0.1')`], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    try {
+      await waitForHttp(`http://127.0.0.1:${foreignPort}/health`);
+      await writeFile(join(dir, 'config', 'gateway.local.json'), JSON.stringify({
+        upstreamApiKey: 'test-key',
+        host: '127.0.0.1',
+        port: foreignPort,
+      }));
+      assert.match(
+        runCli(['start', '--dir', dir]),
+        /Gateway is already reachable at http:\/\/127\.0\.0\.1:\d+\. Another install may already be running\./,
+      );
+      assert.match(
+        runCli(['stop', '--dir', dir]),
+        /No gateway process is recorded for this install\. http:\/\/127\.0\.0\.1:\d+ is still reachable, likely from another install\./,
+      );
+    } finally {
+      await stopHttpChild(`http://127.0.0.1:${foreignPort}/shutdown`, foreign);
+    }
+  } finally {
+    try {
+      runCli(['stop', '--force', '--dir', dir]);
+    } catch {
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+  });
+  await scenario('uninstall stops the gateway and removes only real installs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-cli-uninstall-'));
+  const env = { ...process.env };
+  delete env.DEEPSEEK_API_KEY;
+  delete env.UPSTREAM_API_KEY;
+  delete env.GATEWAY_CONFIG_FILE;
+  const runCli = (args, cliPath = 'bin/codex-deepseek-gateway.js') => execFileSync(process.execPath, [cliPath, ...args], {
+    encoding: 'utf8',
+    env,
+    timeout: 20000,
+  });
+  const dir = join(root, 'install');
+  try {
+    assert.match(runCli(['uninstall', '--dir', join(root, 'missing')]), /No install found at /);
+
+    const checkoutDir = join(root, 'checkout');
+    await cp('bin', join(checkoutDir, 'bin'), { recursive: true });
+    await cp('src', join(checkoutDir, 'src'), { recursive: true });
+    await cp('package.json', join(checkoutDir, 'package.json'));
+    let failure;
+    try {
+      runCli(['uninstall', '--dir', checkoutDir], join(checkoutDir, 'bin', 'codex-deepseek-gateway.js'));
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.status, 1);
+    assert.match(String(failure.stderr), /Refusing to remove source checkout /);
+    assert.equal(existsSync(join(checkoutDir, 'src')), true);
+
+    const foreignDir = join(root, 'not-gateway');
+    await mkdir(join(foreignDir, 'bin'), { recursive: true });
+    await mkdir(join(foreignDir, 'src'), { recursive: true });
+    await writeFile(join(foreignDir, 'package.json'), '{broken');
+    await writeFile(join(foreignDir, 'bin', 'codex-deepseek-gateway.js'), 'keep');
+    await writeFile(join(foreignDir, 'src', 'server.js'), 'keep');
+    failure = undefined;
+    try {
+      runCli(['uninstall', '--dir', foreignDir]);
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.status, 1);
+    assert.match(String(failure.stderr), /Refusing to remove .*not-gateway/);
+    assert.equal(existsSync(join(foreignDir, 'src', 'server.js')), true);
+
+    const port = await freePort();
+    await mkdir(join(dir, 'config'), { recursive: true });
+    await writeFile(join(dir, 'config', 'gateway.local.json'), JSON.stringify({
+      upstreamApiKey: 'test-key',
+      host: '127.0.0.1',
+      port,
+      shutdownTimeoutMs: 1000,
+    }));
+    runCli(['install', '--no-edit', '--dir', dir]);
+    const pid = JSON.parse(readFileSync(join(dir, 'gateway.pid'), 'utf8')).pid;
+    assert.equal(processExists(pid), true);
+    const removed = runCli(['uninstall', '--dir', dir]);
+    assert.match(removed, /Gateway stopped\./);
+    assert.match(removed, /Removed /);
+    assert.equal(existsSync(dir), false);
+    assert.equal(processExists(pid), false);
+  } finally {
+    try {
+      runCli(['stop', '--force', '--dir', dir]);
+    } catch {
+    }
     await rm(root, { recursive: true, force: true });
   }
   });

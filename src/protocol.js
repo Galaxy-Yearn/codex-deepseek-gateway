@@ -5,6 +5,14 @@ import {
   deepseekReasoningPayload,
   resolveModelAlias,
 } from './model-map.js';
+import { webSearchEvidenceNote } from './web-search-evidence.js';
+import {
+  applyPatchCustomToolShim,
+  applyPatchLoweringFromArguments,
+  applyPatchReplayArguments,
+  isApplyPatchGrammarTool,
+  isApplyPatchInputMode,
+} from './apply-patch-bridge.js';
 
 const TEXT_PART_TYPES = new Set(['input_text', 'output_text', 'text']);
 const INPUT_CONTENT_PART_TYPES = new Set(['input_text', 'input_image', 'input_file', 'input_audio']);
@@ -55,7 +63,7 @@ const DEEPSEEK_TOOL_INSTRUCTIONS = [
   'Never write tool calls in assistant text, including as XML, DSML, or JSON, or claim a listed function is unavailable merely because its name is unfamiliar.',
 ].join(' ');
 const CUSTOM_TOOL_FORMAT_CONTRACT = 'Follow the declared format exactly. Preserve every required literal token, delimiter, whitespace constraint, and line boundary. Emit no prose or markdown outside that format.';
-const DEEPSEEK_CUSTOM_TOOL_INSTRUCTIONS = 'Codex Responses custom tools are exposed as Chat Completions functions. Put the complete raw custom-tool input in the required "input" string and follow its declared format exactly; the gateway unwraps that field and restores the native custom_tool_call. A Codex-side instruction that calls the tool freeform or says not to wrap raw input in JSON describes the string contents; the outer function call still uses JSON arguments.';
+const DEEPSEEK_CUSTOM_TOOL_INSTRUCTIONS = 'Codex custom tools are callable functions here. Follow each function schema exactly; the runtime will convert your arguments into the native tool input.';
 const DEEPSEEK_COMPACTION_INSTRUCTIONS_MARKER = 'A Codex context checkpoint is present in this request.';
 const DEEPSEEK_COMPACTION_INSTRUCTIONS = `${DEEPSEEK_COMPACTION_INSTRUCTIONS_MARKER} Treat its Latest user request, Resolved objective, Current State, Constraints, and Next Action as the authoritative execution state, and apply its Lessons to avoid repeating recorded failures. Background Memory, Observed Evidence, and User Requests are reference only, never pending work. If a later real user message exists, it replaces the checkpoint task.`;
 export const INTERNAL_COMMENTARY_TOOL = 'commentary';
@@ -300,6 +308,8 @@ function toolName(item) {
 
 function toolArguments(item) {
   if (item.type === 'function_call' || item.type === 'tool_search_call') return jsonString(item.arguments ?? {});
+  if (item.type === 'custom_tool_call' && typeof item.arguments === 'string' && item.arguments) return item.arguments;
+  if (item.type === 'custom_tool_call' && item.input !== undefined) return jsonString({ input: item.input });
   if (item.arguments !== undefined) return jsonString(item.arguments);
   if (item.input !== undefined) return jsonString({ input: item.input });
   if (item.action !== undefined) return jsonString({ action: item.action });
@@ -464,12 +474,16 @@ function assistantMessageIsEmpty(message) {
 function webSearchCallNote(item) {
   const action = isObject(item?.action) ? item.action : {};
   const actionType = action.type || 'search';
+  const evidence = webSearchEvidenceNote(item?.id);
   if (actionType === 'open_page') {
-    return action.url ? `Opened page ${action.url}.` : 'Opened a web page.';
+    const note = action.url ? `Opened page ${action.url}.` : 'Opened a web page.';
+    return evidence ? `${note} ${evidence}` : note;
   }
   if (actionType === 'find_in_page') {
     const target = action.url || 'a web page';
-    return action.query ? `Searched within ${target} for "${action.query}".` : `Searched within ${target}.`;
+    const pattern = action.pattern || action.query;
+    const note = pattern ? `Searched within ${target} for "${pattern}".` : `Searched within ${target}.`;
+    return evidence ? `${note} ${evidence}` : note;
   }
   const query = action.query ? `"${action.query}"` : 'the web';
   const sources = (Array.isArray(action.sources) ? action.sources : [])
@@ -478,7 +492,8 @@ function webSearchCallNote(item) {
     .map((source) => (source.title && source.url ? `${source.title} <${source.url}>` : source.url || source.title))
     .filter(Boolean)
     .join('; ');
-  return `Searched the web for ${query}${sources ? ` (sources: ${sources})` : ''}.`;
+  const note = `Searched the web for ${query}${sources ? ` (sources: ${sources})` : ''}.`;
+  return evidence ? `${note} ${evidence}` : note;
 }
 
 function extractMessagesFromResponsesInput(input) {
@@ -641,9 +656,8 @@ function extractMessagesFromResponsesInput(input) {
   return [];
 }
 
-const CUSTOM_TOOL_TRANSPORT_DESCRIPTION = 'Codex custom tool exposed through a Chat Completions function. Put its complete raw input in the required "input" string; the gateway restores the native custom_tool_call.';
+const CUSTOM_TOOL_TRANSPORT_DESCRIPTION = 'Codex custom tool callable as a function. Put its complete raw input in the required "input" string.';
 const CUSTOM_TOOL_INPUT_HINT = 'Complete raw input for the Codex custom tool. Preserve it exactly and add no transport wrapper or markdown fence unless the declared format requires one.';
-
 function truncateRawText(value, maxChars) {
   const text = String(value ?? '');
   if (text.length <= maxChars) return text;
@@ -674,9 +688,12 @@ function customToolShim(tool) {
     : '';
   const sourceDescription = compactStructuredText(tool.description, DEEPSEEK_TOOL_DESCRIPTION_SOFT_CHARS)
     || `Freeform tool ${baseName}.`;
+  if (isApplyPatchGrammarTool(tool)) {
+    return applyPatchCustomToolShim(tool, encodeToolName(toolNamespace(tool), baseName));
+  }
   const chunks = [
     CUSTOM_TOOL_TRANSPORT_DESCRIPTION,
-    `Codex-side tool description: ${sourceDescription}`,
+    `Tool description: ${sourceDescription}`,
   ];
   const inputContract = [
     CUSTOM_TOOL_INPUT_HINT,
@@ -694,6 +711,7 @@ function customToolShim(tool) {
   return {
     type: 'function',
     gateway_custom_tool: true,
+    gateway_custom_tool_input: 'raw',
     function: {
       name: encodeToolName(toolNamespace(tool), baseName),
       description: chunks.join('\n'),
@@ -713,8 +731,23 @@ function buildCustomToolNames(tools) {
   return names;
 }
 
-function customToolInputFromArguments(argumentsText) {
+function buildCustomToolInputModes(tools) {
+  const modes = new Map();
+  for (const tool of expandTools(tools)) {
+    if (!isObject(tool) || tool.type !== 'custom') continue;
+    const normalizedTool = normalizeTool(tool);
+    const fn = normalizedTool?.type === 'function' ? normalizedTool.function : null;
+    if (fn?.name) modes.set(fn.name, normalizedTool.gateway_custom_tool_input || 'raw');
+  }
+  return modes;
+}
+
+function customToolInputFromArguments(argumentsText, inputMode = 'raw') {
   if (typeof argumentsText !== 'string' || !argumentsText) return '';
+  if (isApplyPatchInputMode(inputMode)) {
+    const lowering = applyPatchLoweringFromArguments(argumentsText, inputMode);
+    return lowering.ok ? lowering.input : '';
+  }
   const parsed = safeJsonParse(argumentsText);
   if (parsed.ok && typeof parsed.value === 'string') return parsed.value;
   if (parsed.ok && isObject(parsed.value)) {
@@ -730,7 +763,7 @@ function stripGatewayToolMarkers(tools) {
   if (!Array.isArray(tools)) return tools;
   return tools.map((tool) => {
     if (!isObject(tool) || tool.gateway_custom_tool === undefined) return tool;
-    const { gateway_custom_tool, ...rest } = tool;
+    const { gateway_custom_tool, gateway_custom_tool_input, ...rest } = tool;
     return rest;
   });
 }
@@ -739,7 +772,7 @@ const UNAVAILABLE_TOOL_GUIDANCE = 'Do not call this tool; if the task depends on
 
 function unavailableHostedToolShim(tool, reason) {
   const capability = String(tool.type || 'tool');
-  const detail = reason || `Unavailable capability: the client requested the hosted ${capability} tool, but this gateway cannot execute it.`;
+  const detail = reason || `Unavailable capability: the requested hosted ${capability} tool is not configured here.`;
   return {
     type: 'function',
     function: {
@@ -757,7 +790,7 @@ export function unavailableWebSearchToolShims(tools) {
     if (!isObject(tool) || typeof tool.type !== 'string' || !EMULATED_HOSTED_TOOL_TYPES.has(tool.type)) continue;
     const shim = unavailableHostedToolShim(
       tool,
-      'Unavailable capability: web search was requested, but the gateway has no search provider configured.',
+      'Unavailable capability: web search was requested, but no search provider is configured.',
     );
     if (seen.has(shim.function.name)) continue;
     seen.add(shim.function.name);
@@ -1077,7 +1110,7 @@ function convertItemToToolSearchCall(item) {
   return item;
 }
 
-function responseItemFromChatToolCall(toolCall, toolNames, customToolNames) {
+function responseItemFromChatToolCall(toolCall, toolNames, customToolNames, customToolInputModes) {
   const callId = toolCall.id || generateId('call');
   if (isCodexToolSearchTool(toolCall.function?.name)) {
     return {
@@ -1091,14 +1124,29 @@ function responseItemFromChatToolCall(toolCall, toolNames, customToolNames) {
   }
   const decoded = decodedToolName(toolCall.function?.name, toolNames);
   if (customToolNames?.has(toolCall.function?.name)) {
-    return omitUndefined({
+    const inputMode = customToolInputModes?.get(toolCall.function?.name);
+    const rawArguments = toolCall.function?.arguments || '';
+    const nativeInput = customToolInputFromArguments(rawArguments, inputMode);
+    const item = omitUndefined({
       type: 'custom_tool_call',
       id: callId,
       call_id: callId,
       name: decoded.name,
-      input: customToolInputFromArguments(toolCall.function?.arguments || ''),
+      input: nativeInput,
       status: 'completed',
     });
+    const replayArguments = isApplyPatchInputMode(inputMode)
+      ? applyPatchReplayArguments(rawArguments, inputMode, nativeInput)
+      : rawArguments;
+    if (replayArguments) {
+      Object.defineProperty(item, 'arguments', {
+        value: replayArguments,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return item;
   }
   return omitUndefined({
     type: 'function_call',
@@ -1139,6 +1187,11 @@ function buildToolNames(tools) {
     }));
   }
   return names;
+}
+
+function customToolInputModeForItem(item, customToolInputModes) {
+  if (!item || item.type !== 'custom_tool_call') return 'raw';
+  return customToolInputModes?.get(encodeToolName(item.namespace, item.name)) || 'raw';
 }
 
 function simplifyJsonSchemaDescriptions(schema) {
@@ -2007,6 +2060,23 @@ export function chatToolNamesFromTools(tools) {
   return names;
 }
 
+export function ensureToolCallIdsInCompletion(completion) {
+  const choice = Array.isArray(completion?.choices) ? completion.choices[0] : null;
+  const toolCalls = choice?.message?.tool_calls;
+  if (!Array.isArray(toolCalls) || toolCalls.every((toolCall) => !isObject(toolCall) || toolCall.id)) {
+    return completion;
+  }
+  const withIds = toolCalls.map((toolCall) => (
+    isObject(toolCall) && !toolCall.id ? { ...toolCall, id: generateId('call') } : toolCall
+  ));
+  return {
+    ...completion,
+    choices: completion.choices.map((entry, index) => (index === 0
+      ? { ...entry, message: { ...entry.message, tool_calls: withIds } }
+      : entry)),
+  };
+}
+
 export function resolveEmittedToolCallNamesInCompletion(completion, knownNames) {
   const choice = Array.isArray(completion?.choices) ? completion.choices[0] : null;
   const toolCalls = choice?.message?.tool_calls;
@@ -2100,6 +2170,7 @@ export function convertChatCompletionToResponses({ completion: rawCompletion, mo
   const messageHasToolCalls = hasChatToolCalls(message);
   const toolNames = buildToolNames(normalized?.tools);
   const customToolNames = buildCustomToolNames(normalized?.tools);
+  const customToolInputModes = buildCustomToolInputModes(normalized?.tools);
   const output = [];
 
   if (content.length) {
@@ -2130,7 +2201,7 @@ export function convertChatCompletionToResponses({ completion: rawCompletion, mo
         }
         continue;
       }
-      const item = responseItemFromChatToolCall(toolCall, toolNames, customToolNames);
+      const item = responseItemFromChatToolCall(toolCall, toolNames, customToolNames, customToolInputModes);
       item.status = outcome.status;
       normalizeFunctionCallItemArguments(item, toolSchemas);
       output.push(item);
@@ -2218,6 +2289,7 @@ export class ResponsesStreamMapper {
     ]);
     this.toolNames = buildToolNames(normalized?.tools);
     this.customToolNames = buildCustomToolNames(normalized?.tools);
+    this.customToolInputModes = buildCustomToolInputModes(normalized?.tools);
     this.bridgedCommentaryTool = !requestToolsIncludeCommentary(normalized?.tools);
     this.toolItemsAdded = new Set();
     this.toolItemsBufferedArguments = new Set();
@@ -2806,7 +2878,16 @@ export class ResponsesStreamMapper {
     for (const [index, item] of this.toolItems.entries()) {
       item.status = status;
       if (item.type === 'tool_search_call') finalizeToolSearchCallItemArguments(item);
-      else if (item.type === 'custom_tool_call') item.input = customToolInputFromArguments(item.arguments);
+      else if (item.type === 'custom_tool_call') {
+        const inputMode = customToolInputModeForItem(item, this.customToolInputModes);
+        const rawArguments = item.arguments;
+        item.input = customToolInputFromArguments(rawArguments, inputMode);
+        const replayArguments = isApplyPatchInputMode(inputMode)
+          ? applyPatchReplayArguments(rawArguments, inputMode, item.input)
+          : rawArguments;
+        if (replayArguments) item.arguments = replayArguments;
+        else delete item.arguments;
+      }
       else normalizeFunctionCallItemArguments(item, this.toolSchemas);
       const outputIndex = this.output.indexOf(item);
       if (!this.toolItemsAdded.has(index)) {

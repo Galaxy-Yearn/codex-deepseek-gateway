@@ -15,11 +15,13 @@ import {
   createLaunchContext,
   missingModelMessage,
   pick,
+  pickerCopy,
   pickModel,
   pickReasoning,
   runCodex,
   withPickerScreen,
 } from './codex-launch.js';
+import { displayWidth, padDisplay, truncateDisplay } from './terminal-text.js';
 
 const TIME_WIDTH = 11;
 const PROVIDER_WIDTH = 17;
@@ -28,9 +30,6 @@ const TABLE_INDENT = '    ';
 const COLUMN_GAP = '  ';
 const MUTED_TEXT = '\x1b[90m';
 const RESET_STYLE = '\x1b[0m';
-const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
-const EXTENDED_PICTOGRAPHIC = /\p{Extended_Pictographic}/u;
-const MARK = /\p{Mark}/u;
 export const DEFAULT_SESSION_LIMIT = 15;
 
 function print(message = '') {
@@ -135,65 +134,9 @@ function firstUserPreview(lines) {
     if (payload?.type !== 'message' || payload.role !== 'user') continue;
     const text = textFromContent(payload.content).trim().replace(/\s+/g, ' ');
     if (!text || text.startsWith('<environment_context>') || text.startsWith('# AGENTS.md instructions')) continue;
-    return truncate(text, TITLE_WIDTH);
+    return truncateDisplay(text, TITLE_WIDTH);
   }
   return '';
-}
-
-function isWideCodePoint(codePoint) {
-  return codePoint >= 0x1100 && (
-    codePoint <= 0x115f
-    || codePoint === 0x2329
-    || codePoint === 0x232a
-    || (codePoint >= 0x2e80 && codePoint <= 0x303e)
-    || (codePoint >= 0x3040 && codePoint <= 0xa4cf)
-    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
-    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
-    || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
-    || (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
-    || (codePoint >= 0xff00 && codePoint <= 0xff60)
-    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
-    || (codePoint >= 0x1b000 && codePoint <= 0x1b2ff)
-    || (codePoint >= 0x1f1e6 && codePoint <= 0x1f1ff)
-    || (codePoint >= 0x1f200 && codePoint <= 0x1f251)
-    || (codePoint >= 0x20000 && codePoint <= 0x3fffd)
-  );
-}
-
-function graphemeWidth(grapheme) {
-  const characters = [...grapheme];
-  const visible = characters.filter((character) => {
-    const codePoint = character.codePointAt(0);
-    return codePoint !== 0x200d && codePoint !== 0xfe0e && codePoint !== 0xfe0f && !MARK.test(character);
-  });
-  if (!visible.length) return 0;
-  return characters.some((character) => isWideCodePoint(character.codePointAt(0)) || EXTENDED_PICTOGRAPHIC.test(character)) ? 2 : 1;
-}
-
-function displayWidth(text) {
-  let width = 0;
-  for (const { segment } of GRAPHEME_SEGMENTER.segment(String(text))) width += graphemeWidth(segment);
-  return width;
-}
-
-function truncate(text, max) {
-  const value = String(text);
-  if (displayWidth(value) <= max) return value;
-  const contentWidth = max - 3;
-  let result = '';
-  let width = 0;
-  for (const { segment } of GRAPHEME_SEGMENTER.segment(value)) {
-    const nextWidth = graphemeWidth(segment);
-    if (width + nextWidth > contentWidth) break;
-    result += segment;
-    width += nextWidth;
-  }
-  return `${result}...`;
-}
-
-function pad(text, width) {
-  const value = truncate(String(text || ''), width);
-  return `${value}${' '.repeat(width - displayWidth(value))}`;
 }
 
 function formatTime(value) {
@@ -258,20 +201,21 @@ function printSessions(sessionsList, options, context) {
   if (sessionsList.length > listed.length) print(`Showing ${listed.length} of ${sessionsList.length}. Use --limit ${sessionsList.length} or --all as needed.\n`);
 }
 
-function sessionHeader() {
-  return `${pad('Date', TIME_WIDTH)}${COLUMN_GAP}${pad('Provider', PROVIDER_WIDTH)}${COLUMN_GAP}${pad('Title', TITLE_WIDTH)}`;
+function sessionHeader(language = 'en') {
+  const [date, provider, title] = pickerCopy(language).sessionColumns;
+  return `${padDisplay(date, TIME_WIDTH)}${COLUMN_GAP}${padDisplay(provider, PROVIDER_WIDTH)}${COLUMN_GAP}${padDisplay(title, TITLE_WIDTH)}`;
 }
 
-function sessionRow(session) {
-  return `${pad(formatTime(session.updatedAt), TIME_WIDTH)}${COLUMN_GAP}${pad(session.provider || '(unknown)', PROVIDER_WIDTH)}${COLUMN_GAP}${pad(session.title, TITLE_WIDTH)}`;
+function sessionRow(session, language = 'en') {
+  return `${padDisplay(formatTime(session.updatedAt), TIME_WIDTH)}${COLUMN_GAP}${padDisplay(session.provider || pickerCopy(language).unknownProvider, PROVIDER_WIDTH)}${COLUMN_GAP}${padDisplay(session.title, TITLE_WIDTH)}`;
 }
 
-function sessionRows(sessionsList) {
-  return sessionsList.map((session) => sessionRow(session));
+function sessionRows(sessionsList, language = 'en') {
+  return sessionsList.map((session) => sessionRow(session, language));
 }
 
-export function sessionPickerRows(allSessions) {
-  return sessionRows(allSessions);
+export function sessionPickerRows(allSessions, language = 'en') {
+  return sessionRows(allSessions, language);
 }
 
 async function chooseSessionFlow(allSessions, context, limit) {
@@ -280,20 +224,22 @@ async function chooseSessionFlow(allSessions, context, limit) {
     return null;
   }
 
-  const header = sessionHeader();
+  const copy = pickerCopy(context.promptLanguage);
+  const header = sessionHeader(context.promptLanguage);
   const windowSize = limit || DEFAULT_SESSION_LIMIT;
   return await withPickerScreen(async () => {
     let step = 'session';
     while (true) {
       if (step === 'session') {
         const result = await pick(
-          `Choose Codex session`,
-          sessionPickerRows(allSessions),
+          copy.sessionTitle,
+          sessionPickerRows(allSessions, context.promptLanguage),
           header,
           {
             windowSize,
-            emptyMessage: 'No matching sessions found.',
-            shortcuts: [{ key: 'n', displayKey: 'N', action: 'new', label: 'new' }],
+            emptyMessage: copy.noSessions,
+            language: context.promptLanguage,
+            shortcuts: [{ key: 'n', displayKey: 'N', action: 'new', label: copy.newSession }],
           },
         );
         if (result.action === 'cancel') return null;

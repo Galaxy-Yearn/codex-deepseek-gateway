@@ -15,7 +15,6 @@ import {
   isCodexContextualUserText,
   isObject,
   joinUrl,
-  mapDeepSeekReasoningEffort,
   neutralizePseudoToolCallMarkup,
   normalizeRole,
   parseBoolean,
@@ -134,9 +133,6 @@ test('shared normalization and parsing contracts', () => {
   assert.equal(parseBoolean('unknown', true), true);
   assert.deepEqual(parseList('a, b, ,c'), ['a', 'b', 'c']);
   assert.deepEqual(parseList([' a ', '', 'b']), ['a', 'b']);
-  assert.equal(mapDeepSeekReasoningEffort('low'), undefined);
-  assert.equal(mapDeepSeekReasoningEffort('high'), 'high');
-  assert.equal(mapDeepSeekReasoningEffort('xhigh'), 'max');
   assert.equal(joinUrl('https://api.example.com/', '/v1/models'), 'https://api.example.com/v1/models');
   assert.equal(joinUrl('https://api.example.com', 'v1/models'), 'https://api.example.com/v1/models');
 

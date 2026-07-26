@@ -64,7 +64,7 @@ test('model alias loading and resolution', async () => {
       object: {
         upstreamModel: 'object-target',
         thinkingMode: 'non_thinking',
-        reasoningEffort: 'xhigh',
+        reasoningEffort: 'max',
         extraBody: { seed: 7 },
       },
       invalid: 42,
@@ -81,7 +81,7 @@ test('model alias loading and resolution', async () => {
     alias: 'object',
     upstreamModel: 'object-target',
     thinking: 'disabled',
-    reasoningEffort: 'xhigh',
+    reasoningEffort: 'max',
     extraBody: { seed: 7 },
   });
   assert.deepEqual(resolveModelAlias('unknown', config), {
@@ -95,19 +95,30 @@ test('model alias loading and resolution', async () => {
 });
 
 test('reasoning and model catalog mapping', async () => {
-  await scenario('maps Codex reasoning effort and alias overrides to DeepSeek thinking payloads', async () => {
+  await scenario('uses native DeepSeek reasoning levels and alias overrides', async () => {
   const cases = [
     [{ thinking: 'auto' }, 'low', { thinking: { type: 'disabled' } }],
-    [{ thinking: 'auto' }, 'medium', { thinking: { type: 'enabled' }, reasoning_effort: 'high' }],
+    [{ thinking: 'auto' }, 'high', { thinking: { type: 'enabled' }, reasoning_effort: 'high' }],
+    [{ thinking: 'auto' }, 'max', { thinking: { type: 'enabled' }, reasoning_effort: 'max' }],
     [{ thinking: 'enabled' }, 'low', { thinking: { type: 'enabled' } }],
     [{ thinking: 'disabled', reasoningEffort: 'max' }, 'high', { thinking: { type: 'disabled' } }],
-    [{ thinking: 'enabled', reasoningEffort: 'xhigh' }, 'medium', { thinking: { type: 'enabled' }, reasoning_effort: 'max' }],
-    [{ thinking: 'enabled' }, 'unsupported', { thinking: { type: 'enabled' } }],
+    [{ thinking: 'enabled', reasoningEffort: 'max' }, 'high', { thinking: { type: 'enabled' }, reasoning_effort: 'max' }],
   ];
 
   for (const [alias, effort, expected] of cases) {
     assert.deepEqual(deepseekReasoningPayload({ alias, reasoning: { effort } }), expected);
   }
+
+  for (const effort of ['medium', 'xhigh', 'none', 'disabled', 'off', 'false', 'HIGH', '', 'unsupported']) {
+    assert.throws(
+      () => deepseekReasoningPayload({ alias: { thinking: 'auto' }, reasoning: { effort } }),
+      (error) => error.code === 'invalid_reasoning_effort' && error.statusCode === 400,
+    );
+  }
+  assert.throws(
+    () => deepseekReasoningPayload({ alias: { thinking: 'auto', reasoningEffort: 'xhigh' } }),
+    (error) => error.code === 'invalid_reasoning_effort' && error.statusCode === 400,
+  );
   });
   await scenario('normalizes, filters, merges, and lists model catalogs deterministically', async () => {
   const legacyChat = ['deepseek', 'chat'].join('-');

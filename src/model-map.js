@@ -1,8 +1,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { isObject, mapDeepSeekReasoningEffort, parseJsonObject } from './common.js';
+import { isObject, parseJsonObject } from './common.js';
 
 const DEEPSEEK_V4_MODELS = ['deepseek-v4-flash', 'deepseek-v4-pro'];
+const DEEPSEEK_REASONING_EFFORTS = new Set(['low', 'high', 'max']);
 const DEPRECATED_MODEL_PATTERN = /^deepseek-(?:chat|reasoner)$/;
 
 function deepseekV4Aliases() {
@@ -70,25 +71,27 @@ export function resolveModelAlias(requestedModel, config = {}) {
   };
 }
 
-function effortDisablesThinking(effort) {
-  if (effort == null) return false;
-  const normalized = String(effort).toLowerCase().replaceAll('_', '-');
-  return normalized === 'low' || normalized === 'none' || normalized === 'disabled' || normalized === 'off' || normalized === 'false';
+function validateDeepSeekReasoningEffort(effort) {
+  if (effort == null) return undefined;
+  if (DEEPSEEK_REASONING_EFFORTS.has(effort)) return effort;
+  const error = new Error(`Unsupported DeepSeek reasoning effort ${JSON.stringify(effort)}. Expected one of: low, high, max`);
+  error.statusCode = 400;
+  error.code = 'invalid_reasoning_effort';
+  throw error;
 }
 
 export function deepseekReasoningPayload({ alias, reasoning } = {}) {
-  const requestEffort = isObject(reasoning) ? reasoning.effort : undefined;
+  const requestEffort = validateDeepSeekReasoningEffort(isObject(reasoning) ? reasoning.effort : undefined);
   const aliasThinking = normalizeThinking(alias?.thinking);
-  const aliasEffort = alias?.reasoningEffort;
+  const aliasEffort = validateDeepSeekReasoningEffort(alias?.reasoningEffort);
+  const effort = aliasEffort ?? requestEffort;
 
-  if (aliasThinking === 'disabled' || (aliasThinking === 'auto' && effortDisablesThinking(requestEffort))) {
+  if (aliasThinking === 'disabled' || (aliasThinking === 'auto' && effort === 'low')) {
     return { thinking: { type: 'disabled' } };
   }
 
   const payload = { thinking: { type: 'enabled' } };
-  const effort = aliasEffort ?? (effortDisablesThinking(requestEffort) ? undefined : requestEffort);
-  const reasoningEffort = mapDeepSeekReasoningEffort(effort);
-  if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
+  if (effort === 'high' || effort === 'max') payload.reasoning_effort = effort;
   return payload;
 }
 

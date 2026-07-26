@@ -19,8 +19,13 @@ import {
   toProviderChatCompletionsRequest,
   unavailableWebSearchToolShims,
 } from '../src/protocol.js';
+import {
+  chatToolsIncludeApplyPatch,
+  invalidApplyPatchToolCalls,
+} from '../src/apply-patch-bridge.js';
 import { SseParser } from '../src/common.js';
 import { DEFAULT_MODEL_ALIASES } from '../src/model-map.js';
+import { clearWebSearchEvidenceForTests, rememberWebSearchEvidence } from '../src/web-search-evidence.js';
 
 test('Responses input and history normalization', async () => {
   await scenario('normalizes Responses input to chat completions messages', async () => {
@@ -238,6 +243,66 @@ test('Responses input and history normalization', async () => {
   assert.match(note, /Earlier web activity/);
   assert.match(note, /gold futures price/);
   assert.match(note, /https:\/\/example\.com\/gold/);
+  });
+  await scenario('replays gateway-owned web evidence by web_search_call item id when sources are absent', async () => {
+  clearWebSearchEvidenceForTests();
+  try {
+    rememberWebSearchEvidence('ws_cached', {
+      action: 'search',
+      query: 'gold futures price',
+      results: [{
+        title: 'Gold source',
+        url: 'https://example.com/gold',
+        snippet: 'Gold settled at a confirmed value today.',
+      }],
+    });
+    const normalized = normalizeResponsesRequest({
+      model: 'deepseek-v4-flash',
+      input: [
+        {
+          type: 'web_search_call',
+          id: 'ws_cached',
+          status: 'completed',
+          action: {
+            type: 'search',
+            query: 'gold futures price',
+          },
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'continue' }],
+        },
+      ],
+    });
+    const chat = toChatCompletionsRequest(normalized);
+    const note = String(chat.messages[0].content);
+    assert.match(note, /Earlier web activity/);
+    assert.match(note, /Gold source/);
+    assert.match(note, /https:\/\/example\.com\/gold/);
+    assert.match(note, /confirmed value/);
+  } finally {
+    clearWebSearchEvidenceForTests();
+  }
+  });
+  await scenario('replays native find-in-page patterns as descriptive history only', async () => {
+  const normalized = normalizeResponsesRequest({
+    input: [{
+      type: 'web_search_call',
+      id: 'ws_find',
+      status: 'completed',
+      action: {
+        type: 'find_in_page',
+        url: 'https://example.com/page',
+        pattern: 'release date',
+      },
+    }],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.equal(chat.messages.length, 1);
+  assert.equal(chat.messages[0].role, 'assistant');
+  assert.match(String(chat.messages[0].content), /release date/);
+  assert.equal(Array.isArray(chat.messages[0].tool_calls), false);
   });
 });
 
@@ -875,8 +940,8 @@ test('tool schemas, namespaces, choices, and limits', async () => {
   const chat = toChatCompletionsRequest(normalized);
   assert.match(chat.tools[0].function.name, /^apply_patch__[a-f0-9]{8}$/);
   assert.equal(chat.tools[0].gateway_custom_tool, true);
-  assert.match(chat.tools[0].function.description, /^Codex custom tool exposed through a Chat Completions function/);
-  assert.match(chat.tools[0].function.description, /Codex-side tool description: Apply a patch/);
+  assert.match(chat.tools[0].function.description, /^Codex custom tool callable as a function/);
+  assert.match(chat.tools[0].function.description, /Tool description: Apply a patch/);
   assert.deepEqual(chat.tools[0].function.parameters.required, ['input']);
   assert.equal(chat.tools[0].function.parameters.properties.input.type, 'string');
   assert.match(chat.tools[0].function.parameters.properties.input.description, /Complete raw input for the Codex custom tool/);
@@ -1333,7 +1398,7 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
       parallel_tool_calls: true,
       response_format: { type: 'json_schema', json_schema: { name: 'answer' } },
       user: 'codex-user',
-      reasoning: { effort: 'xhigh' },
+      reasoning: { effort: 'max' },
     },
     { upstreamProvider: 'deepseek', upstreamModel: 'deepseek-v4-pro' },
   );
@@ -1498,12 +1563,12 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
   const chat = toChatCompletionsRequest(normalized);
   assert.equal('reasoning_content' in chat.messages[0], false);
   });
-  await scenario('maps DeepSeek v4 thinking aliases and Codex reasoning effort', async () => {
+  await scenario('uses native DeepSeek v4 reasoning levels and alias overrides', async () => {
   const noThinking = toProviderChatCompletionsRequest(
     {
       model: 'deepseek-v4-pro',
       messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'none' },
+      reasoning: { effort: 'low' },
     },
     { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
   );
@@ -1516,7 +1581,7 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
       model: 'deepseek-v4-pro',
       messages: [{ role: 'user', content: 'ping' }],
     },
-    { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES, codexReasoningEffort: 'xhigh' },
+    { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES, codexReasoningEffort: 'max' },
   );
   assert.equal(fallbackEffort.model, 'deepseek-v4-pro');
   assert.deepEqual(fallbackEffort.thinking, { type: 'enabled' });
@@ -1534,23 +1599,23 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
   assert.deepEqual(lowNoThinking.thinking, { type: 'disabled' });
   assert.equal('reasoning_effort' in lowNoThinking, false);
 
-  const mediumThinking = toProviderChatCompletionsRequest(
+  const highThinking = toProviderChatCompletionsRequest(
     {
       model: 'deepseek-v4-pro',
       messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'medium' },
+      reasoning: { effort: 'high' },
     },
     { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
   );
-  assert.equal(mediumThinking.model, 'deepseek-v4-pro');
-  assert.deepEqual(mediumThinking.thinking, { type: 'enabled' });
-  assert.equal(mediumThinking.reasoning_effort, 'high');
+  assert.equal(highThinking.model, 'deepseek-v4-pro');
+  assert.deepEqual(highThinking.thinking, { type: 'enabled' });
+  assert.equal(highThinking.reasoning_effort, 'high');
 
   const maxThinking = toProviderChatCompletionsRequest(
     {
       model: 'deepseek-v4-flash',
       messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'xhigh' },
+      reasoning: { effort: 'max' },
     },
     { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
   );
@@ -1576,46 +1641,27 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
   assert.deepEqual(aliasWins.thinking, { type: 'enabled' });
   assert.equal(aliasWins.reasoning_effort, 'high');
   });
-  await scenario('does not pass unsupported DeepSeek reasoning efforts through', async () => {
-  for (const effort of ['minimal', 'foo']) {
-    const request = toProviderChatCompletionsRequest(
-      {
-        model: 'deepseek-v4-pro',
-        messages: [{ role: 'user', content: 'ping' }],
-        reasoning: { effort },
-      },
-      { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
+  await scenario('rejects every non-native DeepSeek reasoning effort', async () => {
+  for (const effort of ['medium', 'xhigh', 'none', 'disabled', 'off', 'false', 'HIGH', '', 'minimal', 'foo']) {
+    assert.throws(
+      () => toProviderChatCompletionsRequest(
+        {
+          model: 'deepseek-v4-pro',
+          messages: [{ role: 'user', content: 'ping' }],
+          reasoning: { effort },
+        },
+        { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
+      ),
+      (error) => error.code === 'invalid_reasoning_effort' && error.statusCode === 400,
     );
-    assert.deepEqual(request.thinking, { type: 'enabled' });
-    assert.equal('reasoning_effort' in request, false);
   }
-
-  const falseNoThinking = toProviderChatCompletionsRequest(
-    {
-      model: 'deepseek-v4-pro',
-      messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'false' },
-    },
-    { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
+  assert.throws(
+    () => toProviderChatCompletionsRequest(
+      { model: 'deepseek-v4-pro', messages: [{ role: 'user', content: 'ping' }] },
+      { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES, codexReasoningEffort: 'xhigh' },
+    ),
+    (error) => error.code === 'invalid_reasoning_effort' && error.statusCode === 400,
   );
-  assert.deepEqual(falseNoThinking.thinking, { type: 'disabled' });
-  assert.equal('reasoning_effort' in falseNoThinking, false);
-
-  const explicitThinkingAlias = toProviderChatCompletionsRequest(
-    {
-      model: 'deepseek-v4-pro',
-      messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'minimal' },
-    },
-    {
-      upstreamProvider: 'deepseek',
-      modelAliases: {
-        'deepseek-v4-pro': { model: 'deepseek-v4-pro', thinking: 'enabled' },
-      },
-    },
-  );
-  assert.deepEqual(explicitThinkingAlias.thinking, { type: 'enabled' });
-  assert.equal('reasoning_effort' in explicitThinkingAlias, false);
   });
   await scenario('keeps the DeepSeek max_tokens default independent from the catalog compaction threshold', async () => {
   const defaulted = toProviderChatCompletionsRequest(
@@ -1752,7 +1798,7 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
     { type: 'web_search' },
   ]);
   assert.deepEqual(shims.map((tool) => tool.function.name), ['web_search', 'web_search_preview']);
-  assert.match(shims[0].function.description, /no search provider configured/);
+  assert.match(shims[0].function.description, /no search provider is configured/);
   assert.match(shims[0].function.description, /Do not call this tool/);
   });
   await scenario('keeps DeepSeek provider request prefixes byte-stable across rounds and turns', async () => {
@@ -2235,7 +2281,7 @@ test('non-streaming Responses output and replay conversion', async () => {
       {
         type: 'custom',
         name: 'apply_patch',
-        description: 'Edit files with a patch envelope.',
+        description: 'Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.',
         format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
         input_schema: {
           type: 'object',
@@ -2247,27 +2293,41 @@ test('non-streaming Responses output and replay conversion', async () => {
   const chat = toChatCompletionsRequest(normalized);
   assert.equal(chat.tools.length, 1);
   assert.equal(chat.tools[0].function.name, 'apply_patch');
-  assert.match(chat.tools[0].function.description, /^Codex custom tool exposed through a Chat Completions function/);
-  assert.match(chat.tools[0].function.description, /Codex-side tool description: Edit files with a patch envelope/);
-  assert.deepEqual(chat.tools[0].function.parameters.required, ['input']);
-  assert.match(chat.tools[0].function.parameters.properties.input.description, /Input format: grammar\./);
-  assert.match(chat.tools[0].function.parameters.properties.input.description, /Input syntax: lark\./);
-  assert.match(chat.tools[0].function.parameters.properties.input.description, /begin_patch hunk\+ end_patch/);
-  assert.match(chat.tools[0].function.parameters.properties.input.description, /Raw patch payload/);
-  assert.match(chat.tools[0].function.parameters.properties.input.description, /Preserve every required literal token, delimiter, whitespace constraint, and line boundary/);
-  assert.doesNotMatch(chat.tools[0].function.parameters.properties.input.description, /anchor line|current source|validation error/);
-  assert.equal(JSON.stringify(chat.tools[0]).split('start: begin_patch hunk+ end_patch').length - 1, 1);
+  assert.equal(chat.tools[0].function.description, 'Edit files by sending structured edits; the runtime applies them through native apply_patch.');
+  assert.doesNotMatch(chat.tools[0].function.description, /FREEFORM|do not wrap|Tool description/i);
+  assert.equal(chat.tools[0].gateway_custom_tool_input, 'apply_patch');
+  assert.deepEqual(chat.tools[0].function.parameters.required, ['edits']);
+  assert.equal('anyOf' in chat.tools[0].function.parameters, false);
+  assert.equal(chat.tools[0].function.parameters.properties.edits.type, 'array');
+  assert.equal(chat.tools[0].function.parameters.properties.edits.minItems, 1);
+  assert.equal(chat.tools[0].function.parameters.properties.edits.items.properties.old.minLength, 1);
+  assert.equal('minLength' in chat.tools[0].function.parameters.properties.edits.items.properties.new, false);
+  assert.equal('minLength' in chat.tools[0].function.parameters.properties.edits.items.properties.content, false);
+  assert.deepEqual(chat.tools[0].function.parameters.properties.edits.items.properties.type.enum, [
+    'add_file',
+    'delete_file',
+    'replace_text',
+    'delete_text',
+    'append_text',
+    'insert_text_before',
+    'insert_text_after',
+    'update_hunk',
+  ]);
+  assert.equal('input' in chat.tools[0].function.parameters.properties, false);
+  assert.equal(JSON.stringify(chat.tools[0]).includes('start: begin_patch hunk+ end_patch'), false);
+  assert.equal(JSON.stringify(chat.tools[0]).includes('FREEFORM tool'), false);
 
   const provider = toProviderChatCompletionsRequest(chat, {
     upstreamProvider: 'deepseek',
     modelAliases: DEFAULT_MODEL_ALIASES,
   });
   assert.equal('gateway_custom_tool' in provider.tools[0], false);
-  assert.match(provider.tools[0].function.parameters.properties.input.description, /begin_patch hunk\+ end_patch/);
-  assert.match(provider.messages[0].content, /Codex Responses custom tools are exposed as Chat Completions functions/);
+  assert.equal('gateway_custom_tool_input' in provider.tools[0], false);
+  assert.equal(provider.tools[0].function.parameters.properties.edits.type, 'array');
+  assert.equal('input' in provider.tools[0].function.parameters.properties, false);
+  assert.match(provider.messages[0].content, /Codex custom tools are callable functions here/);
   assert.match(provider.messages[0].content, /Choose the most direct tool whose declared scope matches the target/);
   assert.match(provider.messages[0].content, /Never invent handles, IDs, URIs, resource names, or prior tool results/);
-  assert.match(provider.messages[0].content, /the outer function call still uses JSON arguments/);
 
   const mapper = new ResponsesStreamMapper({
     responseId: 'resp_custom',
@@ -2275,6 +2335,11 @@ test('non-streaming Responses output and replay conversion', async () => {
     normalized,
   });
   const patchText = '*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch';
+  const structuredPatch = {
+    edits: [
+      { type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' },
+    ],
+  };
   const events = [
     ...mapper.mapChatEvent({
       data: JSON.stringify({
@@ -2286,7 +2351,7 @@ test('non-streaming Responses output and replay conversion', async () => {
                   index: 0,
                   id: 'call_patch',
                   type: 'function',
-                  function: { name: 'apply_patch', arguments: JSON.stringify({ input: patchText }) },
+                  function: { name: 'apply_patch', arguments: JSON.stringify(structuredPatch) },
                 },
               ],
             },
@@ -2317,7 +2382,858 @@ test('non-streaming Responses output and replay conversion', async () => {
   assert.equal(completedItem.input, patchText);
   const assistant = mapper.assistantMessage();
   assert.equal(assistant.tool_calls[0].function.name, 'apply_patch');
-  assert.deepEqual(JSON.parse(assistant.tool_calls[0].function.arguments), { input: patchText });
+  assert.deepEqual(JSON.parse(assistant.tool_calls[0].function.arguments), structuredPatch);
+  });
+  await scenario('lowers structured apply_patch edits on non-streaming completions', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const structuredPatch = {
+    edits: [
+      { type: 'add_file', file: 'new.md', content: '# Title\n\nBody' },
+      { type: 'replace_text', file: 'old.md', anchor: '# Old', old: 'before', new: 'after' },
+      { type: 'insert_text_after', file: 'renamed.md', anchor: 'after', content: 'tail' },
+      { type: 'insert_text_before', file: 'renamed.md', anchor: 'after', content: 'head' },
+      { type: 'delete_text', file: 'renamed.md', old: 'remove me' },
+      { type: 'append_text', file: 'renamed.md', content: 'end' },
+      { type: 'delete_file', file: 'remove.md' },
+    ],
+  };
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify(structuredPatch),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_structured_patch',
+  });
+  const item = response.output.find((entry) => entry.type === 'custom_tool_call');
+  assert.equal(item.input, [
+    '*** Begin Patch',
+    '*** Add File: new.md',
+    '+# Title',
+    '+',
+    '+Body',
+    '*** Update File: old.md',
+    '@@',
+    '-before',
+    '+after',
+    '*** Update File: renamed.md',
+    '@@',
+    ' after',
+    '+tail',
+    '@@',
+    '+head',
+    ' after',
+    '@@',
+    '-remove me',
+    '@@',
+    '+end',
+    '*** End of File',
+    '*** Delete File: remove.md',
+    '*** End Patch',
+  ].join('\n'));
+  assert.equal(item.input.match(/\*\*\* Update File: renamed\.md/g).length, 1);
+  assert.equal(Object.keys(item).includes('arguments'), false);
+  assert.deepEqual(JSON.parse(assistantMessageFromResponseOutput(response.output).tool_calls[0].function.arguments), structuredPatch);
+  });
+  await scenario('merges same-file structured edits into one ordered update section', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'move source line',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const structuredPatch = {
+    edits: [
+      { type: 'delete_text', file: 'doc.md', old: '> Source line' },
+      { type: 'insert_text_before', file: 'doc.md', anchor: '# Title', content: '> Source line\n\n' },
+    ],
+  };
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_move_source',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify(structuredPatch),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_patch_non_monotonic',
+  });
+  const item = response.output.find((entry) => entry.type === 'custom_tool_call');
+  assert.equal(item.input, [
+    '*** Begin Patch',
+    '*** Update File: doc.md',
+    '@@',
+    '-> Source line',
+    '@@',
+    '+> Source line',
+    '+',
+    ' # Title',
+    '*** End Patch',
+  ].join('\n'));
+  assert.equal(item.input.match(/\*\*\* Update File: doc\.md/g).length, 1);
+  assert.deepEqual(JSON.parse(assistantMessageFromResponseOutput(response.output).tool_calls[0].function.arguments), structuredPatch);
+  });
+  await scenario('lowers structured native apply_patch hunks', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit with native hunk',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const structuredPatch = {
+    edits: [
+      {
+        type: 'update_hunk',
+        file: 'old.md',
+        move_to: 'renamed.md',
+        chunks: [
+          {
+            anchor: 'function main()',
+            lines: [
+              { op: 'context', text: 'const before = 1;' },
+              { op: 'delete', text: 'old();' },
+              { op: 'add', text: 'new();' },
+            ],
+          },
+          {
+            anchor: 'function cleanup()',
+            lines: [
+              { op: 'delete', text: 'oldCleanup();' },
+              { op: 'add', text: 'newCleanup();' },
+            ],
+          },
+        ],
+      },
+      {
+        type: 'update_hunk',
+        file: 'tail.md',
+        chunks: [
+          {
+            lines: [{ op: 'add', text: 'tail' }],
+            eof: true,
+          },
+        ],
+      },
+    ],
+  };
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_native_hunk',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify(structuredPatch),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_patch_native_hunk',
+  });
+  const item = response.output.find((entry) => entry.type === 'custom_tool_call');
+  assert.equal(item.input, [
+    '*** Begin Patch',
+    '*** Update File: old.md',
+    '*** Move to: renamed.md',
+    '@@ function main()',
+    ' const before = 1;',
+    '-old();',
+    '+new();',
+    '@@ function cleanup()',
+    '-oldCleanup();',
+    '+newCleanup();',
+    '*** Update File: tail.md',
+    '@@',
+    '+tail',
+    '*** End of File',
+    '*** End Patch',
+  ].join('\n'));
+  assert.deepEqual(JSON.parse(assistantMessageFromResponseOutput(response.output).tool_calls[0].function.arguments), structuredPatch);
+  });
+  await scenario('rejects direct native apply_patch input on the DeepSeek-facing apply_patch tool', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const patchText = [
+    '*** Begin Patch',
+    '*** Update File: old.md',
+    '*** Move to: renamed.md',
+    '@@',
+    ' # Old',
+    '-before',
+    '+after',
+    '*** End Patch',
+  ].join('\n');
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ input: patchText }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_raw_patch',
+  });
+  const item = response.output.find((entry) => entry.type === 'custom_tool_call');
+  assert.equal(item.input, '');
+  assert.deepEqual(JSON.parse(assistantMessageFromResponseOutput(response.output).tool_calls[0].function.arguments), { input: '' });
+  });
+  await scenario('uses structured apply_patch edits and drops raw input when both are supplied', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({
+                    input: '*** Begin Patch\n*** Delete File: a.txt\n*** End Patch',
+                    edits: [{ type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' }],
+                  }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_structured_patch_over_raw',
+  });
+  const item = response.output.find((entry) => entry.type === 'custom_tool_call');
+  assert.equal(item.input, '*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch');
+  assert.deepEqual(JSON.parse(assistantMessageFromResponseOutput(response.output).tool_calls[0].function.arguments), {
+    edits: [{ type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' }],
+  });
+  });
+  await scenario('lowers structured apply_patch edits with a Codex environment id when supported', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: {
+          type: 'grammar',
+          syntax: 'lark',
+          definition: [
+            'start: begin_patch environment_id? hunk+ end_patch',
+            'environment_id: "*** Environment ID: " filename LF',
+            'begin_patch: "*** Begin Patch" LF',
+            'end_patch: "*** End Patch" LF?',
+          ].join('\n'),
+        },
+      },
+    ],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.equal(chat.tools[0].gateway_custom_tool_input, 'apply_patch_environment');
+  assert.equal(chat.tools[0].function.parameters.properties.environment_id.type, 'string');
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_env',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({
+                    environment_id: 'workspace',
+                    edits: [{ type: 'add_file', file: 'env.md', content: 'ok' }],
+                  }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_patch_env',
+  });
+  const item = response.output.find((entry) => entry.type === 'custom_tool_call');
+  assert.equal(item.input, [
+    '*** Begin Patch',
+    '*** Environment ID: workspace',
+    '*** Add File: env.md',
+    '+ok',
+    '*** End Patch',
+  ].join('\n'));
+  });
+  await scenario('rejects apply_patch input strings that are not native patch text', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_string',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify('replace old with new'),
+                },
+              },
+              {
+                id: 'call_input',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ input: 'replace old with new' }),
+                },
+              },
+              {
+                id: 'call_empty_input',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ input: '' }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_bad_patch_input',
+  });
+  const items = response.output.filter((entry) => entry.type === 'custom_tool_call');
+  assert.deepEqual(items.map((item) => item.input), ['', '', '']);
+  });
+  await scenario('rejects ambiguous or invalid structured apply_patch edits', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_replace',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ edits: [{ type: 'replace_text', file: 'a.txt', new: 'new' }] }),
+                },
+              },
+              {
+                id: 'call_delete_text',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ edits: [{ type: 'delete_text', file: 'a.txt' }] }),
+                },
+              },
+              {
+                id: 'call_delete_file_with_text',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ edits: [{ type: 'delete_file', file: 'a.txt', old: 'line to delete' }] }),
+                },
+              },
+              {
+                id: 'call_legacy_delete',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ edits: [{ type: 'delete', file: 'a.txt' }] }),
+                },
+              },
+              {
+                id: 'call_move_only',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ edits: [{ type: 'move_file', file: 'a.txt', move_to: 'b.txt' }] }),
+                },
+              },
+              {
+                id: 'call_bad_hunk',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ edits: [{ type: 'update_hunk', file: 'a.txt', chunks: [{ lines: [{ op: 'copy', text: 'x' }] }] }] }),
+                },
+              },
+              {
+                id: 'call_old_hunk_shape',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ edits: [{ type: 'update_hunk', file: 'a.txt', lines: [{ op: 'add', text: 'x' }] }] }),
+                },
+              },
+              {
+                id: 'call_unknown_field',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: JSON.stringify({ edits: [{ type: 'replace_text', file: 'a.txt', old: 'old', new: 'new', note: 'extra' }] }),
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_bad_structured_patch',
+  });
+  const items = response.output.filter((entry) => entry.type === 'custom_tool_call');
+  assert.deepEqual(items.map((item) => item.input), ['', '', '', '', '', '', '', '']);
+  });
+  await scenario('merges repeated and interleaved same-file edits into one section per file', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const convert = (callId, edits) => convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              { id: callId, type: 'function', function: { name: 'apply_patch', arguments: JSON.stringify({ edits }) } },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: `resp_${callId}`,
+  }).output.find((entry) => entry.type === 'custom_tool_call');
+
+  const twoHunks = convert('call_two_hunks', [
+    { type: 'replace_text', file: 'a.txt', old: 'one', new: 'ONE' },
+    { type: 'replace_text', file: 'b.txt', old: 'bee', new: 'BEE' },
+    { type: 'replace_text', file: 'a.txt', old: 'two', new: 'TWO' },
+  ]);
+  assert.equal(twoHunks.input, [
+    '*** Begin Patch',
+    '*** Update File: a.txt',
+    '@@',
+    '-one',
+    '+ONE',
+    '@@',
+    '-two',
+    '+TWO',
+    '*** Update File: b.txt',
+    '@@',
+    '-bee',
+    '+BEE',
+    '*** End Patch',
+  ].join('\n'));
+  assert.equal(twoHunks.input.match(/\*\*\* Update File: a\.txt/g).length, 1);
+  assert.equal(twoHunks.input.match(/\*\*\* Update File:/g).length, 2);
+
+  const movedAndEdited = convert('call_move_merge', [
+    {
+      type: 'update_hunk',
+      file: 'src.md',
+      move_to: 'dst.md',
+      chunks: [{ lines: [{ op: 'delete', text: 'x' }, { op: 'add', text: 'y' }] }],
+    },
+    { type: 'replace_text', file: 'src.md', old: 'p', new: 'q' },
+  ]);
+  assert.equal(movedAndEdited.input, [
+    '*** Begin Patch',
+    '*** Update File: src.md',
+    '*** Move to: dst.md',
+    '@@',
+    '-x',
+    '+y',
+    '@@',
+    '-p',
+    '+q',
+    '*** End Patch',
+  ].join('\n'));
+  assert.equal(movedAndEdited.input.match(/\*\*\* Move to:/g).length, 1);
+
+  const blankLines = convert('call_blank_lines', [
+    { type: 'insert_text_after', file: 'c.txt', anchor: 'line', content: '' },
+    { type: 'replace_text', file: 'd.txt', old: 'old', new: '' },
+    { type: 'add_file', file: 'e.txt', content: '' },
+  ]);
+  assert.equal(blankLines.input, [
+    '*** Begin Patch',
+    '*** Update File: c.txt',
+    '@@',
+    ' line',
+    '+',
+    '*** Update File: d.txt',
+    '@@',
+    '-old',
+    '+',
+    '*** Add File: e.txt',
+    '+',
+    '*** End Patch',
+  ].join('\n'));
+  });
+  await scenario('reports pinpointed diagnostics for invalid apply_patch tool calls', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const chatTools = toChatCompletionsRequest(normalized).tools;
+  assert.equal(chatToolsIncludeApplyPatch(chatTools), true);
+  assert.equal(chatToolsIncludeApplyPatch([{ type: 'function', function: { name: 'shell' } }]), false);
+  const diagnose = (args) => invalidApplyPatchToolCalls({
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            { id: 'call_check', type: 'function', function: { name: 'apply_patch', arguments: args } },
+          ],
+        },
+        finish_reason: 'tool_calls',
+      },
+    ],
+  }, chatTools);
+
+  assert.deepEqual(diagnose(JSON.stringify({
+    edits: [{ type: 'replace_text', file: 'a.txt', old: 'one', new: 'ONE' }],
+  })), []);
+
+  const combined = diagnose(JSON.stringify({
+    edits: [
+      { type: 'add_file', file: 'a.txt', content: 'x' },
+      { type: 'replace_text', file: 'a.txt', old: 'old', new: 'new' },
+    ],
+  }));
+  assert.equal(combined.length, 1);
+  assert.equal(combined[0].id, 'call_check');
+  assert.match(combined[0].error, /edits\[1\]: add_file or delete_file for "a\.txt" cannot be combined/);
+
+  const duplicateDelete = diagnose(JSON.stringify({
+    edits: [
+      { type: 'delete_file', file: 'a.txt' },
+      { type: 'delete_file', file: 'a.txt' },
+    ],
+  }));
+  assert.match(duplicateDelete[0].error, /edits\[1\]: add_file or delete_file for "a\.txt"/);
+
+  const afterEof = diagnose(JSON.stringify({
+    edits: [
+      { type: 'append_text', file: 'a.txt', content: 'tail' },
+      { type: 'insert_text_after', file: 'a.txt', anchor: 'line', content: 'x' },
+    ],
+  }));
+  assert.match(afterEof[0].error, /edits\[1\]: "a\.txt" already has an end-of-file edit/);
+
+  const conflictingMove = diagnose(JSON.stringify({
+    edits: [
+      { type: 'update_hunk', file: 'a.txt', move_to: 'b.txt', chunks: [{ lines: [{ op: 'add', text: 'x' }] }] },
+      { type: 'update_hunk', file: 'a.txt', move_to: 'c.txt', chunks: [{ lines: [{ op: 'add', text: 'y' }] }] },
+    ],
+  }));
+  assert.match(conflictingMove[0].error, /edits\[1\]: conflicting move_to targets for "a\.txt"/);
+
+  const emptyOldReplace = diagnose(JSON.stringify({
+    edits: [{ type: 'replace_text', file: 'a.txt', old: '', new: 'x' }],
+  }));
+  assert.match(emptyOldReplace[0].error, /edits\[0\] replace_text: "old" must be non-empty exact current file text; to remove lines use delete_text with the exact lines/);
+
+  const emptyOldDelete = diagnose(JSON.stringify({
+    edits: [{ type: 'delete_text', file: 'a.txt', old: '' }],
+  }));
+  assert.match(emptyOldDelete[0].error, /edits\[0\] delete_text: "old" must be non-empty exact current file text; delete_text removes exactly those lines/);
+
+  const unknownField = diagnose(JSON.stringify({
+    edits: [{ type: 'append_text', file: 'a.txt', content: 'x', anchor: 'line' }],
+  }));
+  assert.match(unknownField[0].error, /edits\[0\] append_text: unknown field "anchor"/);
+
+  const unknownType = diagnose(JSON.stringify({
+    edits: [{ type: 'modify', file: 'a.txt' }],
+  }));
+  assert.match(unknownType[0].error, /edits\[0\]: unknown type "modify"/);
+
+  const arrayContent = diagnose(JSON.stringify({
+    edits: [
+      { type: 'delete_file', file: 'z.txt' },
+      { type: 'add_file', file: 'a.txt', content: ['line1', 'line2'] },
+    ],
+  }));
+  assert.equal(arrayContent.length, 1);
+  assert.match(arrayContent[0].error, /edits\[1\] add_file: "content" must be a string/);
+  assert.doesNotMatch(arrayContent[0].error, /line1,line2/);
+
+  const numericContent = diagnose(JSON.stringify({
+    edits: [{ type: 'insert_text_after', file: 'a.txt', anchor: 'line', content: 123 }],
+  }));
+  assert.match(numericContent[0].error, /edits\[0\] insert_text_after: "content" must be a string/);
+
+  const numericOldReplace = diagnose(JSON.stringify({
+    edits: [{ type: 'replace_text', file: 'a.txt', old: 123, new: 'x' }],
+  }));
+  assert.match(numericOldReplace[0].error, /edits\[0\] replace_text: "old" must be a string/);
+
+  const numericOldDelete = diagnose(JSON.stringify({
+    edits: [{ type: 'delete_text', file: 'a.txt', old: 123 }],
+  }));
+  assert.match(numericOldDelete[0].error, /edits\[0\] delete_text: "old" must be a string/);
+
+  const objectNew = diagnose(JSON.stringify({
+    edits: [{ type: 'replace_text', file: 'a.txt', old: 'x', new: {} }],
+  }));
+  assert.match(objectNew[0].error, /edits\[0\] replace_text: "new" must be a string/);
+
+  const nullContent = diagnose(JSON.stringify({
+    edits: [{ type: 'append_text', file: 'a.txt', content: null }],
+  }));
+  assert.match(nullContent[0].error, /edits\[0\] append_text: "content" must be a string/);
+
+  const editsOnlyError = /apply_patch arguments must be \{"edits": \[\.\.\.\]\}; raw patch text is not accepted\./;
+  assert.match(diagnose(JSON.stringify('*** Begin Patch raw'))[0].error, editsOnlyError);
+  assert.match(diagnose(JSON.stringify({ input: '*** Begin Patch raw' }))[0].error, editsOnlyError);
+  assert.match(diagnose('{"edits": not json')[0].error, editsOnlyError);
+
+  const multiInvalid = diagnose(JSON.stringify({
+    edits: Array.from({ length: 8 }, () => ({ type: 'modify', file: 'a.txt' })),
+  }));
+  assert.match(multiInvalid[0].error, /and 3 more invalid edits/);
+  assert.equal(multiInvalid[0].error.length <= 700, true);
+  });
+  await scenario('does not pass malformed apply_patch JSON through as native patch text', async () => {
+  const normalized = normalizeResponsesRequest({
+    model: 'deepseek-v4-flash',
+    input: 'edit',
+    tools: [
+      {
+        type: 'custom',
+        name: 'apply_patch',
+        description: 'Edit files.',
+        format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' },
+      },
+    ],
+  });
+  const response = convertChatCompletionToResponses({
+    completion: {
+      created: 1000,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_bad',
+                type: 'function',
+                function: {
+                  name: 'apply_patch',
+                  arguments: '{"changes":[{"action":"add","path":"a.md","lines":["# Title"]}',
+                },
+              },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    },
+    model: 'deepseek-v4-flash',
+    previousResponseId: null,
+    normalized,
+    responseId: 'resp_bad_patch',
+  });
+  const item = response.output.find((entry) => entry.type === 'custom_tool_call');
+  assert.equal(item.input, '');
   });
   await scenario('adds a provider-level execution contract when Codex replay contains a checkpoint', async () => {
   const checkpoint = [
