@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { chmod, cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 
 async function scenario(name, run) {
@@ -99,6 +100,26 @@ test('CLI version and installation lifecycle', async () => {
   });
   assert.equal(output.trim(), packageJson.version);
   });
+  await scenario('reports an available update without changing the requested command result', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-update-check-'));
+  const preload = join(dir, 'preload.mjs');
+  try {
+    await writeFile(preload, `Object.defineProperty(process.stderr, 'isTTY', { value: true });\nglobalThis.fetch = async () => ({ ok: true, json: async () => ({ name: ${JSON.stringify(packageJson.name)}, version: '9.9.9' }) });\n`);
+    const result = spawnSync(
+      process.execPath,
+      ['--import', pathToFileURL(preload).href, resolve('bin/codex-deepseek-gateway.js'), '--version'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout.trim(), packageJson.version);
+    assert.equal(
+      result.stderr,
+      'New version 9.9.9 available. Run `codex-deepseek-gateway update` to update.\n',
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
   await scenario('install copies runtime assets without overwriting local config or reasoning cache', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-cli-install-'));
   try {
@@ -120,6 +141,8 @@ test('CLI version and installation lifecycle', async () => {
     await mkdir(join(dir, 'src'), { recursive: true });
     await writeFile(join(dir, 'src', 'stale.js'), 'stale');
     await writeFile(join(dir, 'config', 'model-aliases.json'), JSON.stringify({ stale: { model: 'stale' } }));
+    await writeFile(join(dir, 'config', 'codex-model-catalog.json'), '{}');
+    await writeFile(join(dir, 'config', 'codex-model-catalog.zh.json'), '{}');
 
     const env = { ...process.env };
     delete env.DEEPSEEK_API_KEY;
@@ -135,21 +158,14 @@ test('CLI version and installation lifecycle', async () => {
     assert.equal(existsSync(join(dir, 'bin', 'codex-deepseek-gateway.js')), true);
     assert.equal(existsSync(join(dir, 'src', 'server.js')), true);
     assert.equal(existsSync(join(dir, 'src', 'stale.js')), false);
-    assert.equal(existsSync(join(dir, 'gateway.debug.log')), false);
-    assert.equal(existsSync(join(dir, 'gateway.debug.log.1')), false);
-    assert.equal(existsSync(join(dir, 'config', 'codex-model-catalog.json')), true);
-    assert.equal(existsSync(join(dir, 'config', 'codex-model-catalog.zh.json')), true);
+    assert.equal(readFileSync(join(dir, 'gateway.debug.log'), 'utf8'), 'old debug');
+    assert.equal(readFileSync(join(dir, 'gateway.debug.log.1'), 'utf8'), 'older debug');
+    assert.equal(existsSync(join(dir, 'config', 'model-catalog.json')), true);
+    assert.equal(existsSync(join(dir, 'config', 'model-catalog.zh.json')), true);
+    assert.equal(existsSync(join(dir, 'config', 'codex-model-catalog.json')), false);
+    assert.equal(existsSync(join(dir, 'config', 'codex-model-catalog.zh.json')), false);
+    assert.equal(existsSync(join(dir, 'config', 'model-aliases.json')), false);
     assert.equal(existsSync(join(dir, 'config', 'frontend-design-guidance', 'en.md')), true);
-    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'config', 'model-aliases.json'), 'utf8')), {
-      'deepseek-v4-flash': {
-        model: 'deepseek-v4-flash',
-        thinking: 'auto',
-      },
-      'deepseek-v4-pro': {
-        model: 'deepseek-v4-pro',
-        thinking: 'auto',
-      },
-    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

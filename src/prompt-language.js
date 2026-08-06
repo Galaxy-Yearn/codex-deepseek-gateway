@@ -8,6 +8,6 @@ export function normalizePromptLanguage(value) {
 
 export function catalogFileForPromptLanguage(language) {
   return normalizePromptLanguage(language) === 'zh'
-    ? 'codex-model-catalog.zh.json'
-    : 'codex-model-catalog.json';
+    ? 'model-catalog.zh.json'
+    : 'model-catalog.json';
 }

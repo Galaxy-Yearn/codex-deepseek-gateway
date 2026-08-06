@@ -10,7 +10,7 @@ import {
   rmSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/config.js';
 import { newConversation } from '../src/codex-launch.js';
@@ -269,27 +269,6 @@ function readProcessRecord(installDir) {
   return readRuntimeRecord(pidPath(installDir));
 }
 
-function pathWithin(parent, target) {
-  const rel = relative(resolve(parent), resolve(target));
-  return rel === '' || (rel && !rel.startsWith('..') && !isAbsolute(rel));
-}
-
-function clearDebugPayloadLogs(installDir) {
-  const paths = new Set([join(installDir, 'gateway.debug.log')]);
-  try {
-    const config = loadInstalledConfig(installDir);
-    if (config.debugPayloadLogPath) {
-      const logPath = resolve(installDir, config.debugPayloadLogPath);
-      if (pathWithin(installDir, logPath)) paths.add(logPath);
-    }
-  } catch {
-  }
-  for (const logPath of paths) {
-    rmSync(logPath, { force: true });
-    rmSync(`${logPath}.1`, { force: true });
-  }
-}
-
 function copyRuntime(installDir) {
   mkdirSync(join(installDir, 'bin'), { recursive: true });
   mkdirSync(join(installDir, 'src'), { recursive: true });
@@ -299,12 +278,14 @@ function copyRuntime(installDir) {
   rmSync(join(installDir, 'src'), { recursive: true, force: true });
   cpSync(join(ROOT, 'bin'), join(installDir, 'bin'), { recursive: true });
   cpSync(join(ROOT, 'src'), join(installDir, 'src'), { recursive: true });
-  copyFileSync(join(ROOT, 'config', 'codex-model-catalog.json'), join(installDir, 'config', 'codex-model-catalog.json'));
-  copyFileSync(join(ROOT, 'config', 'codex-model-catalog.zh.json'), join(installDir, 'config', 'codex-model-catalog.zh.json'));
+  rmSync(join(installDir, 'config', 'codex-model-catalog.json'), { force: true });
+  rmSync(join(installDir, 'config', 'codex-model-catalog.zh.json'), { force: true });
+  copyFileSync(join(ROOT, 'config', 'model-catalog.json'), join(installDir, 'config', 'model-catalog.json'));
+  copyFileSync(join(ROOT, 'config', 'model-catalog.zh.json'), join(installDir, 'config', 'model-catalog.zh.json'));
   rmSync(join(installDir, 'config', 'frontend-design-guidance'), { recursive: true, force: true });
   cpSync(join(ROOT, 'config', 'frontend-design-guidance'), join(installDir, 'config', 'frontend-design-guidance'), { recursive: true });
   rmSync(join(installDir, 'config', 'codex-model-catalog.base.json'), { force: true });
-  copyFileSync(join(ROOT, 'config', 'model-aliases.example.json'), join(installDir, 'config', 'model-aliases.json'));
+  rmSync(join(installDir, 'config', 'model-aliases.json'), { force: true });
   const localConfig = configPath(installDir);
   if (!existsSync(localConfig)) {
     copyFileSync(join(ROOT, 'config', 'gateway.example.json'), localConfig);
@@ -329,7 +310,6 @@ function openConfig(file) {
 
 async function install(options) {
   copyRuntime(options.dir);
-  clearDebugPayloadLogs(options.dir);
   print(`Installed to ${options.dir}\n`);
   if (!isConfigured(options.dir)) {
     print(`Edit this file and put your DeepSeek API key:\n  ${configPath(options.dir)}\n`);

@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readSession, sessionPickerRows } from '../src/codex-sessions.js';
-import { pathOnlyEnv, prepareFakeCodex } from './fake-codex.js';
+import { pathOnlyEnv, prepareFakeCodex } from '../test-support/fake-codex.js';
 
 function writeJsonl(file, rows) {
   writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
@@ -55,14 +55,10 @@ function prepareSessionsFixture() {
   mkdirSync(join(projectDir, 'sub'), { recursive: true });
   mkdirSync(join(codexHome, 'sessions', '2026', '07'), { recursive: true });
   mkdirSync(join(installDir, 'config'), { recursive: true });
-  writeFileSync(join(installDir, 'config', 'model-aliases.json'), JSON.stringify({
-    'deepseek-v4-flash': { model: 'deepseek-v4-flash', thinking: 'auto' },
-    'deepseek-v4-pro': { model: 'deepseek-v4-pro', thinking: 'auto' },
-  }));
   writeFileSync(join(installDir, 'config', 'gateway.local.json'), '{}');
   writeFileSync(
-    join(installDir, 'config', 'codex-model-catalog.json'),
-    readFileSync(new URL('../config/codex-model-catalog.json', import.meta.url), 'utf8'),
+    join(installDir, 'config', 'model-catalog.json'),
+    readFileSync(new URL('../config/model-catalog.json', import.meta.url), 'utf8'),
   );
   const dayDir = join(codexHome, 'sessions', '2026', '07');
   const streaming = '019faaaa-0000-7000-8000-000000000001';
@@ -188,7 +184,7 @@ test('session discovery and filtering', async () => {
   try {
     const output = runSessionsCli(fixture, ['--print'], { cwd: join(fixture.projectDir, 'sub') });
     assert.match(output, new RegExp(`Codex sessions for project ${fixture.projectDir.replace(/\\/g, '\\\\')}`));
-    assert.match(output, /Target: deepseek-gateway \/ deepseek-v4-flash \/ low/);
+    assert.match(output, /Target: deepseek-gateway \/ deepseek-v4-flash \/ high/);
     assert.match(output, / 1 {2}2026-07-21 {3}deepseek-gateway/);
     assert.match(output, /Streaming fix/);
     assert.doesNotMatch(output, /Old A name/);
@@ -301,13 +297,10 @@ test('session picker rendering and navigation', async () => {
     mkdirSync(join(projectDir, '.git'), { recursive: true });
     mkdirSync(join(codexHome, 'sessions'), { recursive: true });
     mkdirSync(join(installDir, 'config'), { recursive: true });
-    writeFileSync(join(installDir, 'config', 'model-aliases.json'), JSON.stringify({
-      'deepseek-v4-flash': { model: 'deepseek-v4-flash', thinking: 'auto' },
-    }));
     writeFileSync(join(installDir, 'config', 'gateway.local.json'), JSON.stringify({ codexPromptLanguage: 'zh' }));
     writeFileSync(
-      join(installDir, 'config', 'codex-model-catalog.zh.json'),
-      readFileSync(new URL('../config/codex-model-catalog.zh.json', import.meta.url), 'utf8'),
+      join(installDir, 'config', 'model-catalog.zh.json'),
+      readFileSync(new URL('../config/model-catalog.zh.json', import.meta.url), 'utf8'),
     );
     writeJsonl(join(codexHome, 'sessions', 'main.jsonl'), [
       {
@@ -359,13 +352,10 @@ test('session picker rendering and navigation', async () => {
   try {
     mkdirSync(join(codexHome, 'sessions'), { recursive: true });
     mkdirSync(join(installDir, 'config'), { recursive: true });
-    writeFileSync(join(installDir, 'config', 'model-aliases.json'), JSON.stringify({
-      'deepseek-v4-flash': { model: 'deepseek-v4-flash', thinking: 'auto' },
-    }));
     writeFileSync(join(installDir, 'config', 'gateway.local.json'), '{}');
     writeFileSync(
-      join(installDir, 'config', 'codex-model-catalog.json'),
-      readFileSync(new URL('../config/codex-model-catalog.json', import.meta.url), 'utf8'),
+      join(installDir, 'config', 'model-catalog.json'),
+      readFileSync(new URL('../config/model-catalog.json', import.meta.url), 'utf8'),
     );
     writeJsonl(join(codexHome, 'sessions', 'main.jsonl'), [
       {
@@ -406,7 +396,7 @@ test('session picker rendering and navigation', async () => {
     assert.equal(output.match(/Choose gateway model/g)?.length, 2);
     assert.equal(output.match(/Choose DeepSeek reasoning level for deepseek-v4-flash/g)?.length, 1);
     assert.match(output, /Fast and cost-efficient agentic model for everyday work\./);
-    assert.match(output, /Fast responses with thinking disabled/);
+    assert.match(output, /Fast responses with light reasoning/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { clearScreenDown, cursorTo } from 'node:readline';
 import { readCodexConfig } from './codex-config.js';
 import { readLocalConfigFile } from './local-config.js';
+import { modelCatalogEntries, readModelCatalog } from './model-catalog.js';
 import { catalogFileForPromptLanguage, normalizePromptLanguage } from './prompt-language.js';
 import { displayWidth, padDisplay, truncateDisplay } from './terminal-text.js';
 
@@ -27,7 +28,7 @@ const PICKER_COPY = {
     sessionColumns: ['Date', 'Provider', 'Title'],
     showing: (first, last, total) => `Showing ${first}-${last} of ${total}`,
     unknownProvider: '(unknown)',
-    missingModel: (aliasesPath) => `No gateway models found in ${aliasesPath}\n`,
+    missingModel: (catalogPath) => `No gateway models found in ${catalogPath}\n`,
   },
   zh: {
     browse: '选择',
@@ -42,7 +43,7 @@ const PICKER_COPY = {
     sessionColumns: ['日期', '提供方', '标题'],
     showing: (first, last, total) => `显示 ${first}-${last}，共 ${total} 项`,
     unknownProvider: '(未知)',
-    missingModel: (aliasesPath) => `在 ${aliasesPath} 未找到网关模型\n`,
+    missingModel: (catalogPath) => `在 ${catalogPath} 未找到网关模型\n`,
   },
 };
 const require = createRequire(import.meta.url);
@@ -73,16 +74,6 @@ export function findProjectRoot(start) {
   }
 }
 
-function readJsonObject(file) {
-  if (!existsSync(file)) return {};
-  const value = JSON.parse(readFileSync(file, 'utf8'));
-  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-}
-
-export function gatewayModels(installDir) {
-  return Object.keys(readJsonObject(join(installDir, 'config', 'model-aliases.json'))).sort();
-}
-
 function readPromptLanguage(installDir) {
   const configFile = join(installDir, 'config', 'gateway.local.json');
   const localConfig = readLocalConfigFile(configFile);
@@ -90,20 +81,30 @@ function readPromptLanguage(installDir) {
 }
 
 function readPickerCatalog(file) {
-  const catalog = readJsonObject(file);
+  const catalog = readModelCatalog(file);
+  const models = [];
   const modelDescriptions = {};
+  const defaultReasoningEfforts = {};
   const reasoningDescriptions = {};
-  for (const model of Array.isArray(catalog.models) ? catalog.models : []) {
-    const slug = String(model?.slug || '').trim();
-    if (!slug) continue;
+  const reasoningEfforts = {};
+  for (const model of modelCatalogEntries(catalog)) {
+    const slug = model.slug;
+    models.push(slug);
     modelDescriptions[slug] = String(model.description || '').trim();
-    reasoningDescriptions[slug] = Object.fromEntries(
-      (Array.isArray(model.supported_reasoning_levels) ? model.supported_reasoning_levels : [])
-        .map((level) => [String(level?.effort || '').trim(), String(level?.description || '').trim()])
-        .filter(([effort]) => effort),
-    );
+    const levels = (Array.isArray(model.supported_reasoning_levels) ? model.supported_reasoning_levels : [])
+      .map((level) => [String(level?.effort || '').trim(), String(level?.description || '').trim()])
+      .filter(([effort]) => effort);
+    reasoningDescriptions[slug] = Object.fromEntries(levels);
+    reasoningEfforts[slug] = levels.map(([effort]) => effort);
+    const defaultEffort = String(model.default_reasoning_level || '').trim();
+    if (defaultEffort) defaultReasoningEfforts[slug] = defaultEffort;
   }
-  return { modelDescriptions, reasoningDescriptions };
+  return { defaultReasoningEfforts, modelDescriptions, models: models.sort(), reasoningDescriptions, reasoningEfforts };
+}
+
+function reasoningEffortsForModel(context) {
+  const efforts = context.reasoningEfforts?.[context.model];
+  return Array.isArray(efforts) && efforts.length ? efforts : REASONING_EFFORTS;
 }
 
 export function pickerCopy(language) {
@@ -112,39 +113,42 @@ export function pickerCopy(language) {
 
 export function createLaunchContext(options) {
   const codexHome = defaultCodexHome();
-  const models = gatewayModels(options.dir);
   const codexConfig = readCodexConfig();
   const promptLanguage = readPromptLanguage(options.dir);
   const modelCatalogPath = join(options.dir, 'config', catalogFileForPromptLanguage(promptLanguage));
   const pickerCatalog = readPickerCatalog(modelCatalogPath);
+  const models = pickerCatalog.models;
   const provider = options.provider || DEFAULT_PROVIDER;
   const configModel = codexConfig.modelProvider === DEFAULT_PROVIDER && models.includes(codexConfig.model) ? codexConfig.model : '';
   const configReasoningEffort = codexConfig.modelProvider === provider ? codexConfig.modelReasoningEffort : '';
+  const model = options.model || configModel || models[0] || '';
   return {
     all: options.all,
     codexHome,
     installDir: options.dir,
     modelCatalogPath,
     modelDescriptions: pickerCatalog.modelDescriptions,
+    defaultReasoningEfforts: pickerCatalog.defaultReasoningEfforts,
     models,
     promptLanguage,
     projectRoot: findProjectRoot(process.cwd()),
     provider,
     reasoningDescriptions: pickerCatalog.reasoningDescriptions,
-    model: options.model || configModel || models[0] || '',
-    reasoningEffort: options.reasoningEffort || configReasoningEffort || 'low',
+    reasoningEfforts: pickerCatalog.reasoningEfforts,
+    model,
+    reasoningEffort: options.reasoningEffort || configReasoningEffort || pickerCatalog.defaultReasoningEfforts[model] || 'high',
   };
 }
 
 export function missingModelMessage(context) {
-  const aliasesPath = join(context.installDir, 'config', 'model-aliases.json');
-  return pickerCopy(context.promptLanguage).missingModel(aliasesPath);
+  return pickerCopy(context.promptLanguage).missingModel(context.modelCatalogPath);
 }
 
 function configOverrideArgs(context) {
-  if (context.provider === DEFAULT_PROVIDER && !REASONING_EFFORTS.includes(context.reasoningEffort)) {
+  const reasoningEfforts = reasoningEffortsForModel(context);
+  if (context.provider === DEFAULT_PROVIDER && !reasoningEfforts.includes(context.reasoningEffort)) {
     throw new Error(
-      `Unsupported DeepSeek reasoning effort ${JSON.stringify(context.reasoningEffort)}. Expected one of: ${REASONING_EFFORTS.join(', ')}`,
+      `Unsupported DeepSeek reasoning effort ${JSON.stringify(context.reasoningEffort)}. Expected one of: ${reasoningEfforts.join(', ')}`,
     );
   }
   const args = [
@@ -514,16 +518,23 @@ export async function pickModel(context) {
   const copy = pickerCopy(context.promptLanguage);
   const rows = pickerChoiceRows(context.models, context.modelDescriptions, terminalWidth());
   const result = await pick(copy.modelTitle, rows, '', { language: context.promptLanguage });
-  if (result.action === 'select') context.model = context.models[result.index];
+  if (result.action === 'select') {
+    context.model = context.models[result.index];
+    const reasoningEfforts = reasoningEffortsForModel(context);
+    if (!reasoningEfforts.includes(context.reasoningEffort)) {
+      context.reasoningEffort = context.defaultReasoningEfforts?.[context.model] || reasoningEfforts[0];
+    }
+  }
   return result.action;
 }
 
 export async function pickReasoning(context) {
   const copy = pickerCopy(context.promptLanguage);
   const descriptions = context.reasoningDescriptions?.[context.model];
-  const rows = pickerChoiceRows(REASONING_EFFORTS, descriptions, terminalWidth());
+  const reasoningEfforts = reasoningEffortsForModel(context);
+  const rows = pickerChoiceRows(reasoningEfforts, descriptions, terminalWidth());
   const result = await pick(copy.reasoningTitle(context.model), rows, '', { language: context.promptLanguage });
-  if (result.action === 'select') context.reasoningEffort = REASONING_EFFORTS[result.index];
+  if (result.action === 'select') context.reasoningEffort = reasoningEfforts[result.index];
   return result.action;
 }
 

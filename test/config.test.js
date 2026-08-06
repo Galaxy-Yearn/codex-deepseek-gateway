@@ -13,7 +13,7 @@ async function scenario(name, run) {
   }
 }
 import { inspectCodexConfig, readCodexConfig } from '../src/codex-config.js';
-import { loadConfig, normalizeCompactMaxTokens, normalizeCompactReasoningEffort } from '../src/config.js';
+import { loadConfig, normalizeCompactMaxTokens, normalizeCompactReasoningEffort, normalizeCompactTimeoutMs } from '../src/config.js';
 import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from '../src/local-config.js';
 import { catalogFileForPromptLanguage, normalizePromptLanguage } from '../src/prompt-language.js';
 
@@ -49,8 +49,9 @@ test('gateway configuration precedence and defaults', async () => {
     assert.equal(config.host, '127.0.0.2');
     assert.equal(config.upstreamApiKey, 'from-file');
     assert.equal(config.upstreamProvider, 'deepseek');
-    assert.equal(config.compactReasoningEffort, 'max');
+    assert.equal(config.compactReasoningEffort, 'high');
     assert.equal(config.compactMaxTokens, 20000);
+    assert.equal(config.compactTimeoutMs, 240000);
     assert.equal(config.requestBodyMaxBytes, 1048576);
     assert.equal(config.shutdownTimeoutMs, 4000);
     assert.equal(config.tavilyWebSearchEnabled, false);
@@ -85,24 +86,30 @@ test('gateway configuration precedence and defaults', async () => {
       upstreamApiKey: 'from-file',
       compactReasoningEffort: 'high',
       compactMaxTokens: 50000,
+      compactTimeoutMs: 210000,
     }));
     const localConfig = loadConfig({ GATEWAY_CONFIG_FILE: file });
     assert.equal(localConfig.compactReasoningEffort, 'high');
-    assert.equal(localConfig.compactMaxTokens, 50000);
+    assert.equal(localConfig.compactMaxTokens, 20000);
+    assert.equal(localConfig.compactTimeoutMs, 210000);
 
     const envConfig = loadConfig({
       GATEWAY_CONFIG_FILE: file,
       COMPACT_REASONING_EFFORT: 'invalid',
       COMPACT_MAX_TOKENS: '200000',
+      COMPACT_TIMEOUT_MS: '175000',
     });
-    assert.equal(envConfig.compactReasoningEffort, 'max');
-    assert.equal(envConfig.compactMaxTokens, 100000);
+    assert.equal(envConfig.compactReasoningEffort, 'high');
+    assert.equal(envConfig.compactMaxTokens, 20000);
+    assert.equal(envConfig.compactTimeoutMs, 175000);
 
     const fallbackConfig = loadConfig({
       GATEWAY_CONFIG_FILE: file,
       COMPACT_MAX_TOKENS: '0',
     });
     assert.equal(fallbackConfig.compactMaxTokens, 20000);
+    assert.equal(normalizeCompactReasoningEffort('max'), 'max');
+    assert.equal(normalizeCompactTimeoutMs(0), 240000);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -150,11 +157,35 @@ test('gateway configuration precedence and defaults', async () => {
         codexPromptLanguage: 'zh',
       }),
     );
+    await writeFile(join(dir, 'config', 'model-catalog.zh.json'), JSON.stringify({
+      models: [{ slug: 'zh-catalog-model' }],
+    }));
 
     const config = loadConfig({
       GATEWAY_CONFIG_FILE: join(dir, 'config', 'gateway.local.json'),
     });
     assert.equal(config.codexPromptLanguage, 'zh');
+    assert.deepEqual(Object.keys(config.modelAliases), ['zh-catalog-model']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
+  await scenario('derives installed model mappings from the English model catalog', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-config-model-catalog-'));
+  try {
+    await mkdir(join(dir, 'config'));
+    const configFile = join(dir, 'config', 'gateway.local.json');
+    await writeFile(configFile, JSON.stringify({ upstreamApiKey: 'from-file' }));
+    await writeFile(join(dir, 'config', 'model-catalog.json'), JSON.stringify({
+      models: [
+        { slug: 'catalog-a' },
+        { slug: 'catalog-b' },
+      ],
+    }));
+
+    const config = loadConfig({ GATEWAY_CONFIG_FILE: configFile });
+    assert.deepEqual(Object.keys(config.modelAliases), ['catalog-a', 'catalog-b']);
+    assert.deepEqual(config.modelAliases['catalog-a'], { model: 'catalog-a', thinking: 'auto' });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -209,14 +240,14 @@ test('gateway configuration precedence and defaults', async () => {
   });
   await scenario('normalizes standalone compact, prompt-language, and local-config boundaries', async () => {
   assert.equal(normalizeCompactReasoningEffort('high'), 'high');
-  assert.equal(normalizeCompactReasoningEffort('future'), 'max');
-  assert.equal(normalizeCompactMaxTokens('50000'), 50000);
-  assert.equal(normalizeCompactMaxTokens('200000'), 100000);
+  assert.equal(normalizeCompactReasoningEffort('future'), 'high');
+  assert.equal(normalizeCompactMaxTokens('50000'), 20000);
+  assert.equal(normalizeCompactMaxTokens('200000'), 20000);
   assert.equal(normalizeCompactMaxTokens('0'), 20000);
   assert.equal(normalizePromptLanguage(' ZH '), 'zh');
   assert.equal(normalizePromptLanguage('fr'), 'en');
-  assert.equal(catalogFileForPromptLanguage('zh'), 'codex-model-catalog.zh.json');
-  assert.equal(catalogFileForPromptLanguage('invalid'), 'codex-model-catalog.json');
+  assert.equal(catalogFileForPromptLanguage('zh'), 'model-catalog.zh.json');
+  assert.equal(catalogFileForPromptLanguage('invalid'), 'model-catalog.json');
 
   const dir = await mkdtemp(join(tmpdir(), 'gateway-local-config-'));
   try {

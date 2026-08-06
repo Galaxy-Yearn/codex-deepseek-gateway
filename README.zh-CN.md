@@ -20,7 +20,19 @@ Codex /v1/responses
 - 一个 [DeepSeek API key](https://platform.deepseek.com/api_keys)
 - [Codex CLI](https://developers.openai.com/codex) 0.144.0 或更新版本
 
-## 安装与启动
+## 项目优势
+
+核心目标是让 DeepSeek 在 Codex 中尽量贴近原生 GPT 模型的行为：同样的工作流和会话生命周期、DeepSeek 可使用每一个 Codex 工具（含并行调用与会话中途通过 `tool_search` 公开的工具）、工具运行期间有实时进度说明。工具执行、历史与恢复仍完全归 Codex 管理。
+
+在此之上，网关额外提供：
+
+- 替换模型列表：随包 catalog 把 DeepSeek 模型与 reasoning 档位注册进 Codex，`/model` 可直接切换，需要校验模型名的功能（如原生 sub-agents）也照常可用。
+- 极高的缓存命中率：请求构造针对 DeepSeek 上下文缓存的特点做了优化，多轮会话中命中率极高，费用与响应延迟显著降低。
+- 网络搜索：可选接入 Tavily 和 Firecrawl，让 Codex 的网络搜索请求真实可用，并针对多轮搜索优化效率。
+- 调优的系统提示词：随包提供为 DeepSeek 适配的双语 system prompts 与 personalities。
+- 更强的 compact 机制：网关把映射历史投影为惰性语义证据，让 DeepSeek 提交一个通过 schema 校验的 checkpoint，再安装精简的执行状态与工作记忆。模型输出无效、provider 失败、超时或 authority 校验失败时，直接回退到确定性的可信状态，不会卡住会话。
+
+## 安装、启动与检查
 
 安装软件包，并把运行时复制到 `~/.codex/deepseek-gateway`：
 
@@ -48,9 +60,19 @@ codex-deepseek-gateway status
 
 `status` 应显示 `Gateway status: HEALTHY`。
 
+以下命令和诊断信息用于管理并检查已经安装的网关：
+
+- `codex-deepseek-gateway status` — 执行快速本机健康检查。`HEALTHY` 表示 CLI、已安装运行时和实际运行进程的版本一致，记录中的进程通过身份认证，并且实际使用的本地 API 端点可达。
+- `codex-deepseek-gateway doctor` — 在 `status` 基础上检查完整的 Codex → 网关 → DeepSeek 链路，包括网关配置、监听安全、Codex provider、中英文 catalog 对齐、`/v1/models`、DeepSeek 身份认证、reasoning cache 和可选网络后端。它会给出 `OK`、`WARNING` 或 `FAIL` 及直接修复建议，不会发送 completion，也不会调用 Tavily/Firecrawl。
+- `codex-deepseek-gateway stop` — 验证进程身份后，正常停止记录中的网关实例；无法确认身份时不会终止该进程。
+- `codex-deepseek-gateway stop --force` — 强制停止记录中的 PID。只应在核对 `~/.codex/deepseek-gateway/gateway.pid` 并确认该进程确实属于当前网关安装后使用。
+- 调试日志 — 在 `gateway.local.json` 中设置 `"debugPayload": true`，即可把每次请求的映射与编排摘要写入 `~/.codex/deepseek-gateway/gateway.debug.log`。它用于排查请求转换、模型与 reasoning 映射、工具调用、流式输出、网络搜索和 compact，不会改变网关行为。日志达到 5 MB 时轮转；安装与升级会保留现有日志，旧文件可手动删除。
+
+`status` 和 `doctor` 都支持 `--json`，用于输出稳定的结构化报告。修改 `gateway.local.json` 后，应先运行 `stop`，再运行 `start` 重启网关。更新后连续出现 compact fallback 诊断或请求边界错误，通常是更新时会话仍处于打开状态；退出并重开该会话即可（见「版本更新」一节）。
+
 ## 配置 Codex Provider
 
-Codex 通过 `~/.codex/config.toml` 中的 provider 条目连接网关。launcher 命令（下一节的 `codex-deepseek-gateway new` / `sessions`）不会代为创建，请自行把以下块写入该文件（文件不存在则新建），并重启正在运行的 Codex：
+两种使用方式都需要在 `~/.codex/config.toml` 中配置以下 provider。网关安装器不会代为创建；请自行加入该配置块（文件不存在则新建），并重启正在运行的 Codex：
 
 ```toml
 [model_providers.deepseek-gateway]
@@ -59,21 +81,28 @@ base_url = "http://127.0.0.1:3000/v1"
 wire_api = "responses"
 ```
 
-顶层模型设置可以不写进 `config.toml`：launcher 每次启动都会传入 `model_provider`、你选定的 `model` 和 `model_reasoning_effort`，以及 `model_supports_reasoning_summaries = true` 和 `model_reasoning_summary = "auto"`。只有当你希望普通 `codex` 也能使用网关时才需要补上；此时 launcher 会把你的 `model` 和 `model_reasoning_effort` 作为默认值：
+选择网关有以下两种方式。
+
+### 普通 `codex` 加载随包 Catalog
+
+如需让 DeepSeek 成为普通 Codex 的默认 provider，请添加顶层模型设置，并让 `model_catalog_json` 指向安装后的英文或中文 catalog：
 
 ```toml
 model_provider = "deepseek-gateway"
-model = "deepseek-v4-pro"
-model_reasoning_effort = "max"
-model_supports_reasoning_summaries = true
-model_reasoning_summary = "auto"
+model = "deepseek-v4-flash"
+model_reasoning_effort = "high"
+model_catalog_json = "~/.codex/deepseek-gateway/config/model-catalog.json"
 ```
 
-即便如此，普通 `codex` 也不会加载下一节介绍的随包 model catalog；优先使用 launcher 命令。
+然后直接运行 `codex`。如需中文 prompts、模型与 reasoning 描述以及 personalities，把路径中的文件名改成 `model-catalog.zh.json`。配置 `model_catalog_json` 后，普通 Codex 会加载与网关 launcher 相同的随包模型和元数据。
+
+### Gateway Launcher 与其他 Provider 并用
+
+如需保留另一个 provider 作为普通 Codex 的默认值，请保持其顶层 `model_provider`、`model` 等设置不变。`codex-deepseek-gateway new` 和 `sessions` 只要求上面的 `deepseek-gateway` provider 块；它们会为本次 Codex 进程注入所选 provider、模型、reasoning 强度、reasoning summary 设置和随包 `model_catalog_json`。因此网关可以与另一个 provider 同时配置，而不替换普通 Codex 的默认 provider。
 
 ## 在 Codex 中使用
 
-通过 launcher 启动 Codex：
+使用 launcher 路径时，通过以下命令启动 Codex：
 
 ```sh
 codex-deepseek-gateway new       # 开始新对话
@@ -93,7 +122,7 @@ codex-deepseek-gateway sessions --all               # 包含所有项目的会�
 codex-deepseek-gateway sessions --exec <id-or-row>  # 按行号或 session id 直接恢复
 ```
 
-在 launcher 启动的 Codex TUI 中，`/model` 可在随包 DeepSeek 模型和 reasoning 档位之间切换，`/personality` 可在 catalog 提供的 personality 之间切换。
+无论通过普通 `codex` 还是 launcher，只要加载了随包 catalog，Codex TUI 中的 `/model` 就能切换 DeepSeek 模型和 reasoning 档位，`/personality` 可以切换 catalog 提供的 personality。
 
 ### 语言
 
@@ -105,80 +134,33 @@ codex-deepseek-gateway sessions --exec <id-or-row>  # 按行号或 session id �
 }
 ```
 
-`en`（默认）使用英文的随包 prompts、personalities、模型与 reasoning 描述，以及 `new` / `sessions` 选择界面；`zh` 使用对应的中文版本。无效值回退到 `en`。该设置不会翻译 Codex 自身的原生 TUI。更改会在下次运行 `new` 或 `sessions` 时生效；已打开的 Codex 会话不能热切换 catalog，需要重开。
+`en`（默认）让 launcher 注入英文 catalog，并使用英文 `new` / `sessions` 选择界面；`zh` 使用中文 catalog 和选择界面。无效值回退到 `en`。普通 `codex` 使用其 `model_catalog_json` 路径指定的 catalog 文件。两种方式都不会翻译 Codex 自身的原生 TUI；切换 catalog 后需要重开 Codex 会话。
 
 ### 模型与 Reasoning
 
-网关提供两个模型别名：`deepseek-v4-flash` 和 `deepseek-v4-pro`。随包 catalog 直接提供与 DeepSeek V4 对齐的三个 reasoning 档位：
+当前选中的 catalog 是安装后唯一的模型清单：其中的模型 slug 同时驱动 launcher、网关 `/v1/models` 端点以及默认的 DeepSeek 同名模型映射。
 
-| Reasoning 档位 | DeepSeek 请求 |
-| --- | --- |
-| `low` | `thinking.type = disabled` |
-| `high` | `thinking.type = enabled`，`reasoning_effort = high` |
-| `max` | `thinking.type = enabled`，`reasoning_effort = max` |
+网关提供两个模型 ID：`deepseek-v4-flash` 和 `deepseek-v4-pro`。随包 catalog 直接提供与 DeepSeek V4 对齐的三个 reasoning 档位：
 
-`high` 是 DeepSeek V4 的常规思考强度；`max` 面向最复杂的 Agent 任务。
+| Reasoning 档位 | 含义 | DeepSeek 请求 |
+| --- | --- | --- |
+| `low` | 轻量推理 | `thinking.type = enabled`，`reasoning_effort = low` |
+| `high` | 深度推理 | `thinking.type = enabled`，`reasoning_effort = high` |
+| `max` | 最大推理强度 | `thinking.type = enabled`，`reasoning_effort = max` |
+
+`low` 表示轻量推理，不是关闭思考；`high` 是默认档位，`max` 面向最复杂的 Agent 任务。
+
+如需关闭思考，请在 `config.toml` 中把 Codex 的 `model_reasoning_effort` 设为 `none`，或只对一次普通 Codex 启动进行覆盖：
+
+```sh
+codex -c 'model_reasoning_effort="none"'
+```
+
+`none` 是 Codex 的请求覆盖值，不是 DeepSeek model catalog 对外声明的 reasoning 档位，因此不会出现在 `/model` 或网关 launcher 的选择器中。网关会把它映射成 `thinking.type = disabled`，并从 DeepSeek 请求中省略 `reasoning_effort`。
 
 DeepSeek 的思维链会在 Codex TUI 中完整显示，原始 `reasoning_content` 同时为模型历史保留。
 
-随包 catalog 声明 1M token 的 context window，并在约 900K token 时触发自动压缩；请求未设置输出上限时，剩余约 100K 作为 DeepSeek 默认输出预算（可用 `upstreamMaxTokens` 覆盖）。catalog 还向 Codex 注册了模型别名和 reasoning 档位，因此需要校验模型名的功能（如原生 sub-agents）也接受这些 DeepSeek 模型。
-
-## 项目优势
-
-核心目标是让 DeepSeek 在 Codex 中尽量贴近原生 GPT 模型的行为：同样的工作流和会话生命周期、DeepSeek 可使用每一个 Codex 工具（含并行调用与会话中途通过 `tool_search` 公开的工具）、工具运行期间有实时进度说明。工具执行、历史与恢复仍完全归 Codex 管理。
-
-在此之上，网关额外提供：
-
-- 替换模型列表：随包 catalog 把 DeepSeek 模型与 reasoning 档位注册进 Codex，`/model` 可直接切换，需要校验模型名的功能（如原生 sub-agents）也照常可用。
-- 更强的 compact 机制：`/compact` 由网关亲自执行，生成的检查点在进入会话历史前逐一校验，异常模型输出会被拒绝；thinking 档位与输出预算可调。
-- 极高的缓存命中率：请求构造针对 DeepSeek 上下文缓存的特点做了优化，多轮会话中命中率极高，费用与响应延迟显著降低。
-- 网络搜索：可选接入 Tavily 和 Firecrawl，让 Codex 的网络搜索请求真实可用，并针对多轮搜索优化效率。
-- 调优的系统提示词：随包提供为 DeepSeek 适配的双语 system prompts 与 personalities。
-
-## 配置参考
-
-所有设置位于 `~/.codex/deepseek-gateway/config/gateway.local.json`。复制下面的代码块并按需修改；所示值即默认值（`sk-REPLACE_ME` 是占位符，网关会视作未设置）。每个键也可用 `UPPER_SNAKE_CASE` 形式的环境变量设置（环境变量优先）。修改后重启网关（先 `stop` 再 `start`）。
-
-```json
-{
-  "upstreamApiKey": "sk-REPLACE_ME",
-  "upstreamBaseUrl": "https://api.deepseek.com",
-  "upstreamMaxTokens": 0,
-  "host": "127.0.0.1",
-  "port": 3000,
-  "codexPromptLanguage": "en",
-  "compactReasoningEffort": "max",
-  "compactMaxTokens": 20000,
-  "reasoningCacheEnabled": true,
-  "debugPayload": false,
-  "tavilyApiKey": "",
-  "tavilyWebSearchEnabled": false,
-  "webSearchMaxRounds": 60,
-  "firecrawlApiKey": "",
-  "firecrawlWebFetchEnabled": false
-}
-```
-
-- `upstreamApiKey` — 你的 [DeepSeek API key](https://platform.deepseek.com/api_keys)（也可用 `DEEPSEEK_API_KEY`）。
-- `upstreamBaseUrl` — DeepSeek API 端点；参见 [DeepSeek API 文档](https://api-docs.deepseek.com/)。
-- `upstreamMaxTokens` — DeepSeek 输出 token 上限；`0` 表示使用 catalog 的默认约 100K 预算。
-- `host`、`port` — 网关监听地址。
-- `codexPromptLanguage` — 随包 catalog 与 launcher 语言；见[语言](#语言)。
-- `compactReasoningEffort` — 压缩使用的 thinking effort，`high` 或 `max`。
-- `compactMaxTokens` — 压缩输出预算，硬上限 100000。
-- `reasoningCacheEnabled` — 设为 `false` 可关闭下文的 reasoning cache。
-- `debugPayload` — 把每次请求的映射摘要写入 `gateway.debug.log`（5 MB 轮转）。
-- `tavilyApiKey`、`tavilyWebSearchEnabled` — [Tavily](https://docs.tavily.com/documentation/quickstart) 网络搜索后端（见「网络搜索」）。
-- `webSearchMaxRounds` — 单轮对话内的网络搜索轮数，默认 `60`，硬上限 `80`。
-- `firecrawlApiKey`、`firecrawlWebFetchEnabled` — [Firecrawl](https://docs.firecrawl.dev/introduction) 页面读取后端（见「网络搜索」）。
-- `webSearchMaxSearches`、`webSearchMaxPages` — 每 turn 的 provider 操作预算，默认分别为 `30` 次 Tavily 搜索和 `50` 次 Firecrawl 页面抓取，硬上限分别为 `50` 和 `80`。自动抓取和模型主动抓取共享同一个页面预算。
-- `webSearchMaxToolChars`、`webSearchTurnTimeoutMs`、`webSearchConcurrency` — 工具文本总量、总时限和并发预算，默认分别为 `240000`、`180000`、`3`；工具文本硬上限为 `400000` 字符。
-- `firecrawlMaxAgeMs`、`firecrawlStoreInCache` — Firecrawl 新鲜度和存储策略；默认缓存窗口为两天，Tavily 的新鲜度过滤会自动使用更短窗口。
-
-安装目录下有两个由网关自行管理的支持文件：
-
-- `config/model-aliases.json` — 模型别名；每次 install 和 start 时刷新。
-- `state/reasoning-cache.jsonl` — 有界缓存（默认 1000 条消息 / 16 MB），用于在网关重启后还原工具轮次的 DeepSeek 原始 reasoning；`install` 会保留，也可随时安全删除。
+随包 catalog 声明 1M token 的 context window，自动 compact 使用 Codex 的默认策略。如需覆盖阈值，可在 `~/.codex/config.toml` 中设置 `model_auto_compact_token_limit`，或启动时传入 `codex -c 'model_auto_compact_token_limit=...'`。请求未设置输出上限时，catalog 仍预留约 100K 作为 DeepSeek 默认输出预算（可用 `upstreamMaxTokens` 覆盖）。catalog 还向 Codex 注册了模型和 reasoning 档位，因此需要校验模型名的功能（如原生 sub-agents）也接受这些 DeepSeek 模型。
 
 ## 网络搜索（可选）
 
@@ -204,7 +186,7 @@ Codex 的 `web_search` / `web_search_preview` 请求会经由 Tavily 执行。�
 
 ## 版本更新
 
-更新前先退出所有正在运行的 Codex 会话。更新网关时仍保持打开的会话可能在之后出错：其后续 compact 请求可能连续返回 `upstream_error`，需要重开会话才能恢复。
+更新前先退出所有正在运行的 Codex 会话。更新网关时仍保持打开的会话可能在之后进入确定性 compact fallback，或因请求边界不兼容而失败，需要重开会话才能恢复。
 
 ```sh
 codex-deepseek-gateway update
@@ -240,24 +222,58 @@ codex-deepseek-gateway sessions   # 选择并恢复 Codex 会话
 codex-deepseek-gateway uninstall  # 删除本地运行时
 ```
 
-`status` 是快速的本机检查：核对 CLI、已安装运行时和实际运行进程的版本，认证 PID 所属实例，显示运行时长，并检查进程实际使用的本地 API 端点。`doctor` 在此基础上检查网关配置、监听安全性、Codex CLI/provider、中英文 catalog 与模型 alias、本地模型端点、通过 `GET /models` 进行的 DeepSeek 认证连通性、reasoning cache，以及可选网络搜索后端配置。它不会发送 completion，也不会实际调用 Tavily/Firecrawl。两个命令都可添加 `--json` 输出稳定的结构化报告。
-
 运行 `codex-deepseek-gateway --help` 查看全部选项。
 
-## 故障排查
+## 配置参考
 
-- `codex-deepseek-gateway status` — `HEALTHY` 表示记录中的进程正在运行、身份认证通过、版本一致，并且实际端点可达。
-- `codex-deepseek-gateway doctor` — 对完整的 Codex → 网关 → DeepSeek 配置链路给出 `OK`、`WARNING` 或 `FAIL`，并为每个警告或失败提供直接修复建议。
-- 调试日志：在 `gateway.local.json` 中设置 `"debugPayload": true`，把每次请求的映射摘要写入 `~/.codex/deepseek-gateway/gateway.debug.log`（5 MB 轮转）。
-- `stop` 不会终止无法验证身份的进程。使用 `stop --force` 前，先核对安装目录中的 `gateway.pid`。
-- 更新后 compact 连续出现 `upstream_error`，通常是更新时会话仍处于打开状态；退出并重开该会话即可（见「版本更新」一节）。
+所有设置位于 `~/.codex/deepseek-gateway/config/gateway.local.json`。复制下面的代码块并按需修改；所示值即默认值（`sk-REPLACE_ME` 是占位符，网关会视作未设置）。每个键也可用 `UPPER_SNAKE_CASE` 形式的环境变量设置（环境变量优先）。修改后重启网关（先 `stop` 再 `start`）。
+
+```json
+{
+  "upstreamApiKey": "sk-REPLACE_ME",
+  "upstreamBaseUrl": "https://api.deepseek.com",
+  "upstreamMaxTokens": 0,
+  "host": "127.0.0.1",
+  "port": 3000,
+  "codexPromptLanguage": "en",
+  "compactReasoningEffort": "high",
+  "compactMaxTokens": 20000,
+  "compactTimeoutMs": 240000,
+  "reasoningCacheEnabled": true,
+  "debugPayload": false,
+  "tavilyApiKey": "",
+  "tavilyWebSearchEnabled": false,
+  "webSearchMaxRounds": 60,
+  "firecrawlApiKey": "",
+  "firecrawlWebFetchEnabled": false
+}
+```
+
+- `upstreamApiKey` — 你的 [DeepSeek API key](https://platform.deepseek.com/api_keys)（也可用 `DEEPSEEK_API_KEY`）。
+- `upstreamBaseUrl` — DeepSeek API 端点；参见 [DeepSeek API 文档](https://api-docs.deepseek.com/)。
+- `upstreamMaxTokens` — DeepSeek 输出 token 上限；`0` 表示使用 catalog 的默认约 100K 预算。
+- `host`、`port` — 网关监听地址。
+- `codexPromptLanguage` — launcher 注入的 catalog 与选择器语言；普通 `codex` 使用其配置的 `model_catalog_json`；见[语言](#语言)。
+- `compactReasoningEffort` — 压缩使用的 thinking effort，默认 `high`，仍可使用 `max`。
+- `compactMaxTokens` — 安装后 checkpoint 的硬上限，默认且最高为 20000；harness 不另行限制 DeepSeek 的生成额度，也不设置更小的 checkpoint 目标。
+- `compactTimeoutMs` — 单次 compact 模型调用的总时限，默认 240000 ms，与普通上游请求时限相互独立。
+- `reasoningCacheEnabled` — 设为 `false` 可关闭下文的 reasoning cache。
+- `debugPayload` — 把每次请求的映射摘要写入 `gateway.debug.log`（5 MB 轮转）。
+- `tavilyApiKey`、`tavilyWebSearchEnabled` — [Tavily](https://docs.tavily.com/documentation/quickstart) 网络搜索后端（见「网络搜索」）。
+- `webSearchMaxRounds` — 单轮对话内的网络搜索轮数，默认 `60`，硬上限 `80`。
+- `firecrawlApiKey`、`firecrawlWebFetchEnabled` — [Firecrawl](https://docs.firecrawl.dev/introduction) 页面读取后端（见「网络搜索」）。
+- `webSearchMaxSearches`、`webSearchMaxPages` — 每 turn 的 provider 操作预算，默认分别为 `30` 次 Tavily 搜索和 `50` 次 Firecrawl 页面抓取，硬上限分别为 `50` 和 `80`。自动抓取和模型主动抓取共享同一个页面预算。
+- `webSearchMaxToolChars`、`webSearchTurnTimeoutMs`、`webSearchConcurrency` — 工具文本总量、总时限和并发预算，默认分别为 `240000`、`180000`、`3`；工具文本硬上限为 `400000` 字符。
+- `firecrawlMaxAgeMs`、`firecrawlStoreInCache` — Firecrawl 新鲜度和存储策略；默认缓存窗口为两天，Tavily 的新鲜度过滤会自动使用更短窗口。
+
+安装目录下还会保留 `state/reasoning-cache.jsonl`：这是一个有界缓存（默认 1000 条消息 / 16 MB），用于在网关重启后还原工具轮次的 DeepSeek 原始 reasoning；`install` 会保留，也可随时安全删除。
 
 ## 局限
 
 - Chat Completions 不是完整的 Responses API 替代品。没有本地 executor 的 Codex hosted tools 只会以普通 function tool 的形式声明给 DeepSeek，而不会被执行；网络搜索是网关唯一亲自执行的 hosted tool。
 - Tavily/Firecrawl 的网络搜索模拟以文本为中心，不承诺 OpenAI hosted web_search 的 cached/indexed 模式、图片搜索内容、浏览器控制、截图、原始 HTML、cookies、crawl jobs 或私有网络访问。
 - OpenAI `file_id` 值会原样透传；网关无法获取 OpenAI 托管的私有文件。
-- 普通 `codex` 命令不会加载随包 model catalog；请使用 `new` / `sessions`。
+- 普通 `codex` 仅在 `model_catalog_json` 指向随包文件时加载该 catalog；网关 launcher 会自动注入这个覆盖参数。
 - 恢复会话后，Codex 可能重复显示特定长 Markdown 轮次的尾部。历史本身没有重复；这是上游 Codex TUI 的显示问题。
 
 ## 许可证

@@ -1482,6 +1482,10 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
 
     const request = parsed.value;
     const compactionState = readCodexCompactionMetadata(request, req.headers);
+    if (compactionState.malformed) {
+      sendJson(res, 400, { error: { code: 'invalid_compaction_request', message: 'Malformed Codex turn metadata.' } });
+      return;
+    }
     const normalized = normalizeResponsesRequest(request);
     normalized.messages = prependMissingAssistantToolMessages(normalized.messages, reasoningCache);
     normalized.messages = restoreAssistantReasoningContent(normalized.messages, reasoningCache);

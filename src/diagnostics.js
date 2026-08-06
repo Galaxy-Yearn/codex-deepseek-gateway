@@ -6,6 +6,7 @@ import { inspectCodexConfig } from './codex-config.js';
 import { resolveCodexExecutable } from './codex-launch.js';
 import { isObject, joinUrl, safeJsonParse } from './common.js';
 import { loadConfig } from './config.js';
+import { modelAliasesFromCatalog } from './model-catalog.js';
 import { resolveModelAlias } from './model-map.js';
 import {
   connectHttpUrl,
@@ -28,9 +29,8 @@ export function gatewayDiagnosticPaths(installDir) {
     package: join(installDir, 'package.json'),
     cli: join(installDir, 'bin', 'codex-deepseek-gateway.js'),
     server: join(installDir, 'src', 'server.js'),
-    aliases: join(installDir, 'config', 'model-aliases.json'),
-    catalogEn: join(installDir, 'config', 'codex-model-catalog.json'),
-    catalogZh: join(installDir, 'config', 'codex-model-catalog.zh.json'),
+    catalogEn: join(installDir, 'config', 'model-catalog.json'),
+    catalogZh: join(installDir, 'config', 'model-catalog.zh.json'),
   };
 }
 
@@ -65,7 +65,6 @@ function configContext(paths, env) {
     const config = loadConfig({
       ...env,
       GATEWAY_CONFIG_FILE: paths.config,
-      MODEL_ALIASES_FILE: paths.aliases,
     });
     return { config, error: null };
   } catch (error) {
@@ -405,13 +404,14 @@ export async function inspectGatewayDoctor({
       try { new URL(config.upstreamBaseUrl); } catch { invalid.push('upstreamBaseUrl is invalid'); }
       if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) invalid.push('port must be between 1 and 65535');
       if (!Number.isFinite(config.upstreamTimeoutMs) || config.upstreamTimeoutMs <= 0) invalid.push('upstreamTimeoutMs must be positive');
+      if (!Number.isFinite(config.compactTimeoutMs) || config.compactTimeoutMs <= 0) invalid.push('compactTimeoutMs must be positive');
       if (invalid.length) return diagnosticResult('fail', invalid.join('; '), { path: paths.config }, `Fix ${paths.config}`);
       const debug = config.debugPayload ? 'debug on' : 'debug off';
-      return diagnosticResult('ok', `gateway config valid (${config.codexPromptLanguage} prompts, compact ${config.compactReasoningEffort}/${config.compactMaxTokens}, ${debug})`, {
+      return diagnosticResult('ok', `gateway config valid (${config.codexPromptLanguage} prompts, compact ${config.compactReasoningEffort}/${config.compactMaxTokens}/${config.compactTimeoutMs}ms, ${debug})`, {
         path: paths.config,
         upstream: safeUrl(config.upstreamBaseUrl),
         promptLanguage: config.codexPromptLanguage,
-        compaction: { reasoningEffort: config.compactReasoningEffort, maxTokens: config.compactMaxTokens },
+        compaction: { reasoningEffort: config.compactReasoningEffort, maxTokens: config.compactMaxTokens, timeoutMs: config.compactTimeoutMs },
         proxyAuthentication: Boolean(config.proxyApiKey),
         debugPayload: Boolean(config.debugPayload),
       });
@@ -457,27 +457,28 @@ export async function inspectGatewayDoctor({
       });
     }),
     runCheck('catalog.integrity', 'catalog', async () => {
-      if (!existsSync(paths.aliases)) return diagnosticResult('fail', 'model-aliases.json is missing', { path: paths.aliases }, 'Reinstall the gateway.');
-      const aliases = readJson(paths.aliases);
-      const english = catalogShape(readJson(paths.catalogEn));
+      const englishCatalog = readJson(paths.catalogEn);
+      const english = catalogShape(englishCatalog);
       const chinese = catalogShape(readJson(paths.catalogZh));
       if (!catalogsAligned(english, chinese)) {
         return diagnosticResult('fail', 'English and Chinese catalogs are not structurally aligned', { english: [...english.keys()], chinese: [...chinese.keys()] }, 'Align model IDs, reasoning levels, and personality keys in both catalogs.');
       }
       const catalogModels = [...english.keys()].sort();
-      const aliasModels = Object.keys(aliases).sort();
-      const missingAliases = catalogModels.filter((model) => !aliasModels.includes(model));
-      const extraAliases = aliasModels.filter((model) => !catalogModels.includes(model));
-      if (missingAliases.length) return diagnosticResult('fail', `catalog models are missing aliases: ${missingAliases.join(', ')}`, { catalogModels, aliasModels }, `Fix ${paths.aliases}`);
-      const mappings = Object.fromEntries(aliasModels.map((model) => {
-        const resolved = resolveModelAlias(model, { ...config, modelAliases: aliases });
+      const catalogAliases = modelAliasesFromCatalog(englishCatalog);
+      const configuredAliases = isObject(config?.modelAliases) ? config.modelAliases : catalogAliases;
+      const mappedModels = Object.keys(configuredAliases).sort();
+      const missingMappings = catalogModels.filter((model) => !mappedModels.includes(model));
+      const extraMappings = mappedModels.filter((model) => !catalogModels.includes(model));
+      if (missingMappings.length) return diagnosticResult('fail', `catalog models are missing mappings: ${missingMappings.join(', ')}`, { catalogModels, mappedModels }, 'Reinstall the gateway.');
+      const mappings = Object.fromEntries(mappedModels.map((model) => {
+        const resolved = resolveModelAlias(model, { ...config, modelAliases: configuredAliases });
         return [model, { upstreamModel: resolved.upstreamModel, thinking: resolved.thinking }];
       }));
-      const resultStatus = extraAliases.length ? 'warning' : 'ok';
-      const summary = extraAliases.length
-        ? `aliases not present in the Codex catalogs: ${extraAliases.join(', ')}`
-        : `${config?.codexPromptLanguage || 'selected'} catalog and ${catalogModels.length} model aliases are aligned`;
-      return diagnosticResult(resultStatus, summary, { catalogModels, aliasModels, mappings }, extraAliases.length ? 'Add the aliases to both catalogs or remove them.' : null);
+      const resultStatus = extraMappings.length ? 'warning' : 'ok';
+      const summary = extraMappings.length
+        ? `model mappings not present in the Codex catalogs: ${extraMappings.join(', ')}`
+        : `${config?.codexPromptLanguage || 'selected'} catalogs define ${catalogModels.length} aligned model mappings`;
+      return diagnosticResult(resultStatus, summary, { catalogModels, mappedModels, mappings }, extraMappings.length ? 'Add the mapped models to both catalogs or remove the overrides.' : null);
     }),
     runCheck('gateway.models', 'gateway', async () => {
       if (!config || !['healthy', 'degraded'].includes(status.state)) return diagnosticResult('skipped', 'gateway model endpoint was not checked because the runtime is unavailable');
@@ -513,7 +514,7 @@ export async function inspectGatewayDoctor({
       const models = Array.isArray(data?.data) ? data.data.map((model) => String(model?.id || '')).filter(Boolean).sort() : [];
       const targets = [...new Set(Object.keys(config.modelAliases).map((model) => resolveModelAlias(model, config).upstreamModel))].sort();
       const missing = models.length ? targets.filter((model) => !models.includes(model)) : [];
-      if (missing.length) return diagnosticResult('warning', `DeepSeek authenticated, but /models does not list: ${missing.join(', ')}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models, targets }, 'Verify the configured model aliases against the provider account.');
+      if (missing.length) return diagnosticResult('warning', `DeepSeek authenticated, but /models does not list: ${missing.join(', ')}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models, targets }, 'Verify the configured model mappings against the provider account.');
       return diagnosticResult('ok', `DeepSeek authentication and /models are reachable (${latencyMs} ms)`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models });
     }),
     runCheck('reasoning.cache', 'cache', async () => {

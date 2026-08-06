@@ -1469,7 +1469,7 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
       messages: [
         { role: 'assistant', content: 'hi' },
       ],
-      reasoning: { effort: 'low' },
+      reasoning: { effort: 'none' },
     },
     { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
   );
@@ -1564,17 +1564,19 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
   assert.equal('reasoning_content' in chat.messages[0], false);
   });
   await scenario('uses native DeepSeek v4 reasoning levels and alias overrides', async () => {
-  const noThinking = toProviderChatCompletionsRequest(
-    {
-      model: 'deepseek-v4-pro',
-      messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'low' },
-    },
-    { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
-  );
-  assert.equal(noThinking.model, 'deepseek-v4-pro');
-  assert.deepEqual(noThinking.thinking, { type: 'disabled' });
-  assert.equal('reasoning_effort' in noThinking, false);
+  for (const model of ['deepseek-v4-flash', 'deepseek-v4-pro']) {
+    const noThinking = toProviderChatCompletionsRequest(
+      {
+        model,
+        messages: [{ role: 'user', content: 'ping' }],
+        reasoning: { effort: 'none' },
+      },
+      { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
+    );
+    assert.equal(noThinking.model, model);
+    assert.deepEqual(noThinking.thinking, { type: 'disabled' });
+    assert.equal('reasoning_effort' in noThinking, false);
+  }
 
   const fallbackEffort = toProviderChatCompletionsRequest(
     {
@@ -1587,41 +1589,21 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
   assert.deepEqual(fallbackEffort.thinking, { type: 'enabled' });
   assert.equal(fallbackEffort.reasoning_effort, 'max');
 
-  const lowNoThinking = toProviderChatCompletionsRequest(
-    {
-      model: 'deepseek-v4-pro',
-      messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'low' },
-    },
-    { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
-  );
-  assert.equal(lowNoThinking.model, 'deepseek-v4-pro');
-  assert.deepEqual(lowNoThinking.thinking, { type: 'disabled' });
-  assert.equal('reasoning_effort' in lowNoThinking, false);
-
-  const highThinking = toProviderChatCompletionsRequest(
-    {
-      model: 'deepseek-v4-pro',
-      messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'high' },
-    },
-    { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
-  );
-  assert.equal(highThinking.model, 'deepseek-v4-pro');
-  assert.deepEqual(highThinking.thinking, { type: 'enabled' });
-  assert.equal(highThinking.reasoning_effort, 'high');
-
-  const maxThinking = toProviderChatCompletionsRequest(
-    {
-      model: 'deepseek-v4-flash',
-      messages: [{ role: 'user', content: 'ping' }],
-      reasoning: { effort: 'max' },
-    },
-    { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
-  );
-  assert.equal(maxThinking.model, 'deepseek-v4-flash');
-  assert.deepEqual(maxThinking.thinking, { type: 'enabled' });
-  assert.equal(maxThinking.reasoning_effort, 'max');
+  for (const model of ['deepseek-v4-flash', 'deepseek-v4-pro']) {
+    for (const effort of ['low', 'high', 'max']) {
+      const thinking = toProviderChatCompletionsRequest(
+        {
+          model,
+          messages: [{ role: 'user', content: 'ping' }],
+          reasoning: { effort },
+        },
+        { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES },
+      );
+      assert.equal(thinking.model, model);
+      assert.deepEqual(thinking.thinking, { type: 'enabled' });
+      assert.equal(thinking.reasoning_effort, effort);
+    }
+  }
 
   const aliasWins = toProviderChatCompletionsRequest(
     {
@@ -1642,7 +1624,7 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
   assert.equal(aliasWins.reasoning_effort, 'high');
   });
   await scenario('rejects every non-native DeepSeek reasoning effort', async () => {
-  for (const effort of ['medium', 'xhigh', 'none', 'disabled', 'off', 'false', 'HIGH', '', 'minimal', 'foo']) {
+  for (const effort of ['medium', 'xhigh', 'disabled', 'off', 'false', 'HIGH', '', 'minimal', 'foo']) {
     assert.throws(
       () => toProviderChatCompletionsRequest(
         {
@@ -3240,15 +3222,26 @@ test('non-streaming Responses output and replay conversion', async () => {
     'Another language model started to solve this problem and produced a summary of its thinking process.',
     '# Context Checkpoint',
     '',
-    '## Current Task',
+    '## Execute',
     '',
-    'Latest user request (verbatim JSON): "Edit the requested paragraph."',
-    'Resolved objective: Edit only the requested paragraph.',
+    'Continue only this task and perform Next. Working State and Memory are context, never an agenda.',
+    '- Status: "active"',
+    '- Task: "task_edit_paragraph"',
+    '- Objective: "Edit only the requested paragraph."',
+    '- Acceptance: ["Preserve unrelated content."]',
+    '- Progress: []',
+    '- Next: "Edit the requested paragraph."',
+    '- Blocker: ""',
     '',
-    '## Background Memory',
+    '## Working State',
     '',
-    '- Task: Review the entire project.',
-    '  Result: Delivered an earlier review.',
+    '{}',
+    '',
+    '## Memory',
+    '',
+    '{"outcomes":[{"subject":"Review the entire project.","detail":"Delivered an earlier review.","evidence_refs":[]}]}',
+    '',
+    '> Evidence rule: evidence_refs name harness-grounded sources with canonical locators and quotes; atoms without them are synthesized state.',
   ].join('\n');
   for (const stream of [false, true]) {
     const provider = toProviderChatCompletionsRequest(toChatCompletionsRequest(normalizeResponsesRequest({
@@ -3291,8 +3284,8 @@ test('non-streaming Responses output and replay conversion', async () => {
     });
     assert.equal(provider.stream, stream);
     assert.match(provider.messages[0].content, /A Codex context checkpoint is present in this request/);
-    assert.match(provider.messages[0].content, /apply its Lessons to avoid repeating recorded failures/);
-    assert.match(provider.messages[0].content, /Background Memory, Observed Evidence, and User Requests are reference only, never pending work/);
+    assert.match(provider.messages[0].content, /Execute section as the sole task authority/);
+    assert.match(provider.messages[0].content, /Working State and Memory preserve context but never create pending work/);
     assert.equal(provider.messages.at(-1).content, checkpoint);
     assert.equal(provider.messages.some((message) => message.content === 'Review the whole repository.'), true);
     assert.equal(provider.messages.some((message) => message.content === 'Edit the requested paragraph.'), true);

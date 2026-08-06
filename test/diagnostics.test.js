@@ -37,10 +37,6 @@ async function fixture({ version = '1.2.3', host = '127.0.0.1' } = {}) {
   await writeFile(join(dir, 'package.json'), JSON.stringify({ version }));
   await writeFile(join(dir, 'bin', 'codex-deepseek-gateway.js'), '');
   await writeFile(join(dir, 'src', 'server.js'), '');
-  await writeFile(join(configDir, 'model-aliases.json'), JSON.stringify({
-    'deepseek-v4-flash': { model: 'deepseek-v4-flash', thinking: 'auto' },
-    'deepseek-v4-pro': { model: 'deepseek-v4-pro', thinking: 'auto' },
-  }));
   const catalog = {
     models: ['deepseek-v4-flash', 'deepseek-v4-pro'].map((slug) => ({
       slug,
@@ -52,8 +48,8 @@ async function fixture({ version = '1.2.3', host = '127.0.0.1' } = {}) {
       },
     })),
   };
-  await writeFile(join(configDir, 'codex-model-catalog.json'), JSON.stringify(catalog));
-  await writeFile(join(configDir, 'codex-model-catalog.zh.json'), JSON.stringify(catalog));
+  await writeFile(join(configDir, 'model-catalog.json'), JSON.stringify(catalog));
+  await writeFile(join(configDir, 'model-catalog.zh.json'), JSON.stringify(catalog));
 
   const dataServer = http.createServer((request, response) => {
     response.writeHead(200, { 'content-type': 'application/json' });
@@ -270,7 +266,7 @@ test('gateway diagnostics failure matrix', async () => {
       host: corrupted.host,
       port: corrupted.dataPort,
     }));
-    await writeFile(join(corrupted.dir, 'config', 'codex-model-catalog.zh.json'), '{invalid');
+    await writeFile(join(corrupted.dir, 'config', 'model-catalog.zh.json'), '{invalid');
     await writeFile(join(corrupted.dir, 'state', 'reasoning-cache.jsonl'), 'not a jsonl record\n');
     const report = await inspectGatewayDoctor({
       installDir: corrupted.dir,
@@ -342,7 +338,7 @@ test('gateway diagnostics failure matrix', async () => {
     assert.equal(outdated.checks['codex.integration'].remediation, 'Update Codex CLI.');
 
     await writeFile(codexConfig, 'model_provider = "duckcoding"\n');
-    await writeFile(join(unreachable.dir, 'config', 'codex-model-catalog.zh.json'), JSON.stringify({
+    await writeFile(join(unreachable.dir, 'config', 'model-catalog.zh.json'), JSON.stringify({
       models: [{
         slug: 'deepseek-v4-flash',
         supported_reasoning_levels: [{ effort: 'low' }],

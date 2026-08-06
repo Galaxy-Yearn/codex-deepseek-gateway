@@ -69,7 +69,7 @@ export class ReasoningCache {
 
   migrateLegacy() {
     try {
-      const parsed = safeJsonParse(readFileSync(this.legacyPath, 'utf8').replace(/^﻿/, ''));
+      const parsed = safeJsonParse(readFileSync(this.legacyPath, 'utf8').replace(/^\uFEFF/, ''));
       if (!parsed.ok || !isObject(parsed.value)) return;
       this.loadLegacyPayload(parsed.value);
       const journalPath = `${this.legacyPath}.journal`;

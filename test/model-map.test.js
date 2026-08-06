@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -27,6 +27,13 @@ test('model alias loading and resolution', async () => {
   await scenario('loads model aliases with defaults, file values, and environment precedence', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-model-map-'));
   const file = join(dir, 'aliases.json');
+  const catalogFile = join(dir, 'model-catalog.json');
+  await writeFile(catalogFile, JSON.stringify({
+    models: [
+      { slug: 'catalog-model' },
+      { slug: 'shared' },
+    ],
+  }));
   await writeFile(file, JSON.stringify({
     'file-alias': 'deepseek-v4-pro',
     shared: { model: 'file-model', thinking: false },
@@ -39,9 +46,10 @@ test('model alias loading and resolution', async () => {
         'env-alias': { upstream_model: 'env-model', thinking_mode: 'thinking', effort: 'max' },
         shared: { model: 'env-model' },
       }),
-    }, dir);
+    }, dir, catalogFile);
 
-    assert.deepEqual(aliases['deepseek-v4-flash'], DEFAULT_MODEL_ALIASES['deepseek-v4-flash']);
+    assert.deepEqual(aliases['catalog-model'], { model: 'catalog-model', thinking: 'auto' });
+    assert.equal(aliases['deepseek-v4-flash'], undefined);
     assert.equal(aliases['file-alias'], 'deepseek-v4-pro');
     assert.deepEqual(aliases.shared, { model: 'env-model' });
     assert.equal(resolveModelAlias('file-alias', { modelAliases: aliases }).upstreamModel, 'deepseek-v4-pro');
@@ -52,6 +60,12 @@ test('model alias loading and resolution', async () => {
       reasoningEffort: 'max',
       extraBody: {},
     });
+
+    await mkdir(join(dir, 'config'));
+    await writeFile(join(dir, 'config', 'model-aliases.json'), JSON.stringify({ ignored: 'ignored-model' }));
+    const catalogOnly = loadModelAliases({}, dir, catalogFile);
+    assert.equal(catalogOnly.ignored, undefined);
+    assert.deepEqual(catalogOnly['catalog-model'], { model: 'catalog-model', thinking: 'auto' });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -97,10 +111,11 @@ test('model alias loading and resolution', async () => {
 test('reasoning and model catalog mapping', async () => {
   await scenario('uses native DeepSeek reasoning levels and alias overrides', async () => {
   const cases = [
-    [{ thinking: 'auto' }, 'low', { thinking: { type: 'disabled' } }],
+    [{ thinking: 'auto' }, 'none', { thinking: { type: 'disabled' } }],
+    [{ thinking: 'auto' }, 'low', { thinking: { type: 'enabled' }, reasoning_effort: 'low' }],
     [{ thinking: 'auto' }, 'high', { thinking: { type: 'enabled' }, reasoning_effort: 'high' }],
     [{ thinking: 'auto' }, 'max', { thinking: { type: 'enabled' }, reasoning_effort: 'max' }],
-    [{ thinking: 'enabled' }, 'low', { thinking: { type: 'enabled' } }],
+    [{ thinking: 'enabled' }, 'low', { thinking: { type: 'enabled' }, reasoning_effort: 'low' }],
     [{ thinking: 'disabled', reasoningEffort: 'max' }, 'high', { thinking: { type: 'disabled' } }],
     [{ thinking: 'enabled', reasoningEffort: 'max' }, 'high', { thinking: { type: 'enabled' }, reasoning_effort: 'max' }],
   ];
@@ -109,7 +124,7 @@ test('reasoning and model catalog mapping', async () => {
     assert.deepEqual(deepseekReasoningPayload({ alias, reasoning: { effort } }), expected);
   }
 
-  for (const effort of ['medium', 'xhigh', 'none', 'disabled', 'off', 'false', 'HIGH', '', 'unsupported']) {
+  for (const effort of ['medium', 'xhigh', 'disabled', 'off', 'false', 'HIGH', '', 'unsupported']) {
     assert.throws(
       () => deepseekReasoningPayload({ alias: { thinking: 'auto' }, reasoning: { effort } }),
       (error) => error.code === 'invalid_reasoning_effort' && error.statusCode === 400,

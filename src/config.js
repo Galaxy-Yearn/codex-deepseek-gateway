@@ -3,15 +3,16 @@ import { loadModelAliases } from './model-map.js';
 import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from './local-config.js';
 import { parseBoolean, parseList } from './common.js';
 import { readCodexConfig } from './codex-config.js';
-import { normalizePromptLanguage } from './prompt-language.js';
+import { catalogFileForPromptLanguage, normalizePromptLanguage } from './prompt-language.js';
 import { DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './runtime.js';
 
 export const DEFAULT_COMPACT_MAX_TOKENS = 20000;
-export const COMPACT_MAX_TOKENS_HARD_LIMIT = 100000;
+export const COMPACT_MAX_TOKENS_HARD_LIMIT = 20000;
+export const DEFAULT_COMPACT_TIMEOUT_MS = 240000;
 
 export function normalizeCompactReasoningEffort(value) {
   const normalized = String(value || '').trim().toLowerCase();
-  return normalized === 'high' ? 'high' : 'max';
+  return normalized === 'max' ? 'max' : 'high';
 }
 
 export function normalizeCompactMaxTokens(value) {
@@ -20,11 +21,19 @@ export function normalizeCompactMaxTokens(value) {
   return Math.min(Math.floor(number), COMPACT_MAX_TOKENS_HARD_LIMIT);
 }
 
+export function normalizeCompactTimeoutMs(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return DEFAULT_COMPACT_TIMEOUT_MS;
+  return Math.floor(number);
+}
+
 export function loadConfig(env = process.env) {
   const localConfigPath = resolveLocalConfigPath(env);
   const stateDir = resolve(dirname(localConfigPath), '..', 'state');
   const mergedEnv = mergeLocalConfig(env);
   const localConfig = readLocalConfigFile(localConfigPath);
+  const codexPromptLanguage = normalizePromptLanguage(localConfig.CODEX_PROMPT_LANGUAGE);
+  const modelCatalogPath = resolve(dirname(localConfigPath), catalogFileForPromptLanguage(codexPromptLanguage));
   const codexConfig = readCodexConfig(mergedEnv);
   return {
     port: Number(mergedEnv.PORT || 3000),
@@ -37,6 +46,7 @@ export function loadConfig(env = process.env) {
     upstreamMaxTokens: Number(mergedEnv.UPSTREAM_MAX_TOKENS || mergedEnv.DEEPSEEK_MAX_TOKENS || 0),
     compactReasoningEffort: normalizeCompactReasoningEffort(mergedEnv.COMPACT_REASONING_EFFORT),
     compactMaxTokens: normalizeCompactMaxTokens(mergedEnv.COMPACT_MAX_TOKENS),
+    compactTimeoutMs: normalizeCompactTimeoutMs(mergedEnv.COMPACT_TIMEOUT_MS),
     upstreamModels: parseList(mergedEnv.UPSTREAM_MODELS || mergedEnv.MODELS),
     fetchUpstreamModels: parseBoolean(mergedEnv.FETCH_UPSTREAM_MODELS, false),
     modelsTimeoutMs: Number(mergedEnv.MODELS_TIMEOUT_MS || 5000),
@@ -100,7 +110,7 @@ export function loadConfig(env = process.env) {
     codexReasoningSummary: codexConfig.modelReasoningSummary,
     codexModelSupportsReasoningSummaries: codexConfig.modelSupportsReasoningSummaries,
     codexHideAgentReasoning: codexConfig.hideAgentReasoning,
-    codexPromptLanguage: normalizePromptLanguage(localConfig.CODEX_PROMPT_LANGUAGE),
-    modelAliases: loadModelAliases(mergedEnv),
+    codexPromptLanguage,
+    modelAliases: loadModelAliases(mergedEnv, process.cwd(), modelCatalogPath),
   };
 }

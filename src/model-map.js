@@ -1,33 +1,26 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { isObject, parseJsonObject } from './common.js';
+import { modelAliasesFromCatalog, readModelCatalog } from './model-catalog.js';
 
-const DEEPSEEK_V4_MODELS = ['deepseek-v4-flash', 'deepseek-v4-pro'];
-const DEEPSEEK_REASONING_EFFORTS = new Set(['low', 'high', 'max']);
+const DEEPSEEK_REASONING_EFFORTS = new Set(['none', 'low', 'high', 'max']);
 const DEPRECATED_MODEL_PATTERN = /^deepseek-(?:chat|reasoner)$/;
+const DEFAULT_MODEL_CATALOG_FILE = new URL('../config/model-catalog.json', import.meta.url);
 
-function deepseekV4Aliases() {
-  const aliases = {};
-  for (const model of DEEPSEEK_V4_MODELS) {
-    aliases[model] = { model, thinking: 'auto' };
-  }
-  return aliases;
-}
-
-export const DEFAULT_MODEL_ALIASES = deepseekV4Aliases();
+export const DEFAULT_MODEL_ALIASES = modelAliasesFromCatalog(readModelCatalog(DEFAULT_MODEL_CATALOG_FILE));
 
 function readJsonFile(filePath) {
   if (!filePath || !existsSync(filePath)) return {};
   return parseJsonObject(readFileSync(filePath, 'utf8'), { source: filePath, throwOnInvalid: true });
 }
 
-export function loadModelAliases(env = process.env, cwd = process.cwd()) {
-  const defaultFile = resolve(cwd, 'config', 'model-aliases.json');
-  const filePath = env.MODEL_ALIASES_FILE ? resolve(cwd, env.MODEL_ALIASES_FILE) : defaultFile;
-  const fileAliases = readJsonFile(filePath);
+export function loadModelAliases(env = process.env, cwd = process.cwd(), catalogFile = resolve(cwd, 'config', 'model-catalog.json')) {
+  const catalogAliases = modelAliasesFromCatalog(readModelCatalog(catalogFile));
+  const baseAliases = existsSync(catalogFile) ? catalogAliases : DEFAULT_MODEL_ALIASES;
+  const fileAliases = env.MODEL_ALIASES_FILE ? readJsonFile(resolve(cwd, env.MODEL_ALIASES_FILE)) : {};
   const envAliases = parseJsonObject(env.MODEL_ALIASES_JSON, { source: 'MODEL_ALIASES_JSON', throwOnInvalid: true });
   return {
-    ...DEFAULT_MODEL_ALIASES,
+    ...baseAliases,
     ...fileAliases,
     ...envAliases,
   };
@@ -74,7 +67,7 @@ export function resolveModelAlias(requestedModel, config = {}) {
 function validateDeepSeekReasoningEffort(effort) {
   if (effort == null) return undefined;
   if (DEEPSEEK_REASONING_EFFORTS.has(effort)) return effort;
-  const error = new Error(`Unsupported DeepSeek reasoning effort ${JSON.stringify(effort)}. Expected one of: low, high, max`);
+  const error = new Error(`Unsupported DeepSeek reasoning effort ${JSON.stringify(effort)}. Expected one of: none, low, high, max`);
   error.statusCode = 400;
   error.code = 'invalid_reasoning_effort';
   throw error;
@@ -86,12 +79,12 @@ export function deepseekReasoningPayload({ alias, reasoning } = {}) {
   const aliasEffort = validateDeepSeekReasoningEffort(alias?.reasoningEffort);
   const effort = aliasEffort ?? requestEffort;
 
-  if (aliasThinking === 'disabled' || (aliasThinking === 'auto' && effort === 'low')) {
+  if (aliasThinking === 'disabled' || effort === 'none') {
     return { thinking: { type: 'disabled' } };
   }
 
   const payload = { thinking: { type: 'enabled' } };
-  if (effort === 'high' || effort === 'max') payload.reasoning_effort = effort;
+  if (effort === 'low' || effort === 'high' || effort === 'max') payload.reasoning_effort = effort;
   return payload;
 }
 

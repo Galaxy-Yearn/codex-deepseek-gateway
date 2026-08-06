@@ -1,28 +1,13 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import http from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
-import {
-  CODEX_COMPACT_PROMPT,
-  createCompactionPlan,
-  parseRenderedCheckpoint,
-  readCodexCompactionMetadata,
-  renderCompactionCheckpoint,
-  runCompactionPlan,
-  validateCompactionCompletion,
-} from '../src/compaction.js';
+import { CODEX_COMPACT_PROMPT, parseRenderedCheckpoint, renderCompactionCheckpoint } from '../src/compaction.js';
 import { DEFAULT_MODEL_ALIASES } from '../src/model-map.js';
-import { normalizeResponsesRequest, toChatCompletionsRequest } from '../src/protocol.js';
 import { ReasoningCache } from '../src/reasoning-cache.js';
 import { createProxyServer } from '../src/server.js';
-
-async function scenario(name, run) {
-  try {
-    await run();
-  } catch (error) {
-    error.message = name + ': ' + error.message;
-    throw error;
-  }
-}
 
 function listen(server) {
   return new Promise((resolve) => {
@@ -53,38 +38,68 @@ function parseResponsesSse(text) {
   return frames;
 }
 
-function checkpoint(overrides = {}) {
+function atom(subject, detail, evidenceRefs = []) {
+  return { subject, detail, evidence_refs: evidenceRefs };
+}
+
+function checkpoint({
+  taskId = 'task_gateway_compaction',
+  status = 'active',
+  objective = 'Complete the gateway compaction path.',
+  acceptance = ['Preserve the current task and verify the gateway behavior.'],
+  next = 'Run the remaining verification.',
+  blocker = '',
+  working = {},
+  memory = {},
+} = {}) {
+  const active = status === 'active' || status === 'blocked';
   return {
-    objective: 'Complete the gateway compaction path.',
-    observations: [],
-    state: 'The implementation is present and still needs release verification.',
-    completed: [{ task: 'Review the design.', result: 'Confirmed Codex owns history replacement.' }],
-    in_progress: [{ task: 'Verify compaction.', done: 'Reviewed the request mapping.', remaining: 'Run the gateway tests.' }],
-    lessons: [],
-    constraints: 'Keep the gateway stateless and preserve raw reasoning only in the bounded cache.',
-    next: 'Run the focused tests and inspect the packaged path.',
-    ...overrides,
+    execution: {
+      task_id: active ? taskId : '',
+      status: active ? status : 'idle',
+      objective: active ? objective : '',
+      acceptance: active ? acceptance : [],
+      next: active ? next : '',
+      blocker: status === 'blocked' ? blocker : '',
+    },
+    working: {
+      artifacts: [],
+      knowledge: [],
+      verification: [],
+      operations: [],
+      risks: [],
+      ...working,
+    },
+    memory: {
+      session: [],
+      durable: [],
+      suspended: [],
+      ...memory,
+    },
   };
 }
 
-function compactJsonCompletion({
+function compactCompletion({
   value = checkpoint(),
-  content = JSON.stringify(value),
-  finishReason = 'stop',
+  content = '',
+  finishReason = 'tool_calls',
+  toolName = 'submit_compaction_checkpoint',
+  argumentsText = JSON.stringify(value),
   toolCalls,
-  refusal,
-  choices,
   usage = { prompt_tokens: 900, completion_tokens: 100, total_tokens: 1000 },
 } = {}) {
   const message = { role: 'assistant', content };
-  if (toolCalls !== undefined) message.tool_calls = toolCalls;
-  if (refusal !== undefined) message.refusal = refusal;
+  message.tool_calls = toolCalls ?? [{
+    id: 'call_submit_checkpoint',
+    type: 'function',
+    function: { name: toolName, arguments: argumentsText },
+  }];
   return {
     id: 'chatcmpl_compact',
     object: 'chat.completion',
     created: 123,
     model: 'deepseek-v4-pro',
-    choices: choices ?? [{ index: 0, message, finish_reason: finishReason }],
+    choices: [{ index: 0, message, finish_reason: finishReason }],
     usage,
   };
 }
@@ -108,12 +123,10 @@ function compactMetadata(compaction = {}, metadata = {}) {
 }
 
 function compactBody({
-  stream = true,
+  stream = false,
   metadata = compactMetadata(),
-  history = [
-    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Inspect the gateway and preserve the current progress.' }] },
-    { type: 'function_call_output', call_id: 'call_lookup', output: '{"status":"working"}' },
-  ],
+  history = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue the current gateway task.' }] }],
+  focus = CODEX_COMPACT_PROMPT,
 } = {}) {
   return {
     model: 'deepseek-v4-pro',
@@ -125,7 +138,7 @@ function compactBody({
     tools: [{ type: 'function', name: 'lookup', parameters: { type: 'object', properties: {} } }],
     input: [
       ...history,
-      { type: 'message', role: 'user', content: [{ type: 'input_text', text: CODEX_COMPACT_PROMPT }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: focus }] },
     ],
   };
 }
@@ -139,22 +152,11 @@ function proxyConfig(upstreamBaseUrl, overrides = {}) {
     upstreamProvider: 'deepseek',
     upstreamTimeoutMs: 5000,
     modelAliases: DEFAULT_MODEL_ALIASES,
-    compactReasoningEffort: 'max',
+    compactReasoningEffort: 'high',
     compactMaxTokens: 20000,
+    compactTimeoutMs: 240000,
     ...overrides,
   };
-}
-
-function planFor(rawRequest, metadata = compactMetadata(), config = {}) {
-  const normalized = normalizeResponsesRequest(rawRequest);
-  const chatRequest = toChatCompletionsRequest(normalized);
-  return createCompactionPlan({
-    rawRequest,
-    normalized,
-    chatRequest,
-    metadata,
-    config: proxyConfig(config.upstreamBaseUrl, config),
-  });
 }
 
 async function completionServer(respond) {
@@ -164,297 +166,63 @@ async function completionServer(respond) {
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     bodies.push(body);
+    const forcedToolChoice = body.tool_choice === 'required' || (body.tool_choice && typeof body.tool_choice === 'object');
+    if (body.thinking?.type === 'enabled' && forcedToolChoice) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Thinking mode does not support this tool_choice' } }));
+      return;
+    }
     await respond({ req, res, body, index: bodies.length - 1 });
   });
   return { server, bodies, url: await listen(server) };
 }
 
-test('compaction planning and checkpoint contract', async () => {
-  await scenario('recognizes only explicit Codex metadata', () => {
-    const canonical = readCodexCompactionMetadata({
-      client_metadata: {
-        'x-codex-turn-metadata': JSON.stringify({ request_kind: 'turn' }),
-      },
-    }, {
-      'x-codex-turn-metadata': JSON.stringify(compactMetadata()),
-    });
-    assert.deepEqual(
-      { source: canonical.source, isCompaction: canonical.isCompaction, malformed: canonical.malformed },
-      { source: 'client_metadata', isCompaction: false, malformed: false },
-    );
-
-    const malformed = readCodexCompactionMetadata({
-      client_metadata: { 'x-codex-turn-metadata': '{' },
-      input: CODEX_COMPACT_PROMPT,
-    }, {
-      'x-codex-turn-metadata': JSON.stringify(compactMetadata()),
-    });
-    assert.equal(malformed.source, 'client_metadata');
-    assert.equal(malformed.isCompaction, false);
-    assert.equal(malformed.malformed, true);
-    assert.equal(readCodexCompactionMetadata({ input: CODEX_COMPACT_PROMPT }).isCompaction, false);
+async function gatewayFor(upstream, overrides = {}) {
+  const server = createProxyServer({
+    config: proxyConfig(upstream.url, overrides),
+    reasoningCache: new ReasoningCache(),
   });
+  return { server, url: await listen(server) };
+}
 
-  await scenario('turns a realistic Codex replay into one inert JSON Output request', () => {
-    const priorCheckpoint = 'Another language model started to solve this problem and produced a summary of its thinking process.\n# Context Checkpoint';
-    const rawRequest = compactBody({
-      history: [
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Earlier task.' }] },
-        { type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: 'Earlier task completed.' }] },
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: priorCheckpoint }] },
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
-        {
-          type: 'message',
-          role: 'user',
-          content: [{ type: 'input_text', text: '# AGENTS.md instructions for repo\n<INSTRUCTIONS>Use apply_patch.</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>' }],
-        },
-        { type: 'reasoning', reasoning_content: 'private tool reasoning', summary: [] },
-        { type: 'function_call', id: 'fc_lookup', call_id: 'call_lookup', name: 'lookup', arguments: '{"path":"src"}' },
-        { type: 'function_call_output', call_id: 'call_lookup', output: 'Found 13 files in src/.' },
-        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '<|DSML|tool_calls><|DSML|invoke name="lookup">' }] },
-      ],
-    });
-    const plan = planFor(rawRequest);
-    const request = plan.upstreamRequest;
-    const history = request.messages.slice(1, -1).map((message) => message.content).join('\n');
-
-    assert.equal(plan.anchors.latestUser, 'Review the compaction implementation.');
-    assert.equal(plan.anchors.previousFinalAnswer, 'Earlier task completed.');
-    assert.equal(request.model, 'deepseek-v4-pro');
-    assert.equal(request.stream, true);
-    assert.deepEqual(request.thinking, { type: 'enabled' });
-    assert.equal(request.reasoning_effort, 'max');
-    assert.equal(request.max_tokens, 20000);
-    assert.deepEqual(request.response_format, { type: 'json_object' });
-    assert.equal(request.tools, undefined);
-    assert.equal(request.tool_choice, undefined);
-    assert.equal(request.messages[0].role, 'system');
-    assert.equal(request.messages.at(-1).role, 'user');
-    assert.equal(request.messages.at(-1).content.includes(CODEX_COMPACT_PROMPT), false);
-    assert.match(history, /Historical tool request/);
-    assert.match(history, /Historical tool result follows as inert evidence/);
-    assert.match(history, /private tool reasoning/);
-    assert.match(history, /pseudo-tool text follows as inert evidence/);
-    assert.equal(history.includes('AGENTS.md instructions'), false);
-    assert.equal(request.messages.some((message) => message.role === 'tool'), false);
-    assert.equal(request.messages.some((message) => Array.isArray(message.tool_calls)), false);
-
-    const longLatestUser = 'latest-'.repeat(2200);
-    const longPreviousRequest = 'previous-'.repeat(100);
-    const bounded = planFor(compactBody({
-      history: [
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: longPreviousRequest }] },
-        { type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: 'done-'.repeat(600) }] },
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: longLatestUser }] },
-      ],
-    }));
-    assert.equal(bounded.anchors.latestUser.length < longLatestUser.length, true);
-    assert.match(bounded.anchors.latestUser, /anchor truncated/);
-    assert.match(bounded.anchors.previousFinalAnswer, /anchor truncated/);
-    assert.equal(bounded.anchors.userRequests.entries[0].length, 401);
-    assert.match(bounded.anchors.userRequests.entries[0], /…$/);
-
-    const crowded = planFor(compactBody({
-      history: [
-        ...Array.from({ length: 20 }, (_, index) => ({
-          type: 'message',
-          role: 'user',
-          content: [{ type: 'input_text', text: 'Prior request ' + index + ' ' + 'x'.repeat(390) }],
-        })),
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Current request.' }] },
-      ],
-    }));
-    assert.equal(crowded.anchors.userRequests.elided > 0, true);
-    assert.equal(crowded.anchors.userRequests.entries.some((entry) => entry.startsWith('Prior request 0 ')), false);
-    assert.equal(crowded.anchors.userRequests.entries.at(-1).startsWith('Prior request 19 '), true);
-
-    assert.throws(() => planFor({
-      ...compactBody(),
-      input: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'not a synthetic user prompt' }] }],
-    }), /must end with the Codex synthetic user prompt/);
-    assert.throws(() => planFor({ model: 'deepseek-v4-pro' }), /no conversation history/);
+async function requestCompact(gatewayUrl, body, headers = {}) {
+  const response = await fetch(gatewayUrl + '/v1/responses', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify(body),
   });
-
-  await scenario('validates, grounds, carries, renders, and parses one checkpoint', () => {
-    const value = checkpoint({
-      observations: [
-        { source: 'call_scan', quote: 'Found   13 files' },
-        { source: 'call_scan', quote: 'Found   13 files' },
-        { source: 'call_other', quote: 'Found 13 files' },
-      ],
-      completed: [{ task: 'Current task.', result: 'Current result.' }],
-      lessons: ['Current lesson.'],
-    });
-    const result = validateCompactionCompletion(compactJsonCompletion({ value }), 20000, {
-      evidenceCorpus: [{ source: 'call_scan', content: 'Scan results:\nFound 13 files in src/.' }],
-      priorCompleted: [{ task: 'Earlier task.', result: 'Earlier result.' }],
-      priorLessons: ['Earlier lesson.'],
-      latestUser: 'Review the gateway.',
-      userRequests: { entries: ['Earlier request.'], elided: 2 },
-    });
-
-    assert.equal(result.ok, true);
-    assert.equal(result.observationsDropped, 1);
-    assert.equal(result.observationsDeduplicated, 1);
-    assert.equal(result.completedCarried, 1);
-    assert.equal(result.lessonsCarried, 1);
-    assert.deepEqual(result.checkpoint.observations, [{ source: 'call_scan', quote: 'Found   13 files' }]);
-    const parsed = parseRenderedCheckpoint('Another language model started to solve this problem and produced a summary of its thinking process.\n' + result.content);
-    assert.notEqual(parsed, null);
-    assert.equal(parsed.latestUser, 'Review the gateway.');
-    assert.deepEqual(parsed.completed, [
-      { task: 'Earlier task.', result: 'Earlier result.' },
-      { task: 'Current task.', result: 'Current result.' },
-    ]);
-    assert.deepEqual(parsed.lessons, ['Earlier lesson.', 'Current lesson.']);
-    assert.deepEqual(parsed.userRequests, { entries: ['Earlier request.'], elided: 2 });
-    assert.match(result.content, /## Current Task/);
-    assert.match(result.content, /## Observed Evidence/);
-    assert.match(result.content, /## Background Memory/);
-    assert.match(result.content, /Resume rule:/);
-    assert.equal(parseRenderedCheckpoint(result.content.replace('- Source: call_scan', 'call_scan')), null);
-    assert.equal(parseRenderedCheckpoint(result.content.replace('  Quote: Found   13 files', ' malformed quote')), null);
-    assert.equal(parseRenderedCheckpoint(result.content.replace('## Next Action', '## Obsolete Next')), null);
-  });
-
-  await scenario('rejects distinct unsafe completion classes without multiplying fixtures', () => {
-    const invalidCases = [
-      ['empty content', compactJsonCompletion({ content: '' }), 'empty_content'],
-      ['tool protocol', compactJsonCompletion({
-        content: '',
-        finishReason: 'tool_calls',
-        toolCalls: [{ id: 'call_x', type: 'function', function: { name: 'lookup', arguments: '{}' } }],
-      }), 'tool_calls'],
-      ['invalid JSON', compactJsonCompletion({ content: '{' }), 'invalid_json'],
-      ['pseudo tool markup', compactJsonCompletion({ content: '<|DSML|tool_calls><|DSML|invoke name="lookup">' }), 'pseudo_tool_call_content'],
-      ['non-object checkpoint', compactJsonCompletion({ content: 'null' }), 'checkpoint_not_object'],
-      ['missing required state', compactJsonCompletion({ content: JSON.stringify({ ...checkpoint(), next: undefined }) }), 'checkpoint_missing_next'],
-      ['invalid observations collection', compactJsonCompletion({ value: { ...checkpoint(), observations: {} } }), 'observations_not_array'],
-      ['invalid completed collection', compactJsonCompletion({ value: { ...checkpoint(), completed: {} } }), 'completed_not_array'],
-      ['invalid progress collection', compactJsonCompletion({ value: { ...checkpoint(), in_progress: {} } }), 'in_progress_not_array'],
-      ['invalid evidence shape', compactJsonCompletion({ value: { ...checkpoint(), observations: [{ source: 'call_x' }] } }), 'observations_0_missing_quote'],
-      ['truncated output', compactJsonCompletion({ finishReason: 'length' }), 'finish_reason_length'],
-      ['provider refusal', compactJsonCompletion({ refusal: 'unable' }), 'refusal'],
-      ['multiple choices', compactJsonCompletion({
-        choices: [
-          compactJsonCompletion().choices[0],
-          { index: 1, message: { role: 'assistant', content: '{}' }, finish_reason: 'stop' },
-        ],
-      }), 'expected_one_choice'],
-    ];
-
-    for (const [name, completion, reason] of invalidCases) {
-      const result = validateCompactionCompletion(completion);
-      assert.equal(result.ok, false, name);
-      assert.equal(result.content, '', name);
-      assert.equal(result.reasons.includes(reason), true, name);
-    }
-
-    const fenced = validateCompactionCompletion(compactJsonCompletion({
-      content: '~~~json'.replaceAll('~', String.fromCharCode(96)) + '\n' + JSON.stringify(checkpoint()) + '\n' + '~~~'.replaceAll('~', String.fromCharCode(96)),
-    }));
-    assert.equal(fenced.ok, true);
-
-    const oversized = validateCompactionCompletion(compactJsonCompletion({
-      value: checkpoint({ objective: 'x'.repeat(100) }),
-    }), 1);
-    assert.equal(oversized.ok, false);
-    assert.equal(oversized.reasons.includes('hard_limit'), true);
-  });
-});
-
-test('compaction preserves durable state across consecutive checkpoints', async () => {
-  const firstValue = checkpoint({
-    objective: 'Review the compaction implementation.',
-    observations: [{ source: 'call_scan', quote: 'Found 13 files' }],
-    completed: [{ task: 'Review the design.', result: 'Confirmed the protocol boundary.' }],
-    lessons: ['Do not replay checkpoint prose as evidence.'],
-  });
-  const secondValue = checkpoint({
-    objective: 'Finish the compaction verification.',
-    observations: [{ source: 'call_scan', quote: 'Found 13 files' }],
-    completed: [{ task: 'Run the focused tests.', result: 'The focused path passed.' }],
-    lessons: ['Keep retries bounded.'],
-  });
-  const upstream = await completionServer(async ({ res, index }) => {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(compactJsonCompletion({ value: index === 0 ? firstValue : secondValue })));
-  });
-
-  try {
-    const firstRaw = compactBody({
-      stream: false,
-      history: [
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
-        { type: 'function_call_output', call_id: 'call_scan', output: 'Found 13 files in the test directory.' },
-      ],
-    });
-    const firstPlan = planFor(firstRaw, compactMetadata(), { upstreamBaseUrl: upstream.url });
-    const first = await runCompactionPlan(firstPlan);
-    const firstRendered = first.completion.choices[0].message.content;
-    const installed = 'Another language model started to solve this problem and produced a summary of its thinking process.\n' + firstRendered;
-
-    const secondRaw = compactBody({
-      stream: false,
-      history: [
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: installed }] },
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Run the focused tests.' }] },
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Finish the compaction verification.' }] },
-      ],
-    });
-    const secondPlan = planFor(secondRaw, compactMetadata(), { upstreamBaseUrl: upstream.url });
-    const diagnostics = [];
-    const second = await runCompactionPlan(secondPlan, { onDiagnostic: (entry) => diagnostics.push(entry) });
-    const parsed = parseRenderedCheckpoint(second.completion.choices[0].message.content);
-
-    assert.equal(upstream.bodies.length, 2);
-    assert.equal(second.attempt, 1);
-    assert.notEqual(parsed, null);
-    assert.deepEqual(parsed.observations, [{ source: 'call_scan', quote: 'Found 13 files' }]);
-    assert.deepEqual(parsed.completed, [
-      { task: 'Review the design.', result: 'Confirmed the protocol boundary.' },
-      { task: 'Run the focused tests.', result: 'The focused path passed.' },
-    ]);
-    assert.deepEqual(parsed.lessons, ['Do not replay checkpoint prose as evidence.', 'Keep retries bounded.']);
-    assert.equal(parsed.userRequests.entries.includes('Run the focused tests.'), true);
-    assert.equal(secondPlan.upstreamRequest.messages.some((message) => message.content.includes('Prior checkpoint baseline')), true);
-    assert.equal(secondPlan.evidenceCorpus.some((item) => item.content.includes('# Context Checkpoint')), false);
-    assert.equal(diagnostics.at(-1).prior_checkpoint, 'parsed');
-    assert.equal(diagnostics.at(-1).completed_carried, 1);
-    assert.equal(diagnostics.at(-1).lessons_carried, 1);
-
-    const corruptedRaw = compactBody({
-      stream: false,
-      history: [
-        {
-          type: 'message',
-          role: 'user',
-          content: [{
-            type: 'input_text',
-            text: 'Another language model started to solve this problem and produced a summary of its thinking process.\n# Context Checkpoint\ntruncated',
-          }],
-        },
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue safely despite the damaged checkpoint.' }] },
-      ],
-    });
-    const corruptedPlan = planFor(corruptedRaw, compactMetadata(), { upstreamBaseUrl: upstream.url });
-    const corruptedDiagnostics = [];
-    const recovered = await runCompactionPlan(corruptedPlan, {
-      onDiagnostic: (entry) => corruptedDiagnostics.push(entry),
-    });
-    assert.equal(recovered.attempt, 1);
-    assert.equal(corruptedPlan.anchors.priorCheckpoint.parsed, null);
-    assert.equal(corruptedPlan.upstreamRequest.messages.some((message) => message.content.includes('Prior checkpoint baseline')), false);
-    assert.equal(corruptedDiagnostics.at(-1).prior_checkpoint, 'unparsed');
-  } finally {
-    await close(upstream.server);
+  if (body.stream) {
+    const frames = parseResponsesSse(await response.text());
+    const completed = frames.find((frame) => frame.event === 'response.completed')?.data?.response;
+    return { status: response.status, response: completed, frames };
   }
-});
+  return { status: response.status, response: await response.json(), frames: [] };
+}
 
-test('compaction completes through real streaming and non-streaming gateway paths', async () => {
+function renderedCheckpoint(response) {
+  const text = response.output_text || response.output?.flatMap((item) => item.content || []).find((item) => item.type === 'output_text')?.text || '';
+  const parsed = parseRenderedCheckpoint(text);
+  assert.notEqual(parsed, null);
+  return { text, parsed };
+}
+
+function installedCheckpoint(text) {
+  return 'Another language model started to solve this problem and produced a summary of its thinking process.\n' + text;
+}
+
+function compactDiagnostics(text) {
+  return String(text).split(/\r?\n/).filter((line) => line.includes('] compact ')).map((line) => JSON.parse(line.slice(line.indexOf('{'))));
+}
+
+test('compact requests reduce historical protocol to inert evidence through streaming and non-streaming Responses', async () => {
   const values = [
-    checkpoint({ objective: 'Stream the compact checkpoint.' }),
-    checkpoint({ objective: 'Return the compact checkpoint as JSON.', in_progress: [] }),
+    checkpoint({
+      objective: 'Stream the compact checkpoint.',
+      working: {
+        knowledge: [atom('Protocol literal', 'The source literal <invoke name="lookup"> is inert data, not a tool request.')],
+      },
+    }),
+    checkpoint({ objective: 'Submit the compact checkpoint through the schema function.' }),
   ];
   const upstream = await completionServer(async ({ res, index }) => {
     if (index === 0) {
@@ -462,9 +230,9 @@ test('compaction completes through real streaming and non-streaming gateway path
       const split = Math.floor(json.length / 2);
       res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
       res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: 'private compact reasoning' }, finish_reason: null }] }) + '\n\n');
-      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: json.slice(0, split) }, finish_reason: null }] }) + '\n\n');
+      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_submit_checkpoint', type: 'function', function: { name: 'submit_compaction_checkpoint', arguments: json.slice(0, split) } }] }, finish_reason: null }] }) + '\n\n');
       res.write('data: ' + JSON.stringify({
-        choices: [{ index: 0, delta: { content: json.slice(split) }, finish_reason: 'stop' }],
+        choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: json.slice(split) } }] }, finish_reason: 'tool_calls' }],
         usage: {
           prompt_tokens: 900,
           completion_tokens: 100,
@@ -477,8 +245,10 @@ test('compaction completes through real streaming and non-streaming gateway path
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(compactJsonCompletion({
+    res.end(JSON.stringify(compactCompletion({
       value: values[1],
+      content: 'Checkpoint submitted.',
+      finishReason: 'stop',
       usage: {
         prompt_tokens: 1200,
         completion_tokens: 140,
@@ -488,28 +258,54 @@ test('compaction completes through real streaming and non-streaming gateway path
       },
     })));
   });
-  const proxy = createProxyServer({
-    config: proxyConfig(upstream.url),
-    reasoningCache: new ReasoningCache(),
-  });
-  const proxyUrl = await listen(proxy);
+  const gateway = await gatewayFor(upstream);
 
   try {
-    const streamed = await fetch(proxyUrl + '/v1/responses', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(compactBody({ stream: true })),
+    const emptyPriorEvidence = checkpoint({ status: 'idle' });
+    emptyPriorEvidence.working.evidence = [{ source: 'empty_prior_source', locator: '', quote: '' }];
+    const richHistory = [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Earlier task.' }] },
+      { type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: 'Earlier task completed.' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: installedCheckpoint(renderCompactionCheckpoint(emptyPriorEvidence)) }] },
+      {
+        type: 'tool_search_output',
+        call_id: 'call_search',
+        status: 'completed',
+        tools: [{ type: 'function', name: 'discovered_tool', parameters: { type: 'object', properties: {} } }],
+      },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: '# AGENTS.md instructions for repo\n<INSTRUCTIONS>Use apply_patch.</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>' }],
+      },
+      { type: 'reasoning', reasoning_content: 'The inspected gateway boundary keeps tool execution in Codex and only maps protocol state.', summary: [] },
+      { type: 'function_call', id: 'fc_lookup', call_id: 'call_lookup', name: 'lookup', arguments: '{"path":"src"}' },
+      { type: 'function_call_output', call_id: 'call_lookup', output: 'Found 13 files in src/.' },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '<|DSML|tool_calls><|DSML|invoke name="lookup">' }] },
+      { type: 'function_call', id: 'fc_test', call_id: 'call_test', name: 'shell_command', arguments: '{"command":"npm test","workdir":"/repo"}' },
+      { type: 'function_call_output', call_id: 'call_test', output: 'Exit code: 0\n67 tests passed.' },
+      { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Verified the shared compact bridge behavior and preserved the remaining task boundary.' }] },
+    ];
+    for (let index = 0; index < 3; index += 1) {
+      const callId = `call_read_${index}`;
+      richHistory.push(
+        { type: 'reasoning', reasoning_content: `Inspection conclusion ${index}: preserve the verified protocol boundary.`, summary: [] },
+        { type: 'function_call', id: `fc_read_${index}`, call_id: callId, name: 'shell_command', arguments: JSON.stringify({ command: `Get-Content src/file-${index}.js`, workdir: '/repo' }) },
+        { type: 'function_call_output', call_id: callId, output: `Representative source content for file ${index}.` },
+      );
+    }
+    const streamed = await requestCompact(gateway.url, compactBody({ stream: true, history: richHistory }), {
+      'x-codex-turn-metadata': JSON.stringify({ request_kind: 'turn' }),
     });
     assert.equal(streamed.status, 200);
-    const frames = parseResponsesSse(await streamed.text());
-    const completed = frames.find((frame) => frame.event === 'response.completed').data.response;
-    assert.equal(completed.output_text, renderCompactionCheckpoint(values[0], {
-      latestUser: 'Inspect the gateway and preserve the current progress.',
-    }));
-    assert.equal(JSON.stringify(completed).includes('"objective"'), false);
-    assert.equal(JSON.stringify(completed).includes('private compact reasoning'), false);
-    assert.equal(frames.some((frame) => frame.event?.startsWith('response.reasoning')), false);
-    assert.deepEqual(completed.usage, {
+    const streamedCheckpoint = renderedCheckpoint(streamed.response);
+    assert.equal(streamedCheckpoint.parsed.execution.objective, 'Stream the compact checkpoint.');
+    assert.match(streamedCheckpoint.parsed.working.knowledge[0].detail, /⟦invoke name="lookup"⟧/);
+    assert.equal(streamedCheckpoint.parsed.working.knowledge[0].detail.includes('<invoke'), false);
+    assert.equal(JSON.stringify(streamed.response).includes('private compact reasoning'), false);
+    assert.equal(streamed.frames.some((frame) => frame.event?.startsWith('response.reasoning')), false);
+    assert.deepEqual(streamed.response.usage, {
       input_tokens: 900,
       input_tokens_details: { cached_tokens: 500 },
       output_tokens: 100,
@@ -517,21 +313,14 @@ test('compaction completes through real streaming and non-streaming gateway path
       total_tokens: 1000,
     });
 
-    const nonStreaming = await fetch(proxyUrl + '/v1/responses', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(compactBody({
-        stream: false,
-        metadata: compactMetadata({ phase: 'standalone_turn', trigger: 'manual' }),
-      })),
-    });
-    const body = await nonStreaming.json();
-    assert.equal(nonStreaming.status, 200);
-    assert.equal(body.status, 'completed');
-    assert.equal(body.output_text, renderCompactionCheckpoint(values[1], {
-      latestUser: 'Inspect the gateway and preserve the current progress.',
+    const nonStreaming = await requestCompact(gateway.url, compactBody({
+      metadata: compactMetadata({ phase: 'standalone_turn', trigger: 'manual' }),
+      focus: 'Preserve file changes and unresolved test failures.',
     }));
-    assert.deepEqual(body.usage, {
+    assert.equal(nonStreaming.status, 200);
+    assert.equal(nonStreaming.response.status, 'completed');
+    assert.equal(renderedCheckpoint(nonStreaming.response).parsed.execution.objective, 'Submit the compact checkpoint through the schema function.');
+    assert.deepEqual(nonStreaming.response.usage, {
       input_tokens: 1200,
       input_tokens_details: { cached_tokens: 1100 },
       output_tokens: 140,
@@ -542,337 +331,556 @@ test('compaction completes through real streaming and non-streaming gateway path
     assert.equal(upstream.bodies.length, 2);
     for (const request of upstream.bodies) {
       assert.equal(request.stream, true);
-      assert.deepEqual(request.response_format, { type: 'json_object' });
-      assert.equal(request.tools, undefined);
-      assert.equal(request.tool_choice, undefined);
+      assert.equal(request.max_tokens, undefined);
+      assert.equal(request.response_format, undefined);
+      assert.deepEqual(request.thinking, { type: 'enabled' });
+      assert.equal(request.reasoning_effort, 'high');
+      assert.equal(request.tools.length, 1);
+      assert.equal(request.tools[0].function.name, 'submit_compaction_checkpoint');
+      assert.match(request.tools[0].function.description, /never submit an empty object/);
+      assert.deepEqual(request.tools[0].function.parameters.required, ['execution', 'working', 'memory']);
+      assert.match(request.tools[0].function.parameters.description, /one canonical home/);
+      assert.match(request.tools[0].function.parameters.description, /both resolved and unresolved/);
+      const checkpointSchema = request.tools[0].function.parameters.properties;
+      assert.match(checkpointSchema.execution.properties.acceptance.description, /real user instructions/);
+      assert.match(checkpointSchema.execution.properties.next.description, /Do not list later steps/);
+      assert.match(checkpointSchema.working.properties.artifacts.description, /no files modified/);
+      assert.match(checkpointSchema.working.properties.knowledge.description, /premise/);
+      assert.match(checkpointSchema.working.properties.knowledge.description, /minimal dependency reference is allowed/);
+      assert.match(checkpointSchema.working.properties.verification.description, /Source reading or search activity is not verification/);
+      assert.match(checkpointSchema.working.properties.risks.description, /disconfirming condition/);
+      assert.match(checkpointSchema.memory.properties.session.description, /Task-specific authorization/);
+      assert.match(checkpointSchema.memory.properties.session.description, /current-task implication/);
+      assert.equal(Object.hasOwn(request, 'tool_choice'), false);
+      assert.equal(request.messages[0].role, 'system');
+      assert.match(request.messages[0].content, /framework-owned context checkpoint reducer/);
+      assert.match(request.messages[0].content, /not an agent turn/);
+      assert.equal(request.messages.at(-1).content.includes(CODEX_COMPACT_PROMPT), false);
+      assert.match(request.messages[0].content, /Call the provided function exactly once/);
+      assert.match(request.messages.at(-1).content, /never the bare reading or compaction activity/);
+      assert.match(request.messages.at(-1).content, /Deterministic coverage inventory/);
       assert.equal(request.messages.some((message) => message.role === 'tool'), false);
+      assert.equal(request.messages.some((message) => Array.isArray(message.tool_calls)), false);
+      assert.equal(request.messages.some((message) => Object.hasOwn(message, 'reasoning_content')), false);
     }
+    const historyText = upstream.bodies[0].messages.slice(1, -1).map((message) => String(message.content || '')).join('\n');
+    assert.match(historyText, /Review the compaction implementation/);
+    assert.equal(historyText.includes('AGENTS.md instructions'), false);
+    assert.equal(historyText.includes('Found 13 files'), false);
+    assert.equal(historyText.includes('can be called directly'), false);
+    assert.equal(historyText.includes('"operation":"lookup"'), false);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /lookup/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /"recovery":"locator"/);
+    assert.equal(upstream.bodies[0].messages.at(-1).content.includes('empty_prior_source'), false);
+    assert.match(historyText, /67 tests passed/);
+    assert.match(historyText, /Verified the shared compact bridge behavior/);
+    assert.match(historyText, /inspected gateway boundary keeps tool execution in Codex/);
+    assert.match(historyText, /Inspection conclusion 2/);
+    assert.equal(historyText.includes('Representative source content'), false);
+    assert.equal(historyText.includes('anchor truncated'), false);
+    assert.equal(historyText.includes('<|DSML|tool_calls>'), false);
+    assert.match(upstream.bodies[1].messages.at(-1).content, /retention priority/);
+
+    const invalid = await requestCompact(gateway.url, {
+      ...compactBody(),
+      input: [],
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.response.error.code, 'invalid_compaction_request');
+
+    const missingInput = await requestCompact(gateway.url, {
+      ...compactBody(),
+      input: undefined,
+    });
+    assert.equal(missingInput.status, 400);
+    assert.equal(missingInput.response.error.code, 'invalid_compaction_request');
+
+    const malformedMetadata = compactBody();
+    malformedMetadata.client_metadata['x-codex-turn-metadata'] = '{';
+    const malformed = await requestCompact(gateway.url, malformedMetadata);
+    assert.equal(malformed.status, 400);
+    assert.equal(malformed.response.error.code, 'invalid_compaction_request');
+
+    const missingPhase = await requestCompact(gateway.url, compactBody({
+      metadata: { ...compactMetadata(), compaction: { trigger: 'auto', reason: 'context_limit', implementation: 'responses', strategy: 'memento' } },
+    }));
+    assert.equal(missingPhase.status, 400);
+    assert.equal(missingPhase.response.error.code, 'invalid_compaction_request');
   } finally {
-    await close(proxy);
+    await close(gateway.server);
     await close(upstream.server);
   }
 });
 
-test('compaction recovery is bounded and fails closed', async () => {
-  async function runSequence(completions, rawRequest = compactBody({ stream: false }), metadata = compactMetadata()) {
-    const upstream = await completionServer(async ({ res, index }) => {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(completions[Math.min(index, completions.length - 1)]));
-    });
-    const plan = planFor(rawRequest, metadata, { upstreamBaseUrl: upstream.url });
-    try {
-      return {
-        result: await runCompactionPlan(plan),
-        bodies: upstream.bodies,
-        plan,
-      };
-    } finally {
-      await close(upstream.server);
-    }
+test('successive compactions preserve conclusion continuity, age file state, and do not revive delivered work', async () => {
+  const artifact = atom('src/compaction.js', 'Modified; execution remains the sole agenda.');
+  const firstTask = checkpoint({
+    taskId: 'task_model_first',
+    objective: 'Review the compaction implementation.',
+    next: 'Fix the lifecycle and run the focused tests.',
+    working: {
+      artifacts: [artifact],
+      knowledge: [atom('Task lifecycle', 'Completed work must not retain executable objectives.', ['E3', 'E1'])],
+      risks: [atom('npm test', 'The compact tests still fail.', ['E2'])],
+    },
+    memory: {
+      session: [atom('compact boundary', 'Keep the compact boundary explicit.')],
+      durable: [atom('PowerShell document rendering', 'Chinese design documents render as mojibake in this shell.', ['E3'])],
+    },
+  });
+  const secondTask = checkpoint({
+    taskId: 'task_model_drift',
+    objective: 'Review the compaction implementation.',
+    acceptance: ['Preserve the inspected findings.', 'Run the focused compact tests.'],
+    next: 'Run the focused compact tests.',
+    working: {
+      artifacts: [artifact],
+      knowledge: [atom('Task lifecycle', 'The lifecycle fix is implemented.')],
+      verification: [atom('npm test', 'The full test suite now passes.', ['e2'])],
+    },
+  });
+  const thirdTask = checkpoint({
+    taskId: 'task_model_drift_again',
+    objective: 'Review the compaction implementation.',
+    acceptance: ['Verify the packaged gateway.'],
+    next: 'Verify the packaged gateway.',
+    working: { artifacts: [artifact] },
+  });
+  const delivered = checkpoint({
+    status: 'idle',
+    memory: {
+      durable: Array.from({ length: 40 }, (_, index) => atom(`completed task ${index}`, `Memory ${index}: ${'high-value detail '.repeat(140)}`)),
+    },
+  });
+  const attemptedRevival = checkpoint({ objective: 'Restart work that was already delivered.' });
+  const prematureIdle = checkpoint({ status: 'idle' });
+  const candidates = [firstTask, secondTask, thirdTask, delivered, attemptedRevival, prematureIdle];
+  const upstream = await completionServer(async ({ res, index }) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(compactCompletion({ value: candidates[index] })));
+  });
+  const gateway = await gatewayFor(upstream);
+
+  try {
+    const taskRun = await requestCompact(gateway.url, compactBody({
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
+        {
+          type: 'function_call',
+          id: 'fc_patch',
+          call_id: 'call_patch',
+          name: 'apply_patch',
+          arguments: JSON.stringify({ input: '*** Begin Patch\n*** Update File: src/compaction.js\n@@\n-old\n+new\n*** End Patch' }),
+        },
+        { type: 'function_call_output', call_id: 'call_patch', output: 'Done!' },
+        { type: 'function_call', id: 'fc_test', call_id: 'call_test', name: 'shell_command', arguments: '{"command":"npm test"}' },
+        { type: 'function_call_output', call_id: 'call_test', output: 'Exit code: 1\n2 compact tests failed.' },
+        { type: 'function_call', id: 'fc_read', call_id: 'call_read', name: 'shell_command', arguments: '{"command":"Get-Content src/compaction.js"}' },
+        { type: 'function_call_output', call_id: 'call_read', output: 'Current compact reducer source includes https://api.deepseek.com as a configuration value.' },
+        {
+          type: 'function_call',
+          id: 'fc_failed_patch',
+          call_id: 'call_failed_patch',
+          name: 'apply_patch',
+          arguments: JSON.stringify({ input: '*** Begin Patch\n*** Update File: src/not-changed.js\n@@\n-old\n+new\n*** End Patch' }),
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_failed_patch',
+          output: 'apply_patch verification failed: Failed to find expected lines in src/not-changed.js:\nold',
+        },
+      ],
+    }));
+    const first = renderedCheckpoint(taskRun.response);
+    assert.equal(first.parsed.execution.objective, 'Review the compaction implementation.');
+    assert.equal(first.parsed.working.artifacts.some((item) => item.subject === 'src/compaction.js'), true);
+    assert.equal(first.parsed.working.artifacts.some((item) => item.subject === 'src/not-changed.js'), false);
+    assert.equal(first.parsed.working.risks.some((item) => item.evidence_refs.includes('call_test')), true);
+    assert.match(first.parsed.working.evidence.find((item) => item.source === 'call_test')?.locator || '', /npm test/);
+    assert.match(first.parsed.working.evidence.find((item) => item.source === 'call_test')?.quote || '', /2 compact tests failed/);
+    const firstKnowledge = first.parsed.working.knowledge.find((item) => item.subject === 'Task lifecycle');
+    assert.deepEqual(firstKnowledge.evidence_refs, ['call_read']);
+    assert.equal(firstKnowledge.detail, 'Completed work must not retain executable objectives.');
+    const readLocator = first.parsed.working.evidence.find((item) => item.source === 'call_read')?.locator || '';
+    assert.match(readLocator, /Get-Content src\/compaction\.js/);
+    assert.equal(readLocator.includes('https://api.deepseek.com'), false);
+    assert.deepEqual(first.parsed.working.evidence.map((item) => item.source).sort(), ['call_read', 'call_test']);
+    assert.equal(first.parsed.memory.session.some((item) => item.detail === 'Keep the compact boundary explicit.'), true);
+    assert.equal(first.parsed.memory.durable.some((item) => item.subject === 'PowerShell document rendering'), false);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /"ref":"e2"/);
+    assert.equal(upstream.bodies[0].messages.at(-1).content.includes('call_test'), false);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /"artifacts":\["src\/compaction\.js"\]/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /apply_patch verification failed/);
+
+    const secondRun = await requestCompact(gateway.url, compactBody({
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: installedCheckpoint(first.text) }] },
+        { type: 'function_call', id: 'fc_test_recheck', call_id: 'call_test', name: 'shell_command', arguments: '{"command":"npm test"}' },
+        { type: 'function_call_output', call_id: 'call_test', output: 'Exit code: 0\n67 tests passed.' },
+      ],
+    }));
+    const second = renderedCheckpoint(secondRun.response);
+    assert.equal(second.parsed.execution.task_id, first.parsed.execution.task_id);
+    assert.equal(second.parsed.working.knowledge.find((item) => item.subject === 'Task lifecycle')?.detail, 'The lifecycle fix is implemented.');
+    assert.match(second.parsed.working.verification.find((item) => item.subject === 'npm test')?.detail || '', /passes/);
+    assert.equal(second.parsed.working.evidence.filter((item) => item.source === 'call_test').length, 1);
+    assert.match(second.parsed.working.evidence.find((item) => item.source === 'call_test')?.quote || '', /67 tests passed/);
+    assert.equal(second.parsed.working.evidence.some((item) => item.quote.includes('2 compact tests failed')), false);
+    assert.match(second.parsed.working.artifacts[0].detail, /execution remains the sole agenda/);
+    assert.match(second.parsed.working.artifacts[0].detail, /Rehydrate from/);
+    assert.equal(second.parsed.memory.session.some((item) => item.detail === 'Keep the compact boundary explicit.'), true);
+
+    const thirdRun = await requestCompact(gateway.url, compactBody({
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: installedCheckpoint(second.text) }] },
+      ],
+    }));
+    const third = renderedCheckpoint(thirdRun.response);
+    assert.equal(third.parsed.execution.task_id, first.parsed.execution.task_id);
+    assert.equal(third.parsed.working.knowledge.some((item) => item.subject === 'Task lifecycle'), false);
+    assert.match(third.parsed.working.artifacts[0].detail, /^Rehydrate from/);
+    assert.equal(third.parsed.working.artifacts[0].detail.includes('execution remains the sole agenda'), false);
+
+    const deliveredRun = await requestCompact(gateway.url, compactBody({
+      metadata: compactMetadata({ phase: 'standalone_turn' }),
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: installedCheckpoint(third.text) }] },
+        { type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: 'The requested compaction work is complete.' }] },
+      ],
+    }));
+    const completed = renderedCheckpoint(deliveredRun.response).parsed;
+    assert.equal(completed.execution.status, 'idle');
+    assert.equal(completed.execution.objective, '');
+    assert.equal(completed.memory.durable.length < 40, true);
+    assert.equal(completed.memory.durable.some((item) => item.subject === 'completed task 39'), true);
+
+    const revivalRun = await requestCompact(gateway.url, compactBody({
+      metadata: compactMetadata({ phase: 'standalone_turn' }),
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: installedCheckpoint(renderedCheckpoint(deliveredRun.response).text) }] },
+      ],
+    }));
+    const idle = renderedCheckpoint(revivalRun.response).parsed.execution;
+    assert.equal(idle.status, 'idle');
+    assert.equal(idle.task_id, '');
+    assert.equal(idle.next, '');
+
+    const newTaskRun = await requestCompact(gateway.url, compactBody({
+      metadata: compactMetadata({ phase: 'standalone_turn' }),
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Review the compaction implementation.' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: installedCheckpoint(renderedCheckpoint(deliveredRun.response).text) }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Start a new task after the delivered checkpoint.' }] },
+      ],
+    }));
+    const newTask = renderedCheckpoint(newTaskRun.response).parsed.execution;
+    assert.equal(newTask.status, 'active');
+    assert.equal(newTask.objective, 'Continue the latest retained real user request from the current workspace state.');
+
+    assert.equal(upstream.bodies.length, candidates.length);
+    assert.equal(upstream.bodies.slice(1).every((body) => body.messages.some((message) => message.role === 'user' && String(message.content || '').includes('Review the compaction implementation.'))), true);
+    assert.equal(upstream.bodies.slice(1).every((body) => body.messages.every((message) => !String(message.content || '').includes('Prior canonical checkpoint baseline'))), true);
+  } finally {
+    await close(gateway.server);
+    await close(upstream.server);
   }
-
-  await scenario('quarantines protocol leakage and retries with a stable inert prefix', async () => {
-    const leaked = compactJsonCompletion({
-      content: '',
-      finishReason: 'tool_calls',
-      toolCalls: [{ id: 'call_leak', type: 'function', function: { name: 'lookup', arguments: '{}' } }],
-    });
-    const run = await runSequence([leaked, compactJsonCompletion()]);
-    assert.equal(run.result.attempt, 2);
-    assert.equal(run.bodies.length, 2);
-    assert.deepEqual(run.bodies[1].messages.slice(0, -1), run.bodies[0].messages.slice(0, -1));
-    assert.match(run.bodies[1].messages.at(-1).content, /emitted tool protocol/);
-    assert.deepEqual(run.bodies[1].thinking, { type: 'enabled' });
-  });
-
-  await scenario('reassembles streamed native tool leakage before the bounded retry', async () => {
-    const upstream = await completionServer(async ({ res, index }) => {
-      if (index === 0) {
-        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
-        res.write('data: ' + JSON.stringify({
-          choices: [{
-            index: 0,
-            delta: {
-              tool_calls: [{
-                index: 0,
-                id: 'call_stream_leak',
-                type: 'function',
-                function: { name: 'look', arguments: '{"path":' },
-              }],
-            },
-            finish_reason: null,
-          }],
-        }) + '\n\n');
-        res.write('data: ' + JSON.stringify({
-          choices: [{
-            index: 0,
-            delta: {
-              tool_calls: [{ index: 0, function: { name: 'up', arguments: '"src"}' } }],
-            },
-            finish_reason: 'tool_calls',
-          }],
-        }) + '\n\n');
-        res.end();
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(compactJsonCompletion()));
-    });
-    try {
-      const plan = planFor(compactBody({ stream: false }), compactMetadata(), { upstreamBaseUrl: upstream.url });
-      const diagnostics = [];
-      const result = await runCompactionPlan(plan, { onDiagnostic: (entry) => diagnostics.push(entry) });
-      assert.equal(result.attempt, 2);
-      assert.equal(upstream.bodies.length, 2);
-      assert.match(upstream.bodies[1].messages.at(-1).content, /emitted tool protocol/);
-      assert.equal(diagnostics[1].stream_chunks, 2);
-      assert.equal(diagnostics[1].saw_tool_call_delta, true);
-      assert.equal(diagnostics[1].raw_finish_reason, 'tool_calls');
-    } finally {
-      await close(upstream.server);
-    }
-  });
-
-  await scenario('recovers once from empty content by disabling thinking', async () => {
-    const run = await runSequence([
-      compactJsonCompletion({ content: '' }),
-      compactJsonCompletion(),
-    ]);
-    assert.equal(run.result.attempt, 2);
-    assert.equal(run.bodies.length, 2);
-    assert.deepEqual(run.bodies[1].thinking, { type: 'disabled' });
-    assert.equal(run.bodies[1].reasoning_effort, undefined);
-    assert.match(run.bodies[1].messages.at(-1).content, /returned empty content/);
-  });
-
-  await scenario('does not retry ordinary validation failures and stops after the bounded recovery attempt', async () => {
-    let invalidCalls = 0;
-    const invalidUpstream = await completionServer(async ({ res }) => {
-      invalidCalls += 1;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(compactJsonCompletion({ content: '{' })));
-    });
-    try {
-      const invalidPlan = planFor(compactBody({ stream: false }), compactMetadata(), { upstreamBaseUrl: invalidUpstream.url });
-      await assert.rejects(
-        runCompactionPlan(invalidPlan),
-        (error) => error.code === 'compact_validation_failed' && error.statusCode === 502,
-      );
-      assert.equal(invalidCalls, 1);
-    } finally {
-      await close(invalidUpstream.server);
-    }
-
-    let emptyCalls = 0;
-    const emptyUpstream = await completionServer(async ({ res }) => {
-      emptyCalls += 1;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(compactJsonCompletion({ content: '' })));
-    });
-    try {
-      const emptyPlan = planFor(compactBody({ stream: false }), compactMetadata(), { upstreamBaseUrl: emptyUpstream.url });
-      await assert.rejects(
-        runCompactionPlan(emptyPlan),
-        (error) => error.code === 'compact_validation_failed',
-      );
-      assert.equal(emptyCalls, 2);
-    } finally {
-      await close(emptyUpstream.server);
-    }
-  });
-
-  await scenario('enforces the mid-turn boundary without breaking standalone compaction', () => {
-    const emptyProgress = compactJsonCompletion({
-      value: checkpoint({ in_progress: [] }),
-    });
-    const midTurn = validateCompactionCompletion(emptyProgress, 20000, {
-      phase: 'mid_turn',
-      hasLatestUser: true,
-      finalAnswerDelivered: false,
-    });
-    assert.equal(midTurn.ok, false);
-    assert.equal(midTurn.reasons.includes('in_progress_empty_mid_turn'), true);
-
-    const standalone = validateCompactionCompletion(emptyProgress, 20000, {
-      phase: 'standalone_turn',
-      hasLatestUser: true,
-      finalAnswerDelivered: false,
-    });
-    assert.equal(standalone.ok, true);
-
-    const delivered = validateCompactionCompletion(emptyProgress, 20000, {
-      phase: 'mid_turn',
-      hasLatestUser: true,
-      finalAnswerDelivered: true,
-    });
-    assert.equal(delivered.ok, true);
-  });
-
-  await scenario('maps upstream context overflow separately from ordinary provider failure', async () => {
-    const upstream = await completionServer(async ({ res }) => {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: { code: 'context_length_exceeded', message: 'maximum context length exceeded' } }));
-    });
-    try {
-      const plan = planFor(compactBody({ stream: false }), compactMetadata(), { upstreamBaseUrl: upstream.url });
-      await assert.rejects(
-        runCompactionPlan(plan),
-        (error) => error.code === 'context_length_exceeded' && error.statusCode === 400 && error.upstreamStatus === 400,
-      );
-    } finally {
-      await close(upstream.server);
-    }
-  });
-
-  await scenario('surfaces streamed provider errors and compact timeouts without retrying', async () => {
-    const streamError = await completionServer(async ({ res }) => {
-      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
-      res.end('data: ' + JSON.stringify({ error: { message: 'stream provider failure' } }) + '\n\n');
-    });
-    try {
-      const plan = planFor(compactBody({ stream: false }), compactMetadata(), { upstreamBaseUrl: streamError.url });
-      await assert.rejects(
-        runCompactionPlan(plan),
-        (error) => error.code === 'upstream_error' && error.upstreamStatus === 502,
-      );
-      assert.equal(streamError.bodies.length, 1);
-    } finally {
-      await close(streamError.server);
-    }
-
-    const timeout = await completionServer(async () => {});
-    try {
-      const plan = planFor(compactBody({ stream: false }), compactMetadata(), {
-        upstreamBaseUrl: timeout.url,
-        upstreamTimeoutMs: 30,
-      });
-      await assert.rejects(
-        runCompactionPlan(plan),
-        (error) => error.code === 'upstream_timeout' && error.statusCode === 504,
-      );
-      assert.equal(timeout.bodies.length, 1);
-    } finally {
-      timeout.server.closeAllConnections();
-      await close(timeout.server);
-    }
-  });
 });
 
-test('compaction diagnostics stay actionable and client disconnects cancel upstream', async () => {
-  await scenario('reports one correlated successful attempt and one bounded provider failure', async () => {
-    const successUpstream = await completionServer(async ({ res }) => {
+test('compact failure handling preserves valid state across protocol, timeout, evidence, and provider failures', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-compact-recovery-'));
+  const debugPath = join(dir, 'gateway.debug.log');
+  const attempts = new Map();
+  const upstream = await completionServer(async ({ res, body }) => {
+    const text = body.messages.map((message) => String(message.content || '')).join('\n');
+    const key = text.includes('Reject a malformed checkpoint submission')
+      ? 'malformed'
+      : text.includes('Reject a wrong checkpoint function')
+        ? 'wrong_function'
+        : text.includes('Recover after compact timeout')
+          ? 'timeout'
+          : text.includes('Reject unknown evidence handle')
+            ? 'badref'
+        : text.includes('Preserve changed files after an incomplete summary')
+          ? 'coverage'
+          : text.includes('Start a separate task after compact failure')
+            ? 'new_task'
+          : 'overflow';
+    const attempt = (attempts.get(key) || 0) + 1;
+    attempts.set(key, attempt);
+
+    if (key === 'malformed' && attempt === 1) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(compactJsonCompletion({
-        usage: {
-          prompt_tokens: 1600,
-          completion_tokens: 120,
-          total_tokens: 1720,
-          prompt_cache_hit_tokens: 1200,
-          prompt_cache_miss_tokens: 400,
-        },
+      res.end(JSON.stringify(compactCompletion({
+        argumentsText: '{"execution":',
       })));
-    });
-    const successDiagnostics = [];
-    try {
-      const plan = planFor(compactBody({ stream: false }), compactMetadata(), { upstreamBaseUrl: successUpstream.url });
-      await runCompactionPlan(plan, { onDiagnostic: (entry) => successDiagnostics.push(entry) });
-      assert.equal(successDiagnostics.length, 2);
-      assert.equal(successDiagnostics[0].status, 'started');
-      assert.equal(successDiagnostics[1].status, 'completed');
-      assert.equal(successDiagnostics[1].thread_id, 'thread_compact');
-      assert.equal(successDiagnostics[1].turn_id, 'turn_compact');
-      assert.equal(successDiagnostics[1].window_id, 'window_compact');
-      assert.equal(successDiagnostics[1].attempt, 1);
-      assert.equal(successDiagnostics[1].input_tokens, 1600);
-      assert.equal(successDiagnostics[1].cache_hit_tokens, 1200);
-      assert.equal(successDiagnostics[1].estimated_installed_tokens > 0, true);
-      assert.equal(successDiagnostics[1].window_reduction > 0, true);
-      assert.match(successDiagnostics[1].time, /^\d{4}-\d{2}-\d{2}T/);
-    } finally {
-      await close(successUpstream.server);
+      return;
     }
-
-    const longMessage = 'provider failure ' + 'x'.repeat(1000);
-    const failureUpstream = await completionServer(async ({ res }) => {
-      res.writeHead(502, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: longMessage } }));
-    });
-    const failureDiagnostics = [];
-    try {
-      const plan = planFor(compactBody({ stream: false }), compactMetadata(), { upstreamBaseUrl: failureUpstream.url });
-      await assert.rejects(
-        runCompactionPlan(plan, { onDiagnostic: (entry) => failureDiagnostics.push(entry) }),
-        (error) => error.code === 'upstream_error' && error.upstreamStatus === 502,
-      );
-      assert.equal(failureDiagnostics.length, 2);
-      assert.equal(failureDiagnostics[1].status, 'failed');
-      assert.equal(failureDiagnostics[1].upstream_status, 502);
-      assert.equal(failureDiagnostics[1].error_message.length, 500);
-      assert.match(failureDiagnostics[1].error_message, /^provider failure/);
-    } finally {
-      await close(failureUpstream.server);
+    if (key === 'wrong_function' && attempt === 1) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(compactCompletion({ toolName: 'shell_command' })));
+      return;
     }
-  });
-
-  await scenario('aborts the compact upstream stream when the Responses client disconnects', async () => {
-    let upstreamCalls = 0;
-    let resolveStarted;
-    let resolveClosed;
-    const started = new Promise((resolve) => {
-      resolveStarted = resolve;
-    });
-    const closed = new Promise((resolve) => {
-      resolveClosed = resolve;
-    });
-    const upstreamServer = http.createServer(async (req, res) => {
-      upstreamCalls += 1;
-      for await (const chunk of req) void chunk;
+    if (key === 'timeout' && attempt === 1) {
       res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
       res.write('data: ' + JSON.stringify({ choices: [{ delta: { reasoning_content: 'still compacting' }, finish_reason: null }] }) + '\n\n');
-      resolveStarted();
-      res.on('close', resolveClosed);
-    });
-    const upstreamUrl = await listen(upstreamServer);
-    const proxy = createProxyServer({
-      config: proxyConfig(upstreamUrl),
-      reasoningCache: new ReasoningCache(),
-    });
-    const proxyUrl = await listen(proxy);
-    let clientRequest;
-    let clientResponse;
-
-    try {
-      clientResponse = await new Promise((resolve, reject) => {
-        const body = JSON.stringify(compactBody({ stream: true }));
-        const target = new URL(proxyUrl + '/v1/responses');
-        clientRequest = http.request({
-          host: target.hostname,
-          port: target.port,
-          path: target.pathname,
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'content-length': Buffer.byteLength(body),
-          },
-        }, resolve);
-        clientRequest.on('error', reject);
-        clientRequest.end(body);
-      });
-      await started;
-      await new Promise((resolve) => clientResponse.once('data', resolve));
-      clientResponse.destroy();
-      await Promise.race([
-        closed,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('upstream compact stream stayed open')), 2000)),
-      ]);
-      assert.equal(upstreamCalls, 1);
-    } finally {
-      clientRequest?.destroy();
-      clientResponse?.destroy();
-      proxy.closeAllConnections();
-      upstreamServer.closeAllConnections();
-      await close(proxy);
-      await close(upstreamServer);
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      if (!res.destroyed && !res.writableEnded) res.end();
+      return;
     }
+    if (key === 'badref') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(compactCompletion({
+        value: checkpoint({
+          objective: 'Reject unknown evidence handle.',
+          working: { knowledge: [atom('Unknown source', 'This atom must not be installed.', ['e99'])] },
+        }),
+      })));
+      return;
+    }
+    if (key === 'coverage') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(compactCompletion({
+        value: checkpoint({
+          objective: 'Preserve changed files after an incomplete summary.',
+          working: { knowledge: [atom('Patch result', 'The workspace contains the current patch result.', ['e1'])] },
+        }),
+      })));
+      return;
+    }
+    if (key === 'new_task') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(compactCompletion({ argumentsText: '{}' })));
+      return;
+    }
+    if (key === 'overflow') {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'context_length_exceeded', message: 'maximum context length exceeded' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(compactCompletion({
+      value: checkpoint({
+        objective: key === 'timeout'
+            ? 'Continue after the compact timeout.'
+            : 'Continue after an invalid checkpoint submission.',
+      }),
+    })));
   });
+  const gateway = await gatewayFor(upstream, { debugPayload: true, debugPayloadLogPath: debugPath, compactTimeoutMs: 60 });
+
+  try {
+    const malformedRun = await requestCompact(gateway.url, compactBody({
+      history: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Reject a malformed checkpoint submission.' }] }],
+    }));
+    assert.equal(renderedCheckpoint(malformedRun.response).parsed.execution.objective, 'Continue the latest retained real user request from the current workspace state.');
+
+    const wrongFunctionRun = await requestCompact(gateway.url, compactBody({
+      history: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Reject a wrong checkpoint function.' }] }],
+    }));
+    assert.equal(renderedCheckpoint(wrongFunctionRun.response).parsed.execution.objective, 'Continue the latest retained real user request from the current workspace state.');
+
+    const timeoutRun = await requestCompact(gateway.url, compactBody({
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Recover after compact timeout.' }] },
+        { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Continue by inspecting compact stream progress.' }] },
+      ],
+    }));
+    assert.equal(renderedCheckpoint(timeoutRun.response).parsed.execution.objective, 'Continue the latest retained real user request from the current workspace state.');
+    assert.equal(renderedCheckpoint(timeoutRun.response).parsed.execution.next, 'Continue by inspecting compact stream progress.');
+
+    const badRefRun = await requestCompact(gateway.url, compactBody({
+      history: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Reject unknown evidence handle.' }] }],
+    }));
+    assert.equal(renderedCheckpoint(badRefRun.response).parsed.working.knowledge.some((item) => item.subject === 'Unknown source'), false);
+
+    const prior = checkpoint({
+      taskId: 'task_prior_review',
+      objective: 'Finish the prior review.',
+      working: { knowledge: [atom('Prior task state', 'This state must not become the new task agenda.')] },
+      memory: {
+        durable: [atom('Provider contract', 'The verified provider contract remains reusable across tasks.', ['call_provider_contract'])],
+      },
+    });
+    prior.working.evidence = [{
+      source: 'call_provider_contract',
+      locator: 'https://api-docs.deepseek.com/api/create-chat-completion',
+      quote: 'Verified provider contract.',
+    }];
+    const newTaskRun = await requestCompact(gateway.url, compactBody({
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Finish the prior review.' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: installedCheckpoint(renderCompactionCheckpoint(prior)) }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Start a separate task after compact failure.' }] },
+      ],
+    }));
+    const newTask = renderedCheckpoint(newTaskRun.response).parsed;
+    assert.notEqual(newTask.execution.task_id, prior.execution.task_id);
+    assert.equal(newTask.working.knowledge.length, 0);
+    assert.equal(newTask.memory.durable[0].subject, 'Provider contract');
+    assert.equal(newTask.working.evidence[0].source, 'call_provider_contract');
+
+    const changedHistory = [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Preserve changed files after an incomplete summary.' }] },
+      {
+        type: 'function_call',
+        id: 'fc_patch',
+        call_id: 'call_patch',
+        name: 'apply_patch',
+        arguments: JSON.stringify({ input: '*** Begin Patch\n*** Update File: src/compaction.js\n@@\n-old\n+new\n*** End Patch' }),
+      },
+      { type: 'function_call_output', call_id: 'call_patch', output: 'Done!' },
+      { type: 'function_call', id: 'fc_fail', call_id: 'call_fail', name: 'shell_command', arguments: '{"command":"npm test"}' },
+      { type: 'function_call_output', call_id: 'call_fail', output: 'Exit code: 1\nAssertion failed.' },
+    ];
+    const coverageRun = await requestCompact(gateway.url, compactBody({ history: changedHistory }));
+    const normalized = renderedCheckpoint(coverageRun.response).parsed;
+    assert.equal(normalized.execution.objective, 'Preserve changed files after an incomplete summary.');
+    assert.equal(normalized.working.artifacts.some((item) => item.subject === 'src/compaction.js'), true);
+    assert.equal(normalized.working.risks.length, 0);
+    assert.equal(normalized.working.evidence.every((item) => item.quote === ''), true);
+
+    const overflowRun = await requestCompact(gateway.url, compactBody({
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue safely after provider context overflow.' }] },
+        { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Continue by checking the compact metadata contract.' }] },
+      ],
+    }));
+    const overflow = renderedCheckpoint(overflowRun.response).parsed;
+    assert.equal(overflow.execution.status, 'active');
+    assert.equal(overflow.execution.next, 'Continue by checking the compact metadata contract.');
+    assert.equal(overflow.working.risks.length, 0);
+
+    assert.equal(attempts.get('malformed'), 1);
+    assert.equal(attempts.get('wrong_function'), 1);
+    assert.equal(attempts.get('timeout'), 1);
+    const malformedRequests = upstream.bodies.filter((body) => body.messages.some((message) => String(message.content || '').includes('Reject a malformed checkpoint submission')));
+    assert.equal(malformedRequests.length, 1);
+    const wrongFunctionRequests = upstream.bodies.filter((body) => body.messages.some((message) => String(message.content || '').includes('Reject a wrong checkpoint function')));
+    assert.equal(wrongFunctionRequests.length, 1);
+    const timeoutRequests = upstream.bodies.filter((body) => body.messages.some((message) => String(message.content || '').includes('Recover after compact timeout')));
+    assert.equal(timeoutRequests.length, 1);
+
+    const diagnostics = compactDiagnostics(await readFile(debugPath, 'utf8'));
+    assert.equal(diagnostics.some((entry) => entry.status === 'completed' && entry.inventory_artifacts === 1 && entry.inventory_error_candidates === 1), true);
+    assert.equal(diagnostics.some((entry) => entry.status === 'completed' && entry.evidence_handles_resolved > 0), true);
+    assert.equal(diagnostics.some((entry) => entry.status === 'invalid' && entry.validation.includes('invalid_checkpoint_arguments')), true);
+    assert.equal(diagnostics.some((entry) => entry.status === 'invalid' && entry.validation.includes('checkpoint_submission_missing')), true);
+    assert.equal(diagnostics.some((entry) => entry.status === 'fallback' && entry.fallback_reason === 'referenced_evidence_dropped'), true);
+    assert.equal(diagnostics.some((entry) => entry.status === 'fallback' && entry.fallback_reason === 'context_length_exceeded'), true);
+    const timeoutFailure = diagnostics.find((entry) => entry.status === 'failed' && entry.error_code === 'upstream_timeout');
+    assert.equal(timeoutFailure.compact_timeout_ms, 60);
+    assert.equal(timeoutFailure.upstream_stage, 'reading_stream');
+    assert.equal(timeoutFailure.stream_chunks > 0, true);
+    assert.equal(timeoutFailure.saw_reasoning_delta, true);
+    assert.equal(diagnostics.some((entry) => entry.status === 'fallback' && entry.fallback_reason === 'upstream_timeout'), true);
+  } finally {
+    gateway.server.closeAllConnections();
+    upstream.server.closeAllConnections();
+    await close(gateway.server);
+    await close(upstream.server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('compact diagnostics report cache effectiveness and client cancellation aborts the upstream stream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-compact-diagnostics-'));
+  const debugPath = join(dir, 'gateway.debug.log');
+  let resolveStreamStarted;
+  let resolveStreamClosed;
+  const streamStarted = new Promise((resolve) => {
+    resolveStreamStarted = resolve;
+  });
+  const streamClosed = new Promise((resolve) => {
+    resolveStreamClosed = resolve;
+  });
+  const upstream = await completionServer(async ({ res, body }) => {
+    const text = body.messages.map((message) => String(message.content || '')).join('\n');
+    if (text.includes('Disconnect while compacting')) {
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.write('data: ' + JSON.stringify({ choices: [{ delta: { reasoning_content: 'still compacting' }, finish_reason: null }] }) + '\n\n');
+      resolveStreamStarted();
+      res.on('close', resolveStreamClosed);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(compactCompletion({
+      usage: {
+        prompt_tokens: 16000,
+        completion_tokens: 120,
+        total_tokens: 16120,
+        prompt_cache_hit_tokens: 12000,
+        prompt_cache_miss_tokens: 4000,
+      },
+    })));
+  });
+  const gateway = await gatewayFor(upstream, { debugPayload: true, debugPayloadLogPath: debugPath });
+  let clientRequest;
+  let clientResponse;
+
+  try {
+    const completedRun = await requestCompact(gateway.url, compactBody({
+      metadata: compactMetadata({}, { turn_id: 'turn_cache' }),
+      history: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Measure compact cache usage.' }] },
+        { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Historical analysis already consumed. '.repeat(500) }] },
+      ],
+    }));
+    assert.equal(completedRun.status, 200);
+    assert.equal(renderedCheckpoint(completedRun.response).parsed.execution.status, 'active');
+
+    clientResponse = await new Promise((resolve, reject) => {
+      const body = JSON.stringify(compactBody({
+        stream: true,
+        metadata: compactMetadata({}, { turn_id: 'turn_disconnect' }),
+        history: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Disconnect while compacting.' }] }],
+      }));
+      const target = new URL(gateway.url + '/v1/responses');
+      clientRequest = http.request({
+        host: target.hostname,
+        port: target.port,
+        path: target.pathname,
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+        },
+      }, resolve);
+      clientRequest.on('error', reject);
+      clientRequest.end(body);
+    });
+    await streamStarted;
+    await new Promise((resolve) => clientResponse.once('data', resolve));
+    clientResponse.destroy();
+    await Promise.race([
+      streamClosed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('upstream compact stream stayed open')), 2000)),
+    ]);
+
+    let diagnostics = [];
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      diagnostics = compactDiagnostics(await readFile(debugPath, 'utf8'));
+      if (diagnostics.some((entry) => entry.turn_id === 'turn_disconnect' && entry.status === 'aborted')) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const completed = diagnostics.find((entry) => entry.turn_id === 'turn_cache' && entry.status === 'completed');
+    assert.equal(completed.cache_hit_tokens, 12000);
+    assert.equal(completed.cache_miss_tokens, 4000);
+    assert.equal(completed.cache_hit_ratio, 0.75);
+    assert.equal(completed.fixed_prefix_tokens > completed.estimated_installed_tokens, true);
+    assert.equal(completed.window_reduction > 10, true);
+    assert.equal(completed.prior_checkpoint, 'none');
+    assert.equal(diagnostics.some((entry) => entry.turn_id === 'turn_disconnect' && entry.status === 'aborted'), true);
+  } finally {
+    clientRequest?.destroy();
+    clientResponse?.destroy();
+    gateway.server.closeAllConnections();
+    upstream.server.closeAllConnections();
+    await close(gateway.server);
+    await close(upstream.server);
+    await rm(dir, { recursive: true, force: true });
+  }
 });
