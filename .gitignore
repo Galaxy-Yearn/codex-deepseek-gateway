@@ -18,7 +18,8 @@ compact-design.md
 compact-principles.md
 system-prompt.md
 .agents/
-.session-review/
+AGENTS.md
+CLAUDE.md
 promotion-doc/
 
 # Logs and generated output

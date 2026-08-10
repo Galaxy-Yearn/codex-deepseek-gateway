@@ -16,6 +16,7 @@ import {
   ResponsesStreamMapper,
   serializeResponsesSseEvent,
   toChatCompletionsRequest,
+  toProviderResponsesRequest,
   toProviderChatCompletionsRequest,
   unavailableWebSearchToolShims,
 } from '../src/protocol.js';
@@ -26,6 +27,45 @@ import {
 import { SseParser } from '../src/common.js';
 import { DEFAULT_MODEL_ALIASES } from '../src/model-map.js';
 import { clearWebSearchEvidenceForTests, rememberWebSearchEvidence } from '../src/web-search-evidence.js';
+
+test('native Responses request mapping', async () => {
+  await scenario('preserves the native Responses request while resolving the catalog model alias', async () => {
+  const request = {
+    model: 'deepseek-v4-flash',
+    instructions: 'Keep the native request intact.',
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+    reasoning: { effort: 'high' },
+    tools: [
+      { type: 'web_search_preview' },
+      { type: 'function', name: 'shell_command', parameters: { type: 'object', properties: {} } },
+      { type: 'custom', name: 'apply_patch', description: 'edit' },
+      { type: 'tool_search', execution: 'client', parameters: { type: 'object' } },
+      { type: 'computer_use', name: 'computer' },
+    ],
+    tool_choice: { type: 'web_search_preview' },
+    stream: true,
+  };
+  const mapped = toProviderResponsesRequest(request, {
+    upstreamProvider: 'deepseek',
+    modelAliases: DEFAULT_MODEL_ALIASES,
+  });
+  assert.notEqual(mapped, request);
+  assert.equal(mapped.model, 'deepseek-v4-flash');
+  assert.deepEqual(mapped.tools, request.tools);
+  assert.deepEqual(mapped.tool_choice, request.tool_choice);
+  assert.deepEqual(mapped.input, request.input);
+  assert.deepEqual(mapped.reasoning, request.reasoning);
+  });
+  await scenario('leaves provider capability validation to the official Responses endpoint', async () => {
+  const mapped = toProviderResponsesRequest({
+    model: 'deepseek-v4-pro',
+    input: 'provider decides availability',
+    tools: [{ type: 'custom', name: 'provider_validates_this' }],
+  }, { upstreamProvider: 'deepseek', modelAliases: DEFAULT_MODEL_ALIASES });
+  assert.equal(mapped.model, 'deepseek-v4-pro');
+  assert.deepEqual(mapped.tools, [{ type: 'custom', name: 'provider_validates_this' }]);
+  });
+});
 
 test('Responses input and history normalization', async () => {
   await scenario('normalizes Responses input to chat completions messages', async () => {
@@ -220,7 +260,7 @@ test('Responses input and history normalization', async () => {
         status: 'completed',
         action: {
           type: 'search',
-          query: 'gold futures price',
+          queries: ['gold futures price', 'gold settlement data'],
           sources: [{ type: 'url', title: 'Gold source', url: 'https://example.com/gold' }],
         },
       },
@@ -242,7 +282,31 @@ test('Responses input and history normalization', async () => {
   const note = String(chat.messages[1].content);
   assert.match(note, /Earlier web activity/);
   assert.match(note, /gold futures price/);
+  assert.match(note, /gold settlement data/);
   assert.match(note, /https:\/\/example\.com\/gold/);
+  });
+  await scenario('preserves native web search failures as descriptive history', async () => {
+  const normalized = normalizeResponsesRequest({
+    input: [{
+      type: 'web_search_call',
+      id: 'ws_failed',
+      status: 'failed',
+      action: {
+        type: 'open_page',
+        url: 'https://example.com/unavailable',
+      },
+      error: {
+        code: 'page_fetch_failed',
+        message: 'The page could not be fetched.',
+      },
+    }],
+  });
+  const chat = toChatCompletionsRequest(normalized);
+  assert.equal(chat.messages.length, 1);
+  assert.equal(chat.messages[0].role, 'assistant');
+  assert.match(String(chat.messages[0].content), /Failed to open page/);
+  assert.match(String(chat.messages[0].content), /page_fetch_failed/);
+  assert.equal(Array.isArray(chat.messages[0].tool_calls), false);
   });
   await scenario('replays gateway-owned web evidence by web_search_call item id when sources are absent', async () => {
   clearWebSearchEvidenceForTests();
@@ -1748,11 +1812,11 @@ test('DeepSeek request, reasoning, and provider compatibility', async () => {
     { upstreamProvider: 'deepseek', upstreamModel: 'deepseek-v4-flash' },
   );
   assert.deepEqual(request.tools.map((tool) => tool.function.name), ['shell_command', 'commentary']);
-  assert.match(String(request.messages[0].content), /The user cannot see your thinking/);
-  assert.match(String(request.messages[0].content), /first in the tool_calls array/);
-  assert.match(String(request.messages[0].content), /Never call it alone or use it for the final answer/);
-  assert.match(request.tools[1].function.description, /first in every tool_calls array with other tool calls/);
-  assert.match(request.tools[1].function.description, /never call it alone or use it for the final answer/);
+  assert.match(String(request.messages[0].content), /When making other tool calls/);
+  assert.match(String(request.messages[0].content), /first in the same tool_calls array/);
+  assert.match(String(request.messages[0].content), /commentary is progress, not a final answer/);
+  assert.match(request.tools[1].function.description, /User-visible progress update for the current operation/);
+  assert.match(request.tools[1].function.description, /When other tools are called, place this call first/);
 
   const withOwnCommentary = toProviderChatCompletionsRequest(
     {

@@ -424,6 +424,129 @@ test('health, models, authentication, and request validation', async () => {
   });
 });
 
+test('native Responses upstream mode', async () => {
+  const upstreamRequests = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : null;
+    upstreamRequests.push({ url: req.url, body, authorization: req.headers.authorization });
+    if (req.url === '/chat/completions') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'chat path' }, finish_reason: 'stop' }] }));
+      return;
+    }
+    if (body?.input === 'provider error') {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'slow down' } }));
+      return;
+    }
+    if (body?.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.write('event: response.created\ndata: {"type":"response.created"}\n\n');
+      res.write('event: response.web_search_call.in_progress\ndata: {"type":"response.web_search_call.in_progress"}\n\n');
+      res.end('event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'resp_native', model: body.model, status: 'completed', output: [], output_text: 'native path' }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'test-key',
+      upstreamProvider: 'deepseek',
+      upstreamWireApi: 'responses',
+      upstreamTimeoutMs: 5000,
+      tavilyWebSearchEnabled: true,
+      tavilyApiKey: 'unused-search-key',
+      modelAliases: DEFAULT_MODEL_ALIASES,
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+
+  try {
+    const request = {
+      model: 'deepseek-v4-flash',
+      instructions: 'native instructions',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'search this' }] }],
+      reasoning: { effort: 'high' },
+      tools: [
+        { type: 'web_search_preview' },
+        { type: 'function', name: 'shell_command', parameters: { type: 'object', properties: {} } },
+        { type: 'custom', name: 'apply_patch', description: 'edit' },
+        { type: 'tool_search', execution: 'client', parameters: { type: 'object' } },
+      ],
+    };
+    const plain = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    assert.equal(plain.status, 200);
+    assert.deepEqual(await plain.json(), {
+      id: 'resp_native',
+      model: 'deepseek-v4-flash',
+      status: 'completed',
+      output: [],
+      output_text: 'native path',
+    });
+
+    const stream = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...request, stream: true }),
+    });
+    const streamText = await stream.text();
+    assert.equal(stream.status, 200);
+    assert.match(streamText, /event: response\.web_search_call\.in_progress/);
+    assert.match(streamText, /event: response\.completed/);
+    assert.doesNotMatch(streamText, /\[DONE\]/);
+
+    const chat = await fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hello' }] }),
+    });
+    assert.equal(chat.status, 200);
+    assert.equal((await chat.json()).choices[0].message.content, 'chat path');
+
+    const models = await fetch(`${proxyUrl}/v1/models`);
+    assert.equal(models.status, 200);
+    assert.deepEqual((await models.json()).data.map((model) => model.id), ['deepseek-v4-flash']);
+
+    const providerError = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', input: 'provider error' }),
+    });
+    assert.equal(providerError.status, 429);
+    assert.deepEqual(await providerError.json(), { error: { code: 'rate_limit_exceeded', message: 'slow down' } });
+
+    const unsupported = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', input: 'hello', tools: [{ type: 'computer_use' }] }),
+    });
+    assert.equal(unsupported.status, 200);
+    assert.equal((await unsupported.json()).output_text, 'native path');
+
+    assert.deepEqual(upstreamRequests.map((entry) => entry.url), ['/responses', '/responses', '/chat/completions', '/responses', '/responses']);
+    assert.equal(upstreamRequests[0].body.instructions, request.instructions);
+    assert.deepEqual(upstreamRequests[0].body.input, request.input);
+    assert.equal(upstreamRequests[0].body.reasoning.effort, 'high');
+    assert.equal(upstreamRequests[0].body.tools[0].type, 'web_search_preview');
+    assert.equal(upstreamRequests[0].body.tools[3].type, 'tool_search');
+    assert.equal(upstreamRequests.at(-1).body.tools[0].type, 'computer_use');
+    assert.equal(upstreamRequests.every((entry) => entry.authorization === 'Bearer test-key'), true);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('graceful shutdown', async () => {
   await scenario('keeps shutdown control off the public data server', async () => {
   const proxy = createProxyServer({

@@ -16,7 +16,7 @@ import {
   normalizeCompactReasoningEffort,
   normalizeCompactTimeoutMs,
 } from './config.js';
-import { toProviderChatCompletionsRequest } from './protocol.js';
+import { normalizeWebSearchCallHistory, toProviderChatCompletionsRequest } from './protocol.js';
 import { callChatCompletions, readJsonResponse } from './upstream.js';
 
 export const CODEX_TURN_METADATA_KEY = 'x-codex-turn-metadata';
@@ -397,6 +397,101 @@ function hostRehydratedToolSources(input) {
   return sources;
 }
 
+function responsesWebSearchEvidence(item, index) {
+  const history = normalizeWebSearchCallHistory(item);
+  if (!history) return null;
+  const action = history.action || 'search';
+  const operation = action === 'open_page'
+    ? 'web_open_page'
+    : action === 'find_in_page'
+      ? 'web_find_in_page'
+      : 'web_search';
+  const details = {
+    status: history.status || 'unknown',
+    action,
+    queries: history.queries.length ? history.queries : undefined,
+    url: history.url,
+    pattern: history.pattern,
+    sources: history.sources.length ? history.sources : undefined,
+    error: history.error,
+  };
+  const locator = boundedAnchor(`Responses web activity ${JSON.stringify(details)}`, 2400);
+  const failed = String(history.status || '').toLowerCase() === 'failed' || Boolean(history.error);
+  return {
+    source: history.id || `native_web_search_${index + 1}`,
+    content: failed ? locator : '',
+    locator,
+    requestLocator: boundedAnchor(`${operation} ${JSON.stringify({
+      queries: history.queries.length ? history.queries : undefined,
+      url: history.url,
+      pattern: history.pattern,
+    })}`, 2000),
+    operation,
+    artifacts: [],
+    failed,
+    recovery: 'expensive',
+  };
+}
+
+function responsesUrlCitationEvidence(item, index) {
+  const citations = [];
+  for (const part of Array.isArray(item?.content) ? item.content : []) {
+    for (const annotation of Array.isArray(part?.annotations) ? part.annotations : []) {
+      if (!isObject(annotation) || annotation.type !== 'url_citation') continue;
+      const url = boundedAnchor(annotation.url, 1600);
+      const title = boundedAnchor(annotation.title, 500);
+      if (!url && !title) continue;
+      citations.push({ url: url || undefined, title: title || undefined });
+      if (citations.length >= 12) break;
+    }
+    if (citations.length >= 12) break;
+  }
+  if (!citations.length) return null;
+  const source = String(item?.id || `response_message_${index + 1}`).trim();
+  const locator = boundedAnchor(`Responses URL citations ${JSON.stringify(citations)}`, 2400);
+  return {
+    source: `${source}:url_citations`,
+    content: '',
+    locator,
+    requestLocator: locator,
+    operation: 'url_citation',
+    artifacts: [],
+    failed: false,
+    recovery: 'locator',
+    citationCount: citations.length,
+  };
+}
+
+function responsesItemEvidenceCorpus(input) {
+  const corpus = [];
+  let webSearchCalls = 0;
+  let urlCitations = 0;
+  for (const [index, item] of (Array.isArray(input) ? input : []).entries()) {
+    const webSearch = responsesWebSearchEvidence(item, index);
+    if (webSearch) {
+      corpus.push(webSearch);
+      webSearchCalls += 1;
+    }
+    const citations = responsesUrlCitationEvidence(item, index);
+    if (citations) {
+      corpus.push(citations);
+      urlCitations += citations.citationCount;
+    }
+  }
+  return { corpus, stats: { records: corpus.length, webSearchCalls, urlCitations } };
+}
+
+function mergeEvidenceCorpora(...corpora) {
+  const merged = new Map();
+  for (const corpus of corpora) {
+    for (const entry of corpus || []) {
+      const source = String(entry?.source || '').trim();
+      if (source) merged.set(source, entry);
+    }
+  }
+  return [...merged.values()];
+}
+
 function toolEvidenceCorpus(messages, ignoredSources = new Set()) {
   const calls = new Map();
   let index = 0;
@@ -638,7 +733,12 @@ function buildCompactionUpstreamRequest(plan) {
     parallel_tool_calls: false,
   }, { ...plan.config, compactionRequest: true });
   const sourceMessages = compactionConversationMessages(request.messages);
-  plan.evidenceCorpus = toolEvidenceCorpus(sourceMessages, hostRehydratedToolSources(plan.rawRequest?.input));
+  const responsesEvidence = responsesItemEvidenceCorpus(plan.rawRequest?.input);
+  plan.responsesEvidenceStats = responsesEvidence.stats;
+  plan.evidenceCorpus = mergeEvidenceCorpora(
+    toolEvidenceCorpus(sourceMessages, hostRehydratedToolSources(plan.rawRequest?.input)),
+    responsesEvidence.corpus,
+  );
   const priorEvidence = (anchors.priorCheckpoint?.parsed?.working?.evidence || []).map((item) => ({
     source: item.source,
     content: item.quote,
@@ -1647,6 +1747,9 @@ function diagnosticBase(plan, upstreamRequest, attempt) {
     historical_tool_calls: plan.historyStats?.toolCalls || 0,
     historical_tool_results: plan.historyStats?.toolResults || 0,
     historical_pseudo_messages: plan.historyStats?.pseudoMessages || 0,
+    responses_item_evidence: plan.responsesEvidenceStats?.records || 0,
+    responses_web_search_calls: plan.responsesEvidenceStats?.webSearchCalls || 0,
+    responses_url_citations: plan.responsesEvidenceStats?.urlCitations || 0,
     input_items: Array.isArray(input) ? input.length : input == null ? 0 : 1,
     messages: upstreamRequest.messages?.length || 0,
     attempt,

@@ -11,7 +11,7 @@ import {
   readCodexCompactionMetadata,
   runCompactionPlan,
 } from './compaction.js';
-import { listModels, mergeModelLists, normalizeModelList } from './model-map.js';
+import { listModels, mergeModelLists, normalizeModelList, supportsNativeResponsesModel } from './model-map.js';
 import {
   assistantMessageFromResponseOutput,
   bridgedCommentaryToolCallsFromMessage,
@@ -27,6 +27,7 @@ import {
   serializeResponsesSseEvent,
   stripBridgedCommentaryFromCompletion,
   toChatCompletionsRequest,
+  toProviderResponsesRequest,
   toProviderChatCompletionsRequest,
   unavailableWebSearchToolShims,
 } from './protocol.js';
@@ -53,7 +54,14 @@ import {
   removeRuntimeRecord,
   writeRuntimeRecord,
 } from './runtime.js';
-import { callChatCompletions, callModels, readJsonResponse, relayChatCompletionsResponse } from './upstream.js';
+import {
+  callChatCompletions,
+  callModels,
+  callResponses,
+  readJsonResponse,
+  relayChatCompletionsResponse,
+  relayResponsesResponse,
+} from './upstream.js';
 import {
   advanceWebSearchChatRequest,
   annotateMessagePartWithWebCitations,
@@ -737,6 +745,68 @@ async function callUpstreamJson({ upstreamRequest, config, signal }) {
       chatToolNamesFromTools(upstreamRequest.tools),
     ),
   };
+}
+
+function writeNativeResponsesFailure(res, error) {
+  if (res.destroyed || res.writableEnded) return;
+  const payload = {
+    type: 'response.failed',
+    response: {
+      status: 'failed',
+      error: { code: 'upstream_error', message: String(error?.message || 'upstream response failed') },
+    },
+  };
+  if (!res.headersSent) {
+    res.writeHead(502, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    });
+  }
+  res.write(`event: response.failed\ndata: ${JSON.stringify(payload)}\n\n`);
+  res.end();
+}
+
+async function handleNativeResponses({ request, requestHeaders, config, res, clientSignal }) {
+  let upstreamRequest;
+  try {
+    upstreamRequest = toProviderResponsesRequest(request, config);
+  } catch (error) {
+    const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 400;
+    sendJson(res, statusCode, { error: { code: error.code, message: error.message || 'Invalid Responses request' } });
+    return true;
+  }
+  if (!config.upstreamApiKey) {
+    sendJson(res, 500, { error: { message: 'Missing UPSTREAM_API_KEY' } });
+    return true;
+  }
+
+  logDebugPayload(config, upstreamRequest, {
+    stage: 'native_responses_payload',
+    rawRequest: request,
+    requestHeaders,
+  });
+  const upstreamResponse = await callResponses({
+    baseUrl: config.upstreamBaseUrl,
+    apiKey: config.upstreamApiKey,
+    request: upstreamRequest,
+    timeoutMs: config.upstreamTimeoutMs,
+    signal: clientSignal,
+  });
+  if (!upstreamResponse.ok) {
+    const data = await readJsonResponse(upstreamResponse);
+    sendJson(res, upstreamResponse.status, data);
+    return true;
+  }
+
+  try {
+    await relayResponsesResponse({ upstreamResponse, res, passThrough: true });
+  } catch (error) {
+    if (clientSignal.aborted) return true;
+    writeNativeResponsesFailure(res, error);
+  }
+  return true;
 }
 
 function clientAbortControllerFor(res) {
@@ -1460,7 +1530,8 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
       });
       if (!response.ok) return localModels;
       const data = await readJsonResponse(response);
-      const upstreamModels = normalizeModelList(data, config);
+      const upstreamModels = normalizeModelList(data, config)
+        .filter((model) => config.upstreamWireApi !== 'responses' || supportsNativeResponsesModel(model.id, config));
       const models = mergeModelLists(upstreamModels, localModels);
       modelCache = {
         data: models,
@@ -1486,14 +1557,24 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
       sendJson(res, 400, { error: { code: 'invalid_compaction_request', message: 'Malformed Codex turn metadata.' } });
       return;
     }
+    const clientAbort = clientAbortControllerFor(res);
+    const clientSignal = clientAbort.signal;
+    if (config.upstreamWireApi === 'responses' && !compactionState.isCompaction) {
+      await handleNativeResponses({
+        request,
+        requestHeaders: req.headers,
+        config,
+        res,
+        clientSignal,
+      });
+      return;
+    }
     const normalized = normalizeResponsesRequest(request);
     normalized.messages = prependMissingAssistantToolMessages(normalized.messages, reasoningCache);
     normalized.messages = restoreAssistantReasoningContent(normalized.messages, reasoningCache);
     normalized.messages = restoreCustomToolCallArguments(normalized.messages, reasoningCache);
 
     const chatRequest = toChatCompletionsRequest(normalized);
-    const clientAbort = clientAbortControllerFor(res);
-    const clientSignal = clientAbort.signal;
     if (compactionState.isCompaction) {
       await handleCompactionResponses({
         request,

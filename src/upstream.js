@@ -56,6 +56,28 @@ export async function callChatCompletions({
   }
 }
 
+export async function callResponses({
+  baseUrl,
+  apiKey,
+  request,
+  timeoutMs,
+  signal,
+}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const finalSignal = mergeAbortSignals(signal, controller.signal);
+  try {
+    return await fetch(joinUrl(baseUrl, '/responses'), {
+      method: 'POST',
+      headers: buildHeaders(apiKey),
+      body: JSON.stringify(request),
+      signal: finalSignal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function callModels({
   baseUrl,
   apiKey,
@@ -153,5 +175,70 @@ export async function relayChatCompletionsResponse({
     if (passThrough && writable()) res.write(`data: ${event.data}\n\n`);
   }
   emitDone({ eof: true });
+  if (endResponse && writable()) res.end();
+}
+
+export async function relayResponsesResponse({
+  upstreamResponse,
+  res,
+  onStreamChunk,
+  passThrough = true,
+  writeHeaders = true,
+  endResponse = true,
+}) {
+  const contentType = upstreamResponse.headers.get('content-type') || '';
+  const isStream = contentType.includes('text/event-stream');
+  const writable = () => !res.destroyed && !res.writableEnded;
+
+  if (!isStream) {
+    const body = await upstreamResponse.text();
+    if (typeof onStreamChunk === 'function') onStreamChunk({ data: body });
+    if (passThrough && writable()) {
+      res.writeHead(upstreamResponse.status, {
+        'content-type': contentType || 'application/json; charset=utf-8',
+      });
+      res.end(body);
+    } else if (endResponse && writable()) {
+      res.end();
+    }
+    return;
+  }
+
+  if (writeHeaders && writable()) {
+    res.writeHead(upstreamResponse.status, {
+      'content-type': contentType || 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    });
+  }
+
+  const reader = upstreamResponse.body?.getReader?.();
+  if (!reader) {
+    if (endResponse && writable()) res.end();
+    return;
+  }
+
+  const parser = new SseParser({ preserveDone: true });
+  const writeEvent = (event) => {
+    if (!passThrough || !writable()) return;
+    const eventName = event.event && event.event !== 'message' ? `event: ${event.event}\n` : '';
+    const data = String(event.data).split('\n').map((line) => `data: ${line}`).join('\n');
+    res.write(`${eventName}${data}\n\n`);
+  };
+  const relayEvents = (events) => {
+    for (const event of events) {
+      if (typeof onStreamChunk === 'function') onStreamChunk(event);
+      writeEvent(event);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    relayEvents(parser.push(value));
+  }
+  relayEvents(parser.end());
+  if (typeof onStreamChunk === 'function') onStreamChunk({ done: true, eof: true });
   if (endResponse && writable()) res.end();
 }

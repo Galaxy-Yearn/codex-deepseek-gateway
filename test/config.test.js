@@ -13,7 +13,7 @@ async function scenario(name, run) {
   }
 }
 import { inspectCodexConfig, readCodexConfig } from '../src/codex-config.js';
-import { loadConfig, normalizeCompactMaxTokens, normalizeCompactReasoningEffort, normalizeCompactTimeoutMs } from '../src/config.js';
+import { loadConfig, normalizeCompactMaxTokens, normalizeCompactReasoningEffort, normalizeCompactTimeoutMs, normalizeUpstreamWireApi } from '../src/config.js';
 import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from '../src/local-config.js';
 import { catalogFileForPromptLanguage, normalizePromptLanguage } from '../src/prompt-language.js';
 
@@ -49,6 +49,7 @@ test('gateway configuration precedence and defaults', async () => {
     assert.equal(config.host, '127.0.0.2');
     assert.equal(config.upstreamApiKey, 'from-file');
     assert.equal(config.upstreamProvider, 'deepseek');
+    assert.equal(config.upstreamWireApi, 'chat_completions');
     assert.equal(config.compactReasoningEffort, 'high');
     assert.equal(config.compactMaxTokens, 20000);
     assert.equal(config.compactTimeoutMs, 240000);
@@ -73,6 +74,20 @@ test('gateway configuration precedence and defaults', async () => {
     assert.equal(config.reasoningCachePath, join(dir, 'state', 'reasoning-cache.jsonl'));
     assert.equal(config.reasoningCacheMaxMessages, 1000);
     assert.equal(config.legacyReasoningCachePath, join(dir, 'state', 'sessions.json'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
+  await scenario('selects and validates the upstream Responses wire API', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-wire-api-config-'));
+  try {
+    await mkdir(join(dir, 'config'));
+    const file = join(dir, 'config', 'gateway.local.json');
+    await writeFile(file, JSON.stringify({ upstreamApiKey: 'from-file', upstreamWireApi: 'responses' }));
+    assert.equal(loadConfig({ GATEWAY_CONFIG_FILE: file }).upstreamWireApi, 'responses');
+    assert.equal(loadConfig({ GATEWAY_CONFIG_FILE: file, UPSTREAM_WIRE_API: 'CHAT_COMPLETIONS' }).upstreamWireApi, 'chat_completions');
+    assert.equal(normalizeUpstreamWireApi(' responses '), 'responses');
+    assert.throws(() => normalizeUpstreamWireApi('streaming'), /Unsupported upstream wire API/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -162,9 +162,10 @@ export function joinUrl(baseUrl, path) {
 export const SSE_PARSER_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 
 export class SseParser {
-  constructor({ maxBufferBytes } = {}) {
+  constructor({ maxBufferBytes, preserveDone = false } = {}) {
     this.decoder = new TextDecoder();
     this.buffer = '';
+    this.preserveDone = Boolean(preserveDone);
     this.maxBufferBytes = Number.isFinite(maxBufferBytes) && maxBufferBytes > 0
       ? maxBufferBytes
       : SSE_PARSER_MAX_BUFFER_BYTES;
@@ -226,7 +227,7 @@ export class SseParser {
     }
     if (dataLines.length === 0) return null;
     const data = dataLines.join('\n');
-    if (data === '[DONE]') return { done: true };
+    if (data === '[DONE]' && !this.preserveDone) return { done: true };
     return { event, data };
   }
 }

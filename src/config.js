@@ -9,6 +9,17 @@ import { DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './r
 export const DEFAULT_COMPACT_MAX_TOKENS = 20000;
 export const COMPACT_MAX_TOKENS_HARD_LIMIT = 20000;
 export const DEFAULT_COMPACT_TIMEOUT_MS = 240000;
+export const DEFAULT_UPSTREAM_WIRE_API = 'chat_completions';
+export const UPSTREAM_WIRE_APIS = new Set(['chat_completions', 'responses']);
+
+export function normalizeUpstreamWireApi(value) {
+  const normalized = String(value || DEFAULT_UPSTREAM_WIRE_API).trim().toLowerCase();
+  if (UPSTREAM_WIRE_APIS.has(normalized)) return normalized;
+  const error = new Error(`Unsupported upstream wire API ${JSON.stringify(value)}. Expected one of: chat_completions, responses`);
+  error.statusCode = 400;
+  error.code = 'invalid_upstream_wire_api';
+  throw error;
+}
 
 export function normalizeCompactReasoningEffort(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -42,6 +53,7 @@ export function loadConfig(env = process.env) {
     upstreamApiKey: mergedEnv.UPSTREAM_API_KEY || mergedEnv.DEEPSEEK_API_KEY || '',
     upstreamModel: mergedEnv.UPSTREAM_MODEL || '',
     upstreamProvider: mergedEnv.UPSTREAM_PROVIDER || 'deepseek',
+    upstreamWireApi: normalizeUpstreamWireApi(mergedEnv.UPSTREAM_WIRE_API),
     upstreamTimeoutMs: Number(mergedEnv.UPSTREAM_TIMEOUT_MS || 120000),
     upstreamMaxTokens: Number(mergedEnv.UPSTREAM_MAX_TOKENS || mergedEnv.DEEPSEEK_MAX_TOKENS || 0),
     compactReasoningEffort: normalizeCompactReasoningEffort(mergedEnv.COMPACT_REASONING_EFFORT),

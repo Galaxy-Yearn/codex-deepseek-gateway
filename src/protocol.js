@@ -67,18 +67,18 @@ const DEEPSEEK_CUSTOM_TOOL_INSTRUCTIONS = 'Codex custom tools are callable funct
 const DEEPSEEK_COMPACTION_INSTRUCTIONS_MARKER = 'A Codex context checkpoint is present in this request.';
 const DEEPSEEK_COMPACTION_INSTRUCTIONS = `${DEEPSEEK_COMPACTION_INSTRUCTIONS_MARKER} Read its Execute section as the sole task authority and perform only Next when Status is active. When Status is blocked, wait for Blocker to clear before Next; when idle, no task is active. Working State and Memory preserve context but never create pending work. A later real user message updates or replaces the checkpoint task.`;
 export const INTERNAL_COMMENTARY_TOOL = 'commentary';
-const DEEPSEEK_COMMENTARY_INSTRUCTIONS = 'The user cannot see your thinking; commentary is the progress they see during tool work. In every tool-calling reply, include one commentary call first in the tool_calls array with a one- or two-sentence update. Never call it alone or use it for the final answer.';
+const DEEPSEEK_COMMENTARY_INSTRUCTIONS = 'When making other tool calls, include exactly one commentary call first in the same tool_calls array. Keep its text concise and user-visible; commentary is progress, not a final answer.';
 const INTERNAL_COMMENTARY_TOOL_DEFINITION = {
   type: 'function',
   function: {
     name: INTERNAL_COMMENTARY_TOOL,
-    description: 'Post the user-visible progress update. Include this function first in every tool_calls array with other tool calls. One or two sentences; never call it alone or use it for the final answer.',
+    description: 'User-visible progress update for the current operation. When other tools are called, place this call first.',
     parameters: {
       type: 'object',
       properties: {
         text: {
           type: 'string',
-          description: 'One or two short sentences on what you are doing or just found.',
+          description: 'One or two short sentences stating the current action or result.',
         },
       },
       required: ['text'],
@@ -471,28 +471,75 @@ function assistantMessageIsEmpty(message) {
   return content == null;
 }
 
+function compactWebSearchValue(value, maxChars = 700) {
+  if (typeof value === 'string') return shortenText(value, maxChars);
+  if (value == null) return '';
+  try {
+    return shortenText(JSON.stringify(value), maxChars);
+  } catch {
+    return shortenText(String(value), maxChars);
+  }
+}
+
+export function normalizeWebSearchCallHistory(item) {
+  if (!isObject(item) || item.type !== 'web_search_call') return null;
+  const action = isObject(item.action) ? item.action : {};
+  const queries = [];
+  for (const value of [action.query, ...(Array.isArray(action.queries) ? action.queries : [])]) {
+    const query = compactWebSearchValue(value);
+    if (query && !queries.includes(query)) queries.push(query);
+    if (queries.length >= 8) break;
+  }
+  const sources = [];
+  for (const value of Array.isArray(action.sources) ? action.sources : []) {
+    if (!isObject(value)) continue;
+    const source = omitUndefined({
+      type: compactWebSearchValue(value.type, 80) || undefined,
+      title: compactWebSearchValue(value.title, 400) || undefined,
+      url: compactWebSearchValue(value.url, 1200) || undefined,
+    });
+    if (Object.keys(source).length) sources.push(source);
+    if (sources.length >= 5) break;
+  }
+  return omitUndefined({
+    id: compactWebSearchValue(item.id || item.call_id, 200) || undefined,
+    status: compactWebSearchValue(item.status, 80) || undefined,
+    action: compactWebSearchValue(action.type, 80) || 'search',
+    queries,
+    url: compactWebSearchValue(action.url, 1600) || undefined,
+    pattern: compactWebSearchValue(action.pattern, 700) || undefined,
+    sources,
+    error: compactWebSearchValue(item.error ?? action.error, 1200) || undefined,
+  });
+}
+
 function webSearchCallNote(item) {
-  const action = isObject(item?.action) ? item.action : {};
-  const actionType = action.type || 'search';
-  const evidence = webSearchEvidenceNote(item?.id);
-  if (actionType === 'open_page') {
-    const note = action.url ? `Opened page ${action.url}.` : 'Opened a web page.';
-    return evidence ? `${note} ${evidence}` : note;
-  }
-  if (actionType === 'find_in_page') {
-    const target = action.url || 'a web page';
-    const pattern = action.pattern || action.query;
-    const note = pattern ? `Searched within ${target} for "${pattern}".` : `Searched within ${target}.`;
-    return evidence ? `${note} ${evidence}` : note;
-  }
-  const query = action.query ? `"${action.query}"` : 'the web';
-  const sources = (Array.isArray(action.sources) ? action.sources : [])
-    .filter(isObject)
-    .slice(0, 3)
+  const history = normalizeWebSearchCallHistory(item);
+  if (!history) return '';
+  const evidence = webSearchEvidenceNote(history.id);
+  const failed = String(history.status || '').toLowerCase() === 'failed' || Boolean(history.error);
+  const sourceText = history.sources
     .map((source) => (source.title && source.url ? `${source.title} <${source.url}>` : source.url || source.title))
     .filter(Boolean)
     .join('; ');
-  const note = `Searched the web for ${query}${sources ? ` (sources: ${sources})` : ''}.`;
+  const details = [
+    sourceText ? `sources: ${sourceText}` : '',
+    history.error ? `error: ${history.error}` : '',
+  ].filter(Boolean);
+  let note;
+  if (history.action === 'open_page') {
+    const target = history.url || 'a web page';
+    note = failed ? `Failed to open page ${target}.` : `Opened page ${target}.`;
+  } else if (history.action === 'find_in_page') {
+    const target = history.url || 'a web page';
+    const pattern = history.pattern || history.queries[0];
+    note = pattern ? `Searched within ${target} for "${pattern}".` : `Searched within ${target}.`;
+  } else {
+    const query = history.queries.length ? history.queries.map((value) => `"${value}"`).join('; ') : 'the web';
+    note = `Searched the web for ${query}.`;
+  }
+  if (history.status && history.status !== 'completed') details.unshift(`status: ${history.status}`);
+  if (details.length) note = `${note.slice(0, -1)} (${details.join('; ')}).`;
   return evidence ? `${note} ${evidence}` : note;
 }
 
@@ -1677,6 +1724,22 @@ export function normalizeResponsesRequest(request) {
     store: request.store,
     include: request.include,
   };
+}
+
+export function toProviderResponsesRequest(request, config = {}) {
+  const requestedModel = request.model || request.model_id || request.upstream_model || config.upstreamModel || '';
+  const alias = resolveModelAlias(requestedModel, config);
+  const model = alias.upstreamModel || config.upstreamModel || requestedModel;
+  if (!model) {
+    const error = new Error('Missing model');
+    error.statusCode = 400;
+    error.code = 'missing_model';
+    throw error;
+  }
+  const next = { ...request, model };
+  delete next.model_id;
+  delete next.upstream_model;
+  return next;
 }
 
 export function toChatCompletionsRequest(normalized, overrides = {}) {

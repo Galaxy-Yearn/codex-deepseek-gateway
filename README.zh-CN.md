@@ -30,7 +30,7 @@ Codex /v1/responses
 - 极高的缓存命中率：请求构造针对 DeepSeek 上下文缓存的特点做了优化，多轮会话中命中率极高，费用与响应延迟显著降低。
 - 网络搜索：可选接入 Tavily 和 Firecrawl，让 Codex 的网络搜索请求真实可用，并针对多轮搜索优化效率。
 - 调优的系统提示词：随包提供为 DeepSeek 适配的双语 system prompts 与 personalities。
-- 更强的 compact 机制：网关把映射历史投影为惰性语义证据，让 DeepSeek 提交一个通过 schema 校验的 checkpoint，再安装精简的执行状态与工作记忆。模型输出无效、provider 失败、超时或 authority 校验失败时，直接回退到确定性的可信状态，不会卡住会话。
+- 更强的 compact 机制：网关把桥接后的 Chat 历史和原生 Responses 历史统一投影为惰性语义证据，让 DeepSeek 提交一个通过 schema 校验的 checkpoint，再安装精简的执行状态与工作记忆。模型输出无效、provider 失败、超时或 authority 校验失败时，直接回退到确定性的可信状态，不会卡住会话。
 
 ## 安装、启动与检查
 
@@ -51,7 +51,7 @@ codex-deepseek-gateway install --no-edit  # 安装但不打开配置文件
 }
 ```
 
-`install` 不会覆盖已有的 `gateway.local.json`。启动网关并检查状态：
+`install` 不会覆盖 `gateway.local.json` 中已有的设置；从旧版本升级时，只会为缺少该字段的配置补上兼容旧行为的 `upstreamWireApi: "chat_completions"`。然后启动网关并检查状态：
 
 ```sh
 codex-deepseek-gateway start
@@ -124,6 +124,18 @@ codex-deepseek-gateway sessions --exec <id-or-row>  # 按行号或 session id �
 
 无论通过普通 `codex` 还是 launcher，只要加载了随包 catalog，Codex TUI 中的 `/model` 就能切换 DeepSeek 模型和 reasoning 档位，`/personality` 可以切换 catalog 提供的 personality。
 
+### 上游 Wire API
+
+网关默认保留现有的 Responses → Chat Completions 桥接。要让 `/v1/responses` 直接接入 DeepSeek 原生 Responses API，可在 `gateway.local.json` 中设置：
+
+```json
+{
+  "upstreamWireApi": "responses"
+}
+```
+
+`chat_completions` 是默认值，继续提供现有的 reasoning cache、apply-patch 兼容和可选本地网络搜索循环。`responses` 只保留网关自有的 model catalog 与 compact harness，其余 Responses 请求和原生 JSON/SSE 事件都直接转发给 DeepSeek。网关执行 compact 时，会把原生 reasoning、function/custom 调用、`web_search_call` 元数据与失败信息，以及响应中实际返回的 URL citation 纳入同一份有界证据清单；不会虚构 provider 未返回的搜索结果。包括不支持的工具类型在内的 provider 能力校验，交给 DeepSeek 官方 Responses 接口处理。无论模式如何，`/v1/chat/completions` 都保持 Chat 直通。
+
 ### 语言
 
 在 `~/.codex/deepseek-gateway/config/gateway.local.json` 中设置 `codexPromptLanguage`：
@@ -182,7 +194,7 @@ DeepSeek 的思维链会在 Codex TUI 中完整显示，原始 `reasoning_conten
 }
 ```
 
-Codex 的 `web_search` / `web_search_preview` 请求会经由 Tavily 执行。配置 Firecrawl 后，搜索结果会补充有用的页面正文，DeepSeek 也可以打开已知页面或在页面内查找文本。单 turn 上限可通过上文配置调整。该功能仅提供文本证据；能力范围见[局限](#局限)。
+当 `upstreamWireApi` 为 `chat_completions` 时，Codex 的 `web_search` / `web_search_preview` 请求会经由 Tavily 执行。配置 Firecrawl 后，搜索结果会补充有用的页面正文，DeepSeek 也可以打开已知页面或在页面内查找文本。当 `upstreamWireApi` 为 `responses` 时，网关不运行本地搜索循环，而是透传 DeepSeek 原生 Responses 的 `web_search` 工具和 `response.web_search_call.*` 事件。单 turn 上限只适用于 Chat Completions 桥接。该功能仅提供文本证据；能力范围见[局限](#局限)。
 
 ## 版本更新
 
@@ -192,7 +204,7 @@ Codex 的 `web_search` / `web_search_preview` 请求会经由 Tavily 执行。�
 codex-deepseek-gateway update
 ```
 
-`update` 要求网关已安装并配置 API key。它会停止网关，安装并运行 npm 上的 latest 版本，保留你的 `gateway.local.json`，重新安装本地运行时，然后运行 `status` 和 `doctor`，检查版本、进程身份、健康状态和配置。命令完成后，再用 `codex-deepseek-gateway new` 或 `codex-deepseek-gateway sessions` 重新启动 Codex 会话。
+`update` 要求网关已安装并配置 API key。它会停止网关，安装并运行 npm 上的 latest 版本，在保留 `gateway.local.json` 既有设置的同时补上缺失的兼容默认项，重新安装本地运行时，然后运行 `status` 和 `doctor`，检查版本、进程身份、健康状态和配置。命令完成后，再用 `codex-deepseek-gateway new` 或 `codex-deepseek-gateway sessions` 重新启动 Codex 会话。
 
 交互式运行 `codex-deepseek-gateway` 命令时，CLI 会检查 npm 是否有新版本，并在可更新时提示运行 `codex-deepseek-gateway update`。非交互式调用会跳过检查，检查失败也不会导致原命令失败。
 
@@ -232,6 +244,7 @@ codex-deepseek-gateway uninstall  # 删除本地运行时
 {
   "upstreamApiKey": "sk-REPLACE_ME",
   "upstreamBaseUrl": "https://api.deepseek.com",
+  "upstreamWireApi": "chat_completions",
   "upstreamMaxTokens": 0,
   "host": "127.0.0.1",
   "port": 3000,
@@ -251,6 +264,7 @@ codex-deepseek-gateway uninstall  # 删除本地运行时
 
 - `upstreamApiKey` — 你的 [DeepSeek API key](https://platform.deepseek.com/api_keys)（也可用 `DEEPSEEK_API_KEY`）。
 - `upstreamBaseUrl` — DeepSeek API 端点；参见 [DeepSeek API 文档](https://api-docs.deepseek.com/)。
+- `upstreamWireApi` — `/v1/responses` 的上游协议，默认 `chat_completions`，也可设为原生 `responses`；无论该值如何，`/v1/chat/completions` 都保持 Chat 直通。
 - `upstreamMaxTokens` — DeepSeek 输出 token 上限；`0` 表示使用 catalog 的默认约 100K 预算。
 - `host`、`port` — 网关监听地址。
 - `codexPromptLanguage` — launcher 注入的 catalog 与选择器语言；普通 `codex` 使用其配置的 `model_catalog_json`；见[语言](#语言)。

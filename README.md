@@ -30,7 +30,7 @@ On top of that, the gateway adds:
 - Very high cache hit rate: request construction is tuned for DeepSeek's context caching, so multi-turn sessions hit the cache at a very high rate, cutting cost and response latency.
 - Web search: optional Tavily and Firecrawl backends make Codex web-search requests actually work.
 - Tuned system prompts: bilingual system prompts and personalities adapted for DeepSeek.
-- Stronger compaction: the gateway projects mapped history into inert semantic evidence, asks DeepSeek for one schema-validated checkpoint, and installs a compact execution and working-memory state. Invalid output, provider failure, timeout, or authority failure falls back to deterministic trusted state instead of stalling the session.
+- Stronger compaction: the gateway projects both bridged Chat history and native Responses history into inert semantic evidence, asks DeepSeek for one schema-validated checkpoint, and installs a compact execution and working-memory state. Invalid output, provider failure, timeout, or authority failure falls back to deterministic trusted state instead of stalling the session.
 
 ## Install, Start, and Check
 
@@ -51,7 +51,7 @@ Put your DeepSeek API key in `~/.codex/deepseek-gateway/config/gateway.local.jso
 }
 ```
 
-`install` never overwrites an existing `gateway.local.json`. Start the gateway and check it:
+`install` never overwrites existing settings in `gateway.local.json`; when upgrading an older install it adds the missing `upstreamWireApi` key with the backwards-compatible `chat_completions` default. Start the gateway and check it:
 
 ```sh
 codex-deepseek-gateway start
@@ -124,6 +124,18 @@ codex-deepseek-gateway sessions --exec <id-or-row>  # resume by row number or se
 
 Whenever the packaged catalog is loaded, whether through plain `codex` or the launcher, `/model` switches between the DeepSeek models and reasoning levels, and `/personality` switches between the catalog personalities.
 
+### Upstream Wire API
+
+The gateway keeps its existing Responses-to-Chat bridge by default. To send `/v1/responses` requests directly to DeepSeek's native Responses API, set this in `gateway.local.json`:
+
+```json
+{
+  "upstreamWireApi": "responses"
+}
+```
+
+`chat_completions` is the default and continues to provide the gateway's existing reasoning cache, apply-patch compatibility, and optional local Web Search loop. `responses` keeps the gateway-owned model catalog and compact harness, while forwarding every other Responses request and native JSON/SSE event directly to DeepSeek. During gateway-owned compaction, native reasoning, function/custom calls, `web_search_call` metadata, failures, and returned URL citations are projected into the same bounded evidence inventory; the gateway does not invent search results that the provider did not return. Provider capability validation, including unsupported tool types, is left to DeepSeek's official Responses endpoint. `/v1/chat/completions` remains a Chat Completions pass-through in either mode.
+
 ### Language
 
 Set `codexPromptLanguage` in `~/.codex/deepseek-gateway/config/gateway.local.json`:
@@ -182,7 +194,7 @@ If you also want opened-page reading, create a [Firecrawl API key](https://www.f
 }
 ```
 
-Codex `web_search` / `web_search_preview` requests are executed through Tavily. With Firecrawl configured, searches are enriched with useful page text, and DeepSeek can open known pages or find text inside them. Per-turn limits are configurable above. This feature is text-only; see [Limits](#limits) for its scope.
+With `upstreamWireApi: "chat_completions"`, Codex `web_search` / `web_search_preview` requests are executed through Tavily. With Firecrawl configured, searches are enriched with useful page text, and DeepSeek can open known pages or find text inside them. With `upstreamWireApi: "responses"`, the gateway does not run this local loop; it forwards DeepSeek's native Responses `web_search` tool and its native `response.web_search_call.*` events. Per-turn limits apply only to the Chat Completions bridge. This feature is text-only; see [Limits](#limits) for its scope.
 
 ## Upgrade
 
@@ -192,7 +204,7 @@ Exit all running Codex sessions before you upgrade. A session left open across a
 codex-deepseek-gateway update
 ```
 
-`update` requires an installed gateway with an API key configured. It stops the gateway, installs and runs the latest npm package, preserves your `gateway.local.json`, reinstalls the local runtime, then runs `status` and `doctor` to verify the version, process identity, health, and configuration. Once it completes, start your Codex sessions again with `codex-deepseek-gateway new` or `codex-deepseek-gateway sessions`.
+`update` requires an installed gateway with an API key configured. It stops the gateway, installs and runs the latest npm package, preserves your `gateway.local.json` settings while adding any missing compatibility defaults, reinstalls the local runtime, then runs `status` and `doctor` to verify the version, process identity, health, and configuration. Once it completes, start your Codex sessions again with `codex-deepseek-gateway new` or `codex-deepseek-gateway sessions`.
 
 Interactive `codex-deepseek-gateway` commands check npm for a newer version and suggest `codex-deepseek-gateway update` when one is available. The check is skipped for non-interactive use and never causes the original command to fail.
 
@@ -232,6 +244,7 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
 {
   "upstreamApiKey": "sk-REPLACE_ME",
   "upstreamBaseUrl": "https://api.deepseek.com",
+  "upstreamWireApi": "chat_completions",
   "upstreamMaxTokens": 0,
   "host": "127.0.0.1",
   "port": 3000,
@@ -251,6 +264,7 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
 
 - `upstreamApiKey` — your [DeepSeek API key](https://platform.deepseek.com/api_keys) (`DEEPSEEK_API_KEY` also works).
 - `upstreamBaseUrl` — DeepSeek API endpoint; see the [DeepSeek API documentation](https://api-docs.deepseek.com/).
+- `upstreamWireApi` — `/v1/responses` upstream protocol, `chat_completions` by default or native `responses`; `/v1/chat/completions` remains a Chat pass-through in either mode.
 - `upstreamMaxTokens` — cap on DeepSeek output tokens; `0` uses the catalog's default ~100K budget.
 - `host`, `port` — gateway listen address.
 - `codexPromptLanguage` — catalog and picker language injected by the launcher; plain `codex` uses its configured `model_catalog_json`; see [Language](#language).

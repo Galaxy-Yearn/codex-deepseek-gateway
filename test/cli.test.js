@@ -120,7 +120,7 @@ test('CLI version and installation lifecycle', async () => {
     await rm(dir, { recursive: true, force: true });
   }
   });
-  await scenario('install copies runtime assets without overwriting local config or reasoning cache', async () => {
+  await scenario('install copies runtime assets and migrates local config without overwriting existing values or reasoning cache', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-cli-install-'));
   try {
     await mkdir(join(dir, 'config'), { recursive: true });
@@ -153,7 +153,10 @@ test('CLI version and installation lifecycle', async () => {
       env,
     });
 
-    assert.deepEqual(JSON.parse(readFileSync(localConfigPath, 'utf8')), localConfig);
+    assert.deepEqual(JSON.parse(readFileSync(localConfigPath, 'utf8')), {
+      ...localConfig,
+      upstreamWireApi: 'chat_completions',
+    });
     assert.equal(readFileSync(reasoningCachePath, 'utf8'), reasoningCache);
     assert.equal(existsSync(join(dir, 'bin', 'codex-deepseek-gateway.js')), true);
     assert.equal(existsSync(join(dir, 'src', 'server.js')), true);
@@ -166,6 +169,28 @@ test('CLI version and installation lifecycle', async () => {
     assert.equal(existsSync(join(dir, 'config', 'codex-model-catalog.zh.json')), false);
     assert.equal(existsSync(join(dir, 'config', 'model-aliases.json')), false);
     assert.equal(existsSync(join(dir, 'config', 'frontend-design-guidance', 'en.md')), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
+  await scenario('install preserves an explicitly selected upstream wire API', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-cli-wire-api-'));
+  try {
+    await mkdir(join(dir, 'config'), { recursive: true });
+    const localConfigPath = join(dir, 'config', 'gateway.local.json');
+    await writeFile(localConfigPath, JSON.stringify({ upstreamApiKey: 'sk-REPLACE_ME', upstreamWireApi: 'responses' }));
+    const env = { ...process.env };
+    delete env.DEEPSEEK_API_KEY;
+    delete env.UPSTREAM_API_KEY;
+    delete env.GATEWAY_CONFIG_FILE;
+    execFileSync(process.execPath, ['bin/codex-deepseek-gateway.js', 'install', '--no-edit', '--dir', dir], {
+      encoding: 'utf8',
+      env,
+    });
+    assert.deepEqual(JSON.parse(readFileSync(localConfigPath, 'utf8')), {
+      upstreamApiKey: 'sk-REPLACE_ME',
+      upstreamWireApi: 'responses',
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -318,7 +343,10 @@ test('CLI version and installation lifecycle', async () => {
     assert.notEqual(newPid, oldPid);
     assert.equal(processExists(oldPid), false);
     assert.equal(processExists(newPid), true);
-    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'config', 'gateway.local.json'), 'utf8')), localConfig);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'config', 'gateway.local.json'), 'utf8')), {
+      ...localConfig,
+      upstreamWireApi: 'chat_completions',
+    });
     assert.equal(readFileSync(join(dir, 'state', 'reasoning-cache.jsonl'), 'utf8'), reasoningCache);
   } finally {
     await stopHttpChild(`http://127.0.0.1:${upstreamPort}/shutdown`, upstream);

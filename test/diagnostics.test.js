@@ -103,6 +103,7 @@ test('gateway diagnostics', async () => {
     assert.equal(status.state, 'healthy');
     assert.deepEqual(status.versions, { cli: '1.2.3', installed: '1.2.3', running: '1.2.3' });
     assert.equal(status.process.authenticated, true);
+    assert.equal(status.configuration.upstreamWireApi, 'chat_completions');
     assert.equal(status.process.uptimeSeconds, 60);
     assert.equal(status.endpoint.reachable, true);
     assert.match(formatGatewayStatus(status), /Gateway status: HEALTHY/);
@@ -165,6 +166,7 @@ test('gateway diagnostics', async () => {
     assert.equal(report.checks['runtime.status'].status, 'ok');
     assert.equal(report.checks['codex.integration'].details.plainCodexProvider, 'duckcoding');
     assert.equal(report.checks['catalog.integrity'].status, 'ok');
+    assert.equal(report.checks['config.gateway'].details.upstreamWireApi, 'chat_completions');
     assert.equal(report.checks['gateway.models'].status, 'ok');
     assert.equal(report.checks['upstream.models'].status, 'ok');
     assert.equal(report.checks['reasoning.cache'].status, 'ok');

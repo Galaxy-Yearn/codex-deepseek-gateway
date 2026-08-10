@@ -163,6 +163,13 @@ test('reasoning and model catalog mapping', async () => {
   assert.deepEqual(listed.map((model) => model.id), ['a-model', 'm-model', 'z-model']);
   assert.equal(listed.every((model) => model.owned_by === 'deepseek'), true);
 
+  const nativeListed = listModels({
+    upstreamProvider: 'deepseek',
+    upstreamWireApi: 'responses',
+    modelAliases: DEFAULT_MODEL_ALIASES,
+  });
+  assert.deepEqual(nativeListed.map((model) => model.id), ['deepseek-v4-flash']);
+
   const merged = mergeModelLists(
     [{ id: 'z-model', source: 'first' }, { id: 'a-model' }],
     [{ id: 'z-model', source: 'second' }, { id: 'm-model' }, { id: legacyChat }],

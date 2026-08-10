@@ -13,8 +13,10 @@ async function scenario(name, run) {
 import {
   callChatCompletions,
   callModels,
+  callResponses,
   readJsonResponse,
   relayChatCompletionsResponse,
+  relayResponsesResponse,
 } from '../src/upstream.js';
 
 function listen(server) {
@@ -67,7 +69,7 @@ test('upstream request contract and failure propagation', async () => {
       body: Buffer.concat(chunks).toString('utf8'),
     });
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(req.url === '/models' ? '{"data":[]}' : '{"choices":[]}');
+    res.end(req.url === '/models' ? '{"data":[]}' : '{}');
   });
   const baseUrl = await listen(upstream);
 
@@ -78,11 +80,19 @@ test('upstream request contract and failure propagation', async () => {
       request: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] },
       timeoutMs: 1000,
     });
+    const responsesResponse = await callResponses({
+      baseUrl: `${baseUrl}/`,
+      apiKey: 'secret',
+      request: { model: 'deepseek-v4-flash', input: 'hi', stream: true },
+      timeoutMs: 1000,
+    });
     const modelsResponse = await callModels({ baseUrl, apiKey: 'secret', timeoutMs: 1000 });
     assert.equal(chatResponse.status, 200);
+    assert.equal(responsesResponse.status, 200);
     assert.equal(modelsResponse.status, 200);
     assert.deepEqual(requests.map((request) => [request.method, request.url]), [
       ['POST', '/chat/completions'],
+      ['POST', '/responses'],
       ['GET', '/models'],
     ]);
     assert.equal(requests.every((request) => request.authorization === 'Bearer secret'), true);
@@ -91,7 +101,12 @@ test('upstream request contract and failure propagation', async () => {
       model: 'deepseek-v4-flash',
       messages: [{ role: 'user', content: 'hi' }],
     });
-    assert.equal(requests[1].body, '');
+    assert.deepEqual(JSON.parse(requests[1].body), {
+      model: 'deepseek-v4-flash',
+      input: 'hi',
+      stream: true,
+    });
+    assert.equal(requests[2].body, '');
   } finally {
     await close(upstream);
   }
@@ -133,6 +148,54 @@ test('upstream request contract and failure propagation', async () => {
     }),
     (error) => error instanceof TypeError,
   );
+  });
+});
+
+test('native Responses relay lifecycle', async () => {
+  await scenario('relays native Responses JSON and semantic SSE without adding Chat [DONE]', async () => {
+  const plainRes = responseCollector();
+  await relayResponsesResponse({
+    upstreamResponse: new Response('{"id":"resp_1","status":"completed"}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }),
+    res: plainRes,
+  });
+  assert.equal(plainRes.status, 200);
+  assert.equal(plainRes.chunks.join(''), '{"id":"resp_1","status":"completed"}');
+
+  const streamRes = responseCollector();
+  const chunks = [];
+  const encoder = new TextEncoder();
+  await relayResponsesResponse({
+    upstreamResponse: new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: response.created\ndata: {"type":"response.created"}\n\n'));
+        controller.enqueue(encoder.encode('event: response.completed\ndata: {"type":"response.completed"}\n\n'));
+        controller.close();
+      },
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    res: streamRes,
+    onStreamChunk: (event) => chunks.push(event),
+  });
+  const text = streamRes.chunks.join('');
+  assert.match(text, /event: response\.created/);
+  assert.match(text, /event: response\.completed/);
+  assert.doesNotMatch(text, /\[DONE\]/);
+  assert.deepEqual(chunks.map((event) => event.event || event.done), ['response.created', 'response.completed', true]);
+
+  for (const terminal of ['response.incomplete', 'response.failed']) {
+    const terminalRes = responseCollector();
+    await relayResponsesResponse({
+      upstreamResponse: new Response(`event: ${terminal}\ndata: {"type":"${terminal}"}\n\n`, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+      res: terminalRes,
+    });
+    assert.match(terminalRes.chunks.join(''), new RegExp(`event: ${terminal.replaceAll('.', '\\.')}\\n`));
+    assert.doesNotMatch(terminalRes.chunks.join(''), /\[DONE\]/);
+  }
   });
 });
 

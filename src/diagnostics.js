@@ -7,7 +7,7 @@ import { resolveCodexExecutable } from './codex-launch.js';
 import { isObject, joinUrl, safeJsonParse } from './common.js';
 import { loadConfig } from './config.js';
 import { modelAliasesFromCatalog } from './model-catalog.js';
-import { resolveModelAlias } from './model-map.js';
+import { listModels, resolveModelAlias } from './model-map.js';
 import {
   connectHttpUrl,
   positiveInteger,
@@ -212,6 +212,7 @@ export async function inspectGatewayStatus({ installDir, cliVersion, env = proce
     configuration: {
       loaded: !configResult.error,
       apiKeyAvailable: Boolean(configResult.config?.upstreamApiKey),
+      upstreamWireApi: configResult.config?.upstreamWireApi || null,
     },
     paths: {
       install: paths.install,
@@ -402,14 +403,16 @@ export async function inspectGatewayDoctor({
       const invalid = [];
       if (!config.upstreamApiKey) invalid.push('DeepSeek API key is missing');
       try { new URL(config.upstreamBaseUrl); } catch { invalid.push('upstreamBaseUrl is invalid'); }
+      if (!['chat_completions', 'responses'].includes(config.upstreamWireApi)) invalid.push('upstreamWireApi must be chat_completions or responses');
       if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) invalid.push('port must be between 1 and 65535');
       if (!Number.isFinite(config.upstreamTimeoutMs) || config.upstreamTimeoutMs <= 0) invalid.push('upstreamTimeoutMs must be positive');
       if (!Number.isFinite(config.compactTimeoutMs) || config.compactTimeoutMs <= 0) invalid.push('compactTimeoutMs must be positive');
       if (invalid.length) return diagnosticResult('fail', invalid.join('; '), { path: paths.config }, `Fix ${paths.config}`);
       const debug = config.debugPayload ? 'debug on' : 'debug off';
-      return diagnosticResult('ok', `gateway config valid (${config.codexPromptLanguage} prompts, compact ${config.compactReasoningEffort}/${config.compactMaxTokens}/${config.compactTimeoutMs}ms, ${debug})`, {
+      return diagnosticResult('ok', `gateway config valid (${config.codexPromptLanguage} prompts, ${config.upstreamWireApi} upstream, compact ${config.compactReasoningEffort}/${config.compactMaxTokens}/${config.compactTimeoutMs}ms, ${debug})`, {
         path: paths.config,
         upstream: safeUrl(config.upstreamBaseUrl),
+        upstreamWireApi: config.upstreamWireApi,
         promptLanguage: config.codexPromptLanguage,
         compaction: { reasoningEffort: config.compactReasoningEffort, maxTokens: config.compactMaxTokens, timeoutMs: config.compactTimeoutMs },
         proxyAuthentication: Boolean(config.proxyApiKey),
@@ -490,7 +493,7 @@ export async function inspectGatewayDoctor({
       });
       if (!result.ok) return diagnosticResult('fail', `gateway /v1/models failed${result.status ? ` with HTTP ${result.status}` : ''}`, { latencyMs: result.latencyMs, error: result.error }, 'Check the running gateway and proxy authentication.');
       const models = Array.isArray(result.data?.data) ? result.data.data.map((model) => String(model?.id || '')).filter(Boolean).sort() : [];
-      const expected = Object.keys(config.modelAliases).sort();
+      const expected = listModels(config).map((model) => model.id).sort();
       const missing = expected.filter((model) => !models.includes(model));
       if (missing.length) return diagnosticResult('fail', `gateway model list is missing: ${missing.join(', ')}`, { models, expected, latencyMs: result.latencyMs }, 'Reinstall and restart the gateway.');
       return diagnosticResult('ok', `gateway exposes ${expected.length} expected models (${result.latencyMs} ms)`, { models, latencyMs: result.latencyMs });
@@ -512,7 +515,7 @@ export async function inspectGatewayDoctor({
       const latencyMs = Date.now() - startedAt;
       if (!response.ok) return diagnosticResult('fail', `DeepSeek /models returned HTTP ${response.status}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, error: errorMessage(data) }, response.status === 401 || response.status === 403 ? 'Check the DeepSeek API key.' : 'Check the DeepSeek endpoint and account status.');
       const models = Array.isArray(data?.data) ? data.data.map((model) => String(model?.id || '')).filter(Boolean).sort() : [];
-      const targets = [...new Set(Object.keys(config.modelAliases).map((model) => resolveModelAlias(model, config).upstreamModel))].sort();
+      const targets = [...new Set(listModels(config).map((model) => resolveModelAlias(model.id, config).upstreamModel))].sort();
       const missing = models.length ? targets.filter((model) => !models.includes(model)) : [];
       if (missing.length) return diagnosticResult('warning', `DeepSeek authenticated, but /models does not list: ${missing.join(', ')}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models, targets }, 'Verify the configured model mappings against the provider account.');
       return diagnosticResult('ok', `DeepSeek authentication and /models are reachable (${latencyMs} ms)`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models });
@@ -573,6 +576,7 @@ export function formatGatewayStatus(status) {
     `Version: ${versionText}`,
     `Process: ${processText}`,
     `API: ${status.endpoint.runningApi || status.endpoint.configuredApi || 'unknown'}${status.endpoint.latencyMs != null ? ` (${status.endpoint.latencyMs} ms)` : ''}`,
+    `Upstream wire API: ${status.configuration.upstreamWireApi || 'unknown'}`,
     `Install: ${status.paths.install}`,
     `Config: ${status.paths.config}`,
   ];

@@ -285,6 +285,47 @@ test('compact requests reduce historical protocol to inert evidence through stre
       { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '<|DSML|tool_calls><|DSML|invoke name="lookup">' }] },
       { type: 'function_call', id: 'fc_test', call_id: 'call_test', name: 'shell_command', arguments: '{"command":"npm test","workdir":"/repo"}' },
       { type: 'function_call_output', call_id: 'call_test', output: 'Exit code: 0\n67 tests passed.' },
+      {
+        type: 'web_search_call',
+        id: 'ws_native_search',
+        status: 'completed',
+        action: {
+          type: 'search',
+          queries: ['DeepSeek Responses API compaction', 'ws_call_id=ws_native_search'],
+          sources: [{ type: 'url', title: 'DeepSeek Responses API', url: 'https://api-docs.deepseek.com/guides/responses_api/' }],
+        },
+      },
+      {
+        type: 'web_search_call',
+        id: 'ws_native_open_failed',
+        status: 'failed',
+        action: { type: 'open_page', url: 'https://example.com/unavailable-native-page' },
+        error: { code: 'page_fetch_failed', message: 'Native page fetch failed.' },
+      },
+      {
+        type: 'message',
+        id: 'msg_native_citation',
+        role: 'assistant',
+        content: [{
+          type: 'output_text',
+          text: 'DeepSeek documents native Responses web search.',
+          annotations: [{
+            type: 'url_citation',
+            title: 'DeepSeek Codex integration',
+            url: 'https://api-docs.deepseek.com/quick_start/agent_integrations/codex',
+            start_index: 0,
+            end_index: 8,
+          }],
+        }],
+      },
+      {
+        type: 'custom_tool_call',
+        id: 'ctc_native_patch',
+        call_id: 'call_native_patch',
+        name: 'apply_patch',
+        input: '*** Begin Patch\n*** Update File: src/native-compact.js\n@@\n-old\n+new\n*** End Patch',
+      },
+      { type: 'custom_tool_call_output', call_id: 'call_native_patch', output: 'Done!' },
       { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Verified the shared compact bridge behavior and preserved the remaining task boundary.' }] },
     ];
     for (let index = 0; index < 3; index += 1) {
@@ -315,6 +356,7 @@ test('compact requests reduce historical protocol to inert evidence through stre
 
     const nonStreaming = await requestCompact(gateway.url, compactBody({
       metadata: compactMetadata({ phase: 'standalone_turn', trigger: 'manual' }),
+      history: richHistory,
       focus: 'Preserve file changes and unresolved test failures.',
     }));
     assert.equal(nonStreaming.status, 200);
@@ -371,6 +413,13 @@ test('compact requests reduce historical protocol to inert evidence through stre
     assert.equal(historyText.includes('"operation":"lookup"'), false);
     assert.match(upstream.bodies[0].messages.at(-1).content, /lookup/);
     assert.match(upstream.bodies[0].messages.at(-1).content, /"recovery":"locator"/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /DeepSeek Responses API compaction/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /ws_call_id=ws_native_search/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /unavailable-native-page/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /page_fetch_failed/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /DeepSeek Codex integration/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /agent_integrations\/codex/);
+    assert.match(upstream.bodies[0].messages.at(-1).content, /src\/native-compact\.js/);
     assert.equal(upstream.bodies[0].messages.at(-1).content.includes('empty_prior_source'), false);
     assert.match(historyText, /67 tests passed/);
     assert.match(historyText, /Verified the shared compact bridge behavior/);
@@ -379,7 +428,10 @@ test('compact requests reduce historical protocol to inert evidence through stre
     assert.equal(historyText.includes('Representative source content'), false);
     assert.equal(historyText.includes('anchor truncated'), false);
     assert.equal(historyText.includes('<|DSML|tool_calls>'), false);
+    assert.match(historyText, /DeepSeek Responses API compaction/);
+    assert.match(historyText, /Failed to open page/);
     assert.match(upstream.bodies[1].messages.at(-1).content, /retention priority/);
+    assert.match(upstream.bodies[1].messages.at(-1).content, /DeepSeek Codex integration/);
 
     const invalid = await requestCompact(gateway.url, {
       ...compactBody(),
@@ -827,6 +879,22 @@ test('compact diagnostics report cache effectiveness and client cancellation abo
       history: [
         { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Measure compact cache usage.' }] },
         { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Historical analysis already consumed. '.repeat(500) }] },
+        {
+          type: 'web_search_call',
+          id: 'ws_diagnostic',
+          status: 'completed',
+          action: { type: 'search', queries: ['compact diagnostics'] },
+        },
+        {
+          type: 'message',
+          id: 'msg_diagnostic_citation',
+          role: 'assistant',
+          content: [{
+            type: 'output_text',
+            text: 'Cited diagnostic source.',
+            annotations: [{ type: 'url_citation', title: 'Diagnostic source', url: 'https://example.com/diagnostic' }],
+          }],
+        },
       ],
     }));
     assert.equal(completedRun.status, 200);
@@ -873,6 +941,9 @@ test('compact diagnostics report cache effectiveness and client cancellation abo
     assert.equal(completed.fixed_prefix_tokens > completed.estimated_installed_tokens, true);
     assert.equal(completed.window_reduction > 10, true);
     assert.equal(completed.prior_checkpoint, 'none');
+    assert.equal(completed.responses_item_evidence, 2);
+    assert.equal(completed.responses_web_search_calls, 1);
+    assert.equal(completed.responses_url_citations, 1);
     assert.equal(diagnostics.some((entry) => entry.turn_id === 'turn_disconnect' && entry.status === 'aborted'), true);
   } finally {
     clientRequest?.destroy();

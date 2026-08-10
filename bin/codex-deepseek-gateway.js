@@ -8,11 +8,12 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig } from '../src/config.js';
+import { DEFAULT_UPSTREAM_WIRE_API, loadConfig } from '../src/config.js';
 import { newConversation } from '../src/codex-launch.js';
 import { DEFAULT_SESSION_LIMIT, sessions } from '../src/codex-sessions.js';
 import {
@@ -269,6 +270,21 @@ function readProcessRecord(installDir) {
   return readRuntimeRecord(pidPath(installDir));
 }
 
+function ensureLocalConfigDefaults(installDir) {
+  const localConfig = configPath(installDir);
+  if (!existsSync(localConfig)) {
+    copyFileSync(join(ROOT, 'config', 'gateway.example.json'), localConfig);
+    return;
+  }
+  const parsed = JSON.parse(readFileSync(localConfig, 'utf8').replace(/^\uFEFF/, ''));
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${localConfig} must contain a JSON object`);
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, 'upstreamWireApi')) return;
+  parsed.upstreamWireApi = DEFAULT_UPSTREAM_WIRE_API;
+  writeFileSync(localConfig, `${JSON.stringify(parsed, null, 2)}\n`);
+}
+
 function copyRuntime(installDir) {
   mkdirSync(join(installDir, 'bin'), { recursive: true });
   mkdirSync(join(installDir, 'src'), { recursive: true });
@@ -286,10 +302,7 @@ function copyRuntime(installDir) {
   cpSync(join(ROOT, 'config', 'frontend-design-guidance'), join(installDir, 'config', 'frontend-design-guidance'), { recursive: true });
   rmSync(join(installDir, 'config', 'codex-model-catalog.base.json'), { force: true });
   rmSync(join(installDir, 'config', 'model-aliases.json'), { force: true });
-  const localConfig = configPath(installDir);
-  if (!existsSync(localConfig)) {
-    copyFileSync(join(ROOT, 'config', 'gateway.example.json'), localConfig);
-  }
+  ensureLocalConfigDefaults(installDir);
 }
 
 function openConfig(file) {

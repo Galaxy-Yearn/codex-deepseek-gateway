@@ -6,6 +6,7 @@ import { modelAliasesFromCatalog, readModelCatalog } from './model-catalog.js';
 const DEEPSEEK_REASONING_EFFORTS = new Set(['none', 'low', 'high', 'max']);
 const DEPRECATED_MODEL_PATTERN = /^deepseek-(?:chat|reasoner)$/;
 const DEFAULT_MODEL_CATALOG_FILE = new URL('../config/model-catalog.json', import.meta.url);
+export const NATIVE_RESPONSES_MODEL = 'deepseek-v4-flash';
 
 export const DEFAULT_MODEL_ALIASES = modelAliasesFromCatalog(readModelCatalog(DEFAULT_MODEL_CATALOG_FILE));
 
@@ -64,6 +65,11 @@ export function resolveModelAlias(requestedModel, config = {}) {
   };
 }
 
+export function supportsNativeResponsesModel(requestedModel, config = {}) {
+  if ((config.upstreamProvider || 'deepseek') !== 'deepseek') return true;
+  return resolveModelAlias(requestedModel, config).upstreamModel === NATIVE_RESPONSES_MODEL;
+}
+
 function validateDeepSeekReasoningEffort(effort) {
   if (effort == null) return undefined;
   if (DEEPSEEK_REASONING_EFFORTS.has(effort)) return effort;
@@ -91,8 +97,10 @@ export function deepseekReasoningPayload({ alias, reasoning } = {}) {
 export function listModels(config = {}) {
   const aliases = isObject(config.modelAliases) ? config.modelAliases : {};
   const configuredModels = Array.isArray(config.upstreamModels) ? config.upstreamModels : [];
+  const nativeResponses = config.upstreamWireApi === 'responses' && (config.upstreamProvider || 'deepseek') === 'deepseek';
   return [...new Set([...Object.keys(aliases), ...configuredModels])]
     .filter((id) => id && !isDeprecatedModel(id))
+    .filter((id) => !nativeResponses || supportsNativeResponsesModel(id, config))
     .sort()
     .map((id) => ({
       id,
