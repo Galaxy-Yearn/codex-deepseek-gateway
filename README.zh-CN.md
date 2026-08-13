@@ -2,22 +2,26 @@
 
 [English](README.md) | 简体中文
 
-一个让 Codex 使用 DeepSeek 模型、同时保留 Codex 工作流的轻量级本地网关。Codex 继续发送 OpenAI `Responses API` 请求。默认情况下，网关将请求映射到 DeepSeek 兼容的 `Chat Completions` 并转换结果；也可以直接按 DeepSeek 官方兼容的 Responses 格式转发。工具、reasoning、流式输出和会话恢复都能照常工作，工具执行、历史与恢复仍由 Codex 管理。
+轻量级本地网关，让 Codex 使用 DeepSeek，同时保留 Codex 的 agent 工作流。默认将 Responses 请求桥接到 Chat Completions，也可透传 DeepSeek 原生 Responses JSON/SSE；工具执行、历史和会话恢复仍由 Codex 管理。
 
-```mermaid
-%%{init: {"theme": "base", "flowchart": {"nodeSpacing": 12, "rankSpacing": 12, "padding": 4}, "themeVariables": {"fontSize": "14px", "primaryTextColor": "#000000", "primaryBorderColor": "#333333", "lineColor": "#666666", "mainBkg": "#ffffff", "nodeBorder": "#333333", "edgeLabelBackground": "transparent"}, "themeCSS": ".edgeLabel rect { fill: transparent !important; stroke: none !important; } .edgeLabel { background-color: transparent !important; }"}}%%
-flowchart TB
-    A["Codex<br/>/v1/responses"] --> B["wire API"]
-    B -->|chat_completions<br/>默认| C["网关<br/>规范化"]
-    C --> D["DeepSeek<br/>/chat/completions"]
-    D --> E["网关<br/>JSON/SSE 映射"]
-    E --> F["Codex Responses<br/>items/events"]
-    B -->|responses| G["DeepSeek<br/>/responses"]
-    G --> H["原生 JSON/SSE<br/>透传"]
-    H --> F
-
-    classDef node fill:#ffffff,stroke:#333333,stroke-width:3px,color:#000000,font-size:14px;
-    class A,B,C,D,E,F,G,H node;
+```text
+Codex /v1/responses
+        |
+        v
+     网关 wire API
+       |              \
+       |               \-- responses ------> DeepSeek /responses
+       v                                      |
+chat_completions                              \-- 原生 JSON/SSE
+       |
+       v
+网关规范化 -> DeepSeek /chat/completions
+                              |
+                              v
+                       网关 JSON/SSE 映射
+                              |
+                              v
+                    Codex Responses items/events
 ```
 
 核心优势包括：

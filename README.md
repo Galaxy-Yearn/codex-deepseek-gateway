@@ -2,22 +2,26 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A lightweight local gateway that lets Codex use DeepSeek models while preserving the Codex workflow. Codex continues to send OpenAI `Responses API` requests. By default, the gateway maps them to DeepSeek-compatible `Chat Completions` and converts the results back; optionally, it forwards requests in DeepSeek's official Responses-compatible format. Tools, reasoning, streaming, and session replay keep working while tool execution, history, and resume remain owned by Codex.
+A lightweight local gateway that connects Codex to DeepSeek while preserving Codex's agent workflow. It bridges Responses requests to Chat Completions by default or forwards native Responses JSON/SSE, while Codex retains tools, history, execution, and session resume.
 
-```mermaid
-%%{init: {"theme": "base", "flowchart": {"nodeSpacing": 12, "rankSpacing": 12, "padding": 4}, "themeVariables": {"fontSize": "14px", "primaryTextColor": "#000000", "primaryBorderColor": "#333333", "lineColor": "#666666", "mainBkg": "#ffffff", "nodeBorder": "#333333", "edgeLabelBackground": "transparent"}, "themeCSS": ".edgeLabel rect { fill: transparent !important; stroke: none !important; } .edgeLabel { background-color: transparent !important; }"}}%%
-flowchart TB
-    A["Codex<br/>/v1/responses"] --> B["wire API"]
-    B -->|chat_completions<br/>default| C["Gateway<br/>normalize"]
-    C --> D["DeepSeek<br/>/chat/completions"]
-    D --> E["Gateway<br/>JSON/SSE map"]
-    E --> F["Codex Responses<br/>items/events"]
-    B -->|responses| G["DeepSeek<br/>/responses"]
-    G --> H["Native JSON/SSE<br/>pass-through"]
-    H --> F
-
-    classDef node fill:#ffffff,stroke:#333333,stroke-width:3px,color:#000000,font-size:14px;
-    class A,B,C,D,E,F,G,H node;
+```text
+Codex /v1/responses
+        |
+        v
+   Gateway wire API
+     |             \
+     |              \-- responses ------> DeepSeek /responses
+     v                                      |
+chat_completions                            \-- native JSON/SSE
+     |
+     v
+Gateway normalize -> DeepSeek /chat/completions
+                              |
+                              v
+                       Gateway JSON/SSE map
+                              |
+                              v
+                    Codex Responses items/events
 ```
 
 Core strengths include:

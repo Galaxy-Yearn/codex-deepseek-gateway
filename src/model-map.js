@@ -6,7 +6,7 @@ import { modelAliasesFromCatalog, readModelCatalog } from './model-catalog.js';
 const DEEPSEEK_REASONING_EFFORTS = new Set(['none', 'low', 'high', 'max']);
 const DEPRECATED_MODEL_PATTERN = /^deepseek-(?:chat|reasoner)$/;
 const DEFAULT_MODEL_CATALOG_FILE = new URL('../config/model-catalog.json', import.meta.url);
-export const NATIVE_RESPONSES_MODEL = 'deepseek-v4-flash';
+const NATIVE_RESPONSES_MODELS = new Set(['deepseek-v4-flash', 'deepseek-v4-pro']);
 
 export const DEFAULT_MODEL_ALIASES = modelAliasesFromCatalog(readModelCatalog(DEFAULT_MODEL_CATALOG_FILE));
 
@@ -67,7 +67,7 @@ export function resolveModelAlias(requestedModel, config = {}) {
 
 export function supportsNativeResponsesModel(requestedModel, config = {}) {
   if ((config.upstreamProvider || 'deepseek') !== 'deepseek') return true;
-  return resolveModelAlias(requestedModel, config).upstreamModel === NATIVE_RESPONSES_MODEL;
+  return NATIVE_RESPONSES_MODELS.has(resolveModelAlias(requestedModel, config).upstreamModel);
 }
 
 function validateDeepSeekReasoningEffort(effort) {

@@ -1,6 +1,6 @@
 {
   "name": "@galaxy-yearn/codex-deepseek-gateway",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Local OpenAI Codex Responses API gateway for DeepSeek Chat Completions and native Responses.",
   "type": "module",
   "main": "src/server.js",

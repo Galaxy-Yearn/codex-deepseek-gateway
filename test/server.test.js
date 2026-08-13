@@ -483,12 +483,12 @@ test('native Responses upstream mode', async () => {
     const plain = await fetch(`${proxyUrl}/v1/responses`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(request),
+      body: JSON.stringify({ ...request, model: 'deepseek-v4-pro' }),
     });
     assert.equal(plain.status, 200);
     assert.deepEqual(await plain.json(), {
       id: 'resp_native',
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4-pro',
       status: 'completed',
       output: [],
       output_text: 'native path',
@@ -515,7 +515,7 @@ test('native Responses upstream mode', async () => {
 
     const models = await fetch(`${proxyUrl}/v1/models`);
     assert.equal(models.status, 200);
-    assert.deepEqual((await models.json()).data.map((model) => model.id), ['deepseek-v4-flash']);
+    assert.deepEqual((await models.json()).data.map((model) => model.id), ['deepseek-v4-flash', 'deepseek-v4-pro']);
 
     const providerError = await fetch(`${proxyUrl}/v1/responses`, {
       method: 'POST',

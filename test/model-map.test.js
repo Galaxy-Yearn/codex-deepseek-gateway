@@ -168,7 +168,7 @@ test('reasoning and model catalog mapping', async () => {
     upstreamWireApi: 'responses',
     modelAliases: DEFAULT_MODEL_ALIASES,
   });
-  assert.deepEqual(nativeListed.map((model) => model.id), ['deepseek-v4-flash']);
+  assert.deepEqual(nativeListed.map((model) => model.id), ['deepseek-v4-flash', 'deepseek-v4-pro']);
 
   const merged = mergeModelLists(
     [{ id: 'z-model', source: 'first' }, { id: 'a-model' }],
