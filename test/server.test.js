@@ -1759,8 +1759,9 @@ test('non-streaming web-search orchestration and compatibility', async () => {
     assert.equal(body.output.some((item) => item.type === 'function_call' && item.name === 'unknown_local_tool'), false);
     const debugLines = (await readFile(debugPath, 'utf8')).trim().split(/\r?\n/);
     const debugEntries = debugLines.map((line) => JSON.parse(line.replace(/^\[codex-deepseek-gateway\] upstream request /, '')));
-    const round = debugEntries.find((entry) => entry.stage === 'web_search_round_0');
+    const round = debugEntries.find((entry) => entry.stage === 'routing_round_0');
     assert.ok(round);
+    assert.equal(debugLines.some((line) => line.startsWith('[codex-deepseek-gateway] web search usage ')), false);
     assert.equal(round.session_id, 'session_debug');
     assert.equal(round.thread_id, 'thread_debug');
     assert.equal(round.turn_id, 'turn_debug');

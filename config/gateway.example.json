@@ -1,6 +1,11 @@
 {
   "upstreamApiKey": "sk-REPLACE_ME",
   "upstreamWireApi": "chat_completions",
+  "visionEnabled": false,
+  "visionApiKey": "",
+  "visionBaseUrl": "https://api.moonshot.cn/v1",
+  "visionModel": "kimi-k3",
+  "visionReasoningEffort": "high",
   "codexPromptLanguage": "en",
   "tavilyApiKey": "",
   "tavilyWebSearchEnabled": false,

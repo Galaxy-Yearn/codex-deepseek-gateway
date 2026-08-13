@@ -2,37 +2,43 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A lightweight local gateway that lets Codex run on DeepSeek models, with an experience nearly identical to the native GPT models. Codex keeps speaking the OpenAI `Responses API`; the gateway translates each request into DeepSeek-compatible `Chat Completions` and translates the result back, so tools, reasoning, streaming, and session replay all keep working.
+A lightweight local gateway that lets Codex use DeepSeek models while preserving the Codex workflow. Codex continues to send OpenAI `Responses API` requests. By default, the gateway maps them to DeepSeek-compatible `Chat Completions` and converts the results back; optionally, it forwards requests in DeepSeek's official Responses-compatible format. Tools, reasoning, streaming, and session replay keep working while tool execution, history, and resume remain owned by Codex.
 
-```text
-Codex /v1/responses
-  -> request normalization and mapping
-  -> DeepSeek /chat/completions
-  -> JSON / SSE normalization and mapping
-  -> Codex Responses items and events
+```mermaid
+%%{init: {"theme": "base", "flowchart": {"nodeSpacing": 12, "rankSpacing": 12, "padding": 4}, "themeVariables": {"fontSize": "14px", "primaryTextColor": "#000000", "primaryBorderColor": "#333333", "lineColor": "#666666", "mainBkg": "#ffffff", "nodeBorder": "#333333", "edgeLabelBackground": "transparent"}, "themeCSS": ".edgeLabel rect { fill: transparent !important; stroke: none !important; } .edgeLabel { background-color: transparent !important; }"}}%%
+flowchart TB
+    A["Codex<br/>/v1/responses"] --> B["wire API"]
+    B -->|chat_completions<br/>default| C["Gateway<br/>normalize"]
+    C --> D["DeepSeek<br/>/chat/completions"]
+    D --> E["Gateway<br/>JSON/SSE map"]
+    E --> F["Codex Responses<br/>items/events"]
+    B -->|responses| G["DeepSeek<br/>/responses"]
+    G --> H["Native JSON/SSE<br/>pass-through"]
+    H --> F
+
+    classDef node fill:#ffffff,stroke:#333333,stroke-width:3px,color:#000000,font-size:14px;
+    class A,B,C,D,E,F,G,H node;
 ```
+
+Core strengths include:
+
+- Codex tools, including parallel calls and tools revealed during a session through `tool_search`.
+- A packaged model catalog that registers DeepSeek models and reasoning levels with Codex, enabling `/model` switching and features that validate model names, such as native sub-agents.
+- High cache hit rates: request construction is tuned for DeepSeek context caching to reduce cost and response latency in multi-turn sessions.
+- Web search: optional Tavily and Firecrawl backends support Codex web-search requests.
+- Vision bridging: Codex image attachments and `view_image` results are converted into reusable text reports for DeepSeek.
+- Tuned system prompts: bilingual system prompts and personalities adapted for DeepSeek.
+- Stronger compaction that produces a schema-validated checkpoint from bridged Chat or native Responses history, with a deterministic trusted fallback when compaction cannot complete safely.
 
 Package: [@galaxy-yearn/codex-deepseek-gateway](https://www.npmjs.com/package/@galaxy-yearn/codex-deepseek-gateway)
 
 ## Requirements
 
 - [Node.js](https://nodejs.org/en/download) 22 or newer
-- A [DeepSeek API key](https://platform.deepseek.com/api_keys)
+- [DeepSeek API key](https://platform.deepseek.com/api_keys)
 - [Codex CLI](https://developers.openai.com/codex) 0.144.0 or newer
 
-## Project Highlights
-
-The core goal is to keep DeepSeek as close to native GPT behavior in Codex as possible: the same workflow and session lifecycle, every Codex tool usable from DeepSeek (including parallel calls and tools revealed mid-session via `tool_search`), and live progress notes while tools run. Tool execution, history, and resume stay entirely owned by Codex.
-
-On top of that, the gateway adds:
-
-- A replacement model list: the bundled catalog registers the DeepSeek models and reasoning levels with Codex, so `/model` switches between them and features that validate model names, such as native sub-agents, keep working.
-- Very high cache hit rate: request construction is tuned for DeepSeek's context caching, so multi-turn sessions hit the cache at a very high rate, cutting cost and response latency.
-- Web search: optional Tavily and Firecrawl backends make Codex web-search requests actually work.
-- Tuned system prompts: bilingual system prompts and personalities adapted for DeepSeek.
-- Stronger compaction: the gateway projects both bridged Chat history and native Responses history into inert semantic evidence, asks DeepSeek for one schema-validated checkpoint, and installs a compact execution and working-memory state. Invalid output, provider failure, timeout, or authority failure falls back to deterministic trusted state instead of stalling the session.
-
-## Install, Start, and Check
+## Install
 
 Install the package and copy the runtime into `~/.codex/deepseek-gateway`:
 
@@ -51,24 +57,7 @@ Put your DeepSeek API key in `~/.codex/deepseek-gateway/config/gateway.local.jso
 }
 ```
 
-`install` never overwrites existing settings in `gateway.local.json`; when upgrading an older install it adds the missing `upstreamWireApi` key with the backwards-compatible `chat_completions` default. Start the gateway and check it:
-
-```sh
-codex-deepseek-gateway start
-codex-deepseek-gateway status
-```
-
-`status` should show `Gateway status: HEALTHY`.
-
-Use these commands and diagnostics to operate and inspect the installed gateway:
-
-- `codex-deepseek-gateway status` — performs a fast local health check. `HEALTHY` means the installed, running, and CLI versions agree, the recorded process is authenticated, and its actual local API endpoint is reachable.
-- `codex-deepseek-gateway doctor` — extends the status check across the complete Codex → gateway → DeepSeek path, including configuration, listener security, provider setup, bilingual catalog alignment, `/v1/models`, DeepSeek authentication, reasoning cache, and optional web backends. It reports `OK`, `WARNING`, or `FAIL` with a direct fix, and never sends a completion or calls Tavily/Firecrawl.
-- `codex-deepseek-gateway stop` — gracefully stops the recorded gateway instance after authenticating it. It refuses to terminate a process whose identity cannot be verified.
-- `codex-deepseek-gateway stop --force` — forcibly stops the recorded PID. Use it only after checking `~/.codex/deepseek-gateway/gateway.pid` and confirming that the process belongs to this gateway installation.
-- Debug log — set `"debugPayload": true` in `gateway.local.json` to write per-request mapping and orchestration summaries to `~/.codex/deepseek-gateway/gateway.debug.log`. It helps diagnose request conversion, model/reasoning mapping, tools, streaming, web search, and compaction without changing gateway behavior. The log rotates at 5 MB; install and upgrade preserve existing logs, and old files can be deleted manually.
-
-Both `status` and `doctor` accept `--json` for stable structured output. Restart the gateway after changing `gateway.local.json` by running `stop` and then `start`. Repeated compact fallback diagnostics or request-boundary errors right after an upgrade usually mean the session was open during the upgrade; exit and reopen the session (see Upgrade).
+`install` never overwrites existing settings in `gateway.local.json`; when upgrading an older install it adds the missing `upstreamWireApi` key with the backwards-compatible `chat_completions` default.
 
 ## Configure the Codex Provider
 
@@ -100,6 +89,27 @@ Then run `codex` normally. Use `model-catalog.zh.json` in the path for the Chine
 
 To keep another provider as your normal Codex default, leave its top-level `model_provider`, `model`, and related settings unchanged. The `codex-deepseek-gateway new` and `sessions` commands need only the `deepseek-gateway` provider block above; for that Codex process they inject the selected provider, model, reasoning effort, reasoning-summary settings, and packaged `model_catalog_json`. This lets the gateway coexist with another provider without replacing your default Codex configuration.
 
+## Start and Check
+
+Start the gateway and check it:
+
+```sh
+codex-deepseek-gateway start
+codex-deepseek-gateway status
+```
+
+`status` should show `Gateway status: HEALTHY`.
+
+Use these commands and diagnostics to operate and inspect the installed gateway:
+
+- `codex-deepseek-gateway status` — performs a fast local health check. `HEALTHY` means the installed, running, and CLI versions agree, the recorded process is authenticated, and its actual local API endpoint is reachable.
+- `codex-deepseek-gateway doctor` — extends the status check across the complete Codex → gateway → DeepSeek path, including configuration, listener security, provider setup, bilingual catalog alignment, `/v1/models`, DeepSeek authentication, reasoning cache, and optional web backends. It reports `OK`, `WARNING`, or `FAIL` with a direct fix, and never sends a completion or calls Tavily/Firecrawl.
+- `codex-deepseek-gateway stop` — gracefully stops the recorded gateway instance after authenticating it. It refuses to terminate a process whose identity cannot be verified.
+- `codex-deepseek-gateway stop --force` — forcibly stops the recorded PID. Use it only after checking `~/.codex/deepseek-gateway/gateway.pid` and confirming that the process belongs to this gateway installation.
+- Debug log — set `"debugPayload": true` in `gateway.local.json` to write per-request mapping and orchestration summaries to `~/.codex/deepseek-gateway/gateway.debug.log`. It helps diagnose request conversion, model/reasoning mapping, tools, streaming, web search, and compaction without changing gateway behavior. The log rotates at 5 MB; install and upgrade preserve existing logs, and old files can be deleted manually.
+
+Both `status` and `doctor` accept `--json` for stable structured output. Restart the gateway after changing `gateway.local.json` by running `stop` and then `start`. Repeated compact fallback diagnostics or request-boundary errors right after an upgrade usually mean the session was open during the upgrade; exit and reopen the session (see Upgrade).
+
 ## Use with Codex
 
 For the launcher path, start Codex with:
@@ -110,8 +120,6 @@ codex-deepseek-gateway sessions  # pick and resume a session from the current pr
 ```
 
 Both commands launch Codex with the provider overrides described above and load the packaged model catalog: the DeepSeek models, system prompts, reasoning levels, and personalities that ship with the gateway.
-
-Without options, `new` asks for a model, then a DeepSeek reasoning level. `sessions` shows a session picker first (Up/Down to browse, `n` to start a new conversation instead), then model and reasoning level.
 
 Useful non-interactive forms:
 
@@ -134,7 +142,7 @@ The gateway keeps its existing Responses-to-Chat bridge by default. To send `/v1
 }
 ```
 
-`chat_completions` is the default and continues to provide the gateway's existing reasoning cache, apply-patch compatibility, and optional local Web Search loop. `responses` keeps the gateway-owned model catalog and compact harness, while forwarding every other Responses request and native JSON/SSE event directly to DeepSeek. During gateway-owned compaction, native reasoning, function/custom calls, `web_search_call` metadata, failures, and returned URL citations are projected into the same bounded evidence inventory; the gateway does not invent search results that the provider did not return. Provider capability validation, including unsupported tool types, is left to DeepSeek's official Responses endpoint. `/v1/chat/completions` remains a Chat Completions pass-through in either mode.
+`chat_completions` is the default and provides the reasoning cache, apply-patch compatibility, and optional local Web Search loop. `responses` retains the packaged catalog and compaction handling while forwarding other Responses requests and native JSON/SSE events directly to DeepSeek. `/v1/chat/completions` remains a pass-through in either mode.
 
 ### Language
 
@@ -172,11 +180,24 @@ codex -c 'model_reasoning_effort="none"'
 
 DeepSeek's chain of thought is shown in full in the Codex TUI, and the raw `reasoning_content` is preserved for model history.
 
-The packaged catalog declares a 1M-token context window and leaves automatic compaction to Codex's default policy. To override the threshold, set `model_auto_compact_token_limit` in `~/.codex/config.toml` or pass `codex -c 'model_auto_compact_token_limit=...'`. When a request sets no output limit, the catalog leaves about 100K as the default DeepSeek output budget (`upstreamMaxTokens` overrides it). The catalog also registers the models and reasoning levels with Codex, so features that validate model names, such as native sub-agents, accept the DeepSeek models.
+## Vision (Optional)
+
+Vision is off until an API key is configured. The gateway uses a separate OpenAI-compatible vision endpoint to turn Codex image inputs into text evidence for DeepSeek. The recommended and default vision model is `kimi-k3`.
+
+```json
+{
+  "visionEnabled": true,
+  "visionApiKey": "..."
+}
+```
+
+Codex local attachments become reusable `Vision report` text on the first model request; DeepSeek receives reports instead of historical image data. `view_image` output and direct API images use the same adapter. Images and reports are not persisted.
 
 ## Web Search (Optional)
 
-Web search is off by default. Create a [Tavily API key](https://app.tavily.com/home), then enable search:
+The local Web Search loop is available only with `upstreamWireApi: "chat_completions"`: Tavily performs searches, and optional Firecrawl support adds page reading. In `responses` mode, the gateway instead forwards DeepSeek's native Responses web-search tools and events. The local feature is off by default and provides text evidence only.
+
+Create a [Tavily API key](https://app.tavily.com/home), then enable search:
 
 ```json
 {
@@ -194,19 +215,15 @@ If you also want opened-page reading, create a [Firecrawl API key](https://www.f
 }
 ```
 
-With `upstreamWireApi: "chat_completions"`, Codex `web_search` / `web_search_preview` requests are executed through Tavily. With Firecrawl configured, searches are enriched with useful page text, and DeepSeek can open known pages or find text inside them. With `upstreamWireApi: "responses"`, the gateway does not run this local loop; it forwards DeepSeek's native Responses `web_search` tool and its native `response.web_search_call.*` events. Per-turn limits apply only to the Chat Completions bridge. This feature is text-only; see [Limits](#limits) for its scope.
-
 ## Upgrade
 
-Exit all running Codex sessions before you upgrade. A session left open across a gateway upgrade may use the deterministic compact fallback or fail at an incompatible request boundary until the session is reopened.
+Exit all running Codex sessions before upgrading, then run:
 
 ```sh
 codex-deepseek-gateway update
 ```
 
-`update` requires an installed gateway with an API key configured. It stops the gateway, installs and runs the latest npm package, preserves your `gateway.local.json` settings while adding any missing compatibility defaults, reinstalls the local runtime, then runs `status` and `doctor` to verify the version, process identity, health, and configuration. Once it completes, start your Codex sessions again with `codex-deepseek-gateway new` or `codex-deepseek-gateway sessions`.
-
-Interactive `codex-deepseek-gateway` commands check npm for a newer version and suggest `codex-deepseek-gateway update` when one is available. The check is skipped for non-interactive use and never causes the original command to fail.
+`update` preserves `gateway.local.json`, updates the package and local runtime, then runs `status` and `doctor`. Reopen Codex sessions after it completes. Interactive commands also suggest `update` when a newer version is available; non-interactive calls skip this check.
 
 ## Uninstall
 
@@ -246,6 +263,19 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
   "upstreamBaseUrl": "https://api.deepseek.com",
   "upstreamWireApi": "chat_completions",
   "upstreamMaxTokens": 0,
+  "visionEnabled": false,
+  "visionApiKey": "",
+  "visionBaseUrl": "https://api.moonshot.cn/v1",
+  "visionModel": "kimi-k3",
+  "visionReasoningEffort": "high",
+  "visionTimeoutMs": 120000,
+  "visionMaxImages": 16,
+  "visionMaxImageBytes": 25165824,
+  "visionMaxTotalImageBytes": 41943040,
+  "visionMaxReportChars": 64000,
+  "visionMaxCompletionTokens": 131072,
+  "visionCacheTtlMs": 21600000,
+  "visionCacheMaxEntries": 128,
   "host": "127.0.0.1",
   "port": 3000,
   "codexPromptLanguage": "en",
@@ -266,6 +296,11 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
 - `upstreamBaseUrl` — DeepSeek API endpoint; see the [DeepSeek API documentation](https://api-docs.deepseek.com/).
 - `upstreamWireApi` — `/v1/responses` upstream protocol, `chat_completions` by default or native `responses`; `/v1/chat/completions` remains a Chat pass-through in either mode.
 - `upstreamMaxTokens` — cap on DeepSeek output tokens; `0` uses the catalog's default ~100K budget.
+- `visionEnabled`, `visionApiKey` — enable Codex image bridging and provide the vision endpoint API key (`VISION_API_KEY` or `MOONSHOT_API_KEY` also works). The example keeps this disabled until a key is configured.
+- `visionBaseUrl`, `visionModel` — OpenAI-compatible vision API base URL and model; image input uses base64 Data URLs because public image URLs are not supported.
+- `visionReasoningEffort` — vision reasoning effort, `high` by default and configurable as `low`, `high`, or `max`.
+- `visionTimeoutMs`, `visionMaxImages`, `visionMaxImageBytes`, `visionMaxTotalImageBytes`, `visionMaxReportChars`, `visionMaxCompletionTokens` — configurable timeout, image, report, and completion limits.
+- `visionCacheTtlMs`, `visionCacheMaxEntries` — bounded in-memory cache for successful reports. Replayed attachments and replays of the same tool output reuse their reports; a new `view_image` call ID requests a fresh observation. Images and reports are not persisted.
 - `host`, `port` — gateway listen address.
 - `codexPromptLanguage` — catalog and picker language injected by the launcher; plain `codex` uses its configured `model_catalog_json`; see [Language](#language).
 - `compactReasoningEffort` — thinking effort used for compaction, `high` by default; `max` remains available.

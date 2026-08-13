@@ -44,6 +44,7 @@ import {
   invalidApplyPatchToolCalls,
 } from './apply-patch-bridge.js';
 import { ReasoningCache } from './reasoning-cache.js';
+import { createVisionReportCache, prepareVisionMessages, prepareVisionResponsesRequest } from './vision.js';
 import {
   closeServerGracefully,
   connectHttpUrl,
@@ -347,6 +348,19 @@ function debugRequestIdentity(context = {}) {
   };
 }
 
+function visionRequestScope(context = {}) {
+  const identity = debugRequestIdentity(context);
+  if (identity.thread_id) return `thread:${identity.thread_id}`;
+  if (identity.session_id) return `session:${identity.session_id}`;
+  if (identity.prompt_cache_key) return `prompt:${identity.prompt_cache_key}`;
+  const input = Array.isArray(context.rawRequest?.input) ? context.rawRequest.input : [];
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const turnId = firstString(input[index]?.internal_chat_message_metadata_passthrough?.turn_id);
+    if (turnId) return `turn:${turnId}`;
+  }
+  return identity.turn_id ? `turn:${identity.turn_id}` : '';
+}
+
 function logDebugPayload(config, request, context = {}) {
   if (!config.debugPayload) return;
   const summary = {
@@ -526,7 +540,7 @@ function logWebSearchUsage(config, stage, usages, finalUsage, web, context = {})
     web.failures ||
     Object.values(web.counts || {}).some((value) => Number(value) > 0)
   ));
-  if (!aggregateUsage && !finalUsage && !hasWebActivity) return;
+  if (!hasWebActivity) return;
   writeDebugPayloadLine(config, `[codex-deepseek-gateway] web search usage ${JSON.stringify({
     ...debugRequestIdentity(context),
     stage,
@@ -753,7 +767,7 @@ function writeNativeResponsesFailure(res, error) {
     type: 'response.failed',
     response: {
       status: 'failed',
-      error: { code: 'upstream_error', message: String(error?.message || 'upstream response failed') },
+      error: { code: error?.code || 'upstream_error', message: String(error?.message || 'upstream response failed') },
     },
   };
   if (!res.headersSent) {
@@ -768,11 +782,21 @@ function writeNativeResponsesFailure(res, error) {
   res.end();
 }
 
-async function handleNativeResponses({ request, requestHeaders, config, res, clientSignal }) {
+async function handleNativeResponses({ request, requestHeaders, config, res, clientSignal, visionReportCache }) {
   let upstreamRequest;
   try {
-    upstreamRequest = toProviderResponsesRequest(request, config);
+    const visionRequest = (config.upstreamProvider || 'deepseek') === 'deepseek'
+      ? await prepareVisionResponsesRequest(request, config, clientSignal, {
+        reportCache: visionReportCache,
+        scope: visionRequestScope({ rawRequest: request, requestHeaders }),
+      })
+      : request;
+    upstreamRequest = toProviderResponsesRequest(visionRequest, config);
   } catch (error) {
+    if (request.stream) {
+      writeNativeResponsesFailure(res, error);
+      return true;
+    }
     const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 400;
     sendJson(res, statusCode, { error: { code: error.code, message: error.message || 'Invalid Responses request' } });
     return true;
@@ -845,6 +869,7 @@ async function runWebSearchChatLoop({ rawRequest, requestHeaders, normalized, ch
   let finalCompletion = null;
   let finalResponse = null;
   let incompleteReason = null;
+  let webSearchStarted = false;
   const maxRounds = maxWebSearchRounds(searchConfig);
   const roundLimit = state.enabled ? maxRounds : APPLY_PATCH_CORRECTION_LIMIT;
   const applyPatchEnabled = chatToolsIncludeApplyPatch(currentChatRequest.tools);
@@ -863,7 +888,9 @@ async function runWebSearchChatLoop({ rawRequest, requestHeaders, normalized, ch
     const upstreamRequest = toWebSearchUpstreamRequest(currentChatRequest, config, webTools);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
     logDebugPayload(config, upstreamRequest, {
-      stage: disableWebTools ? 'web_search_tools_disabled' : 'apply_patch_final_round',
+      stage: disableWebTools
+        ? (state.enabled && webSearchStarted ? 'web_search_tools_disabled' : 'routing_tools_disabled')
+        : 'apply_patch_final_round',
       rawRequest,
       requestHeaders,
       normalized,
@@ -891,7 +918,7 @@ async function runWebSearchChatLoop({ rawRequest, requestHeaders, normalized, ch
     const upstreamRequest = toWebSearchUpstreamRequest(currentChatRequest, config, webTools);
     if (!upstreamRequest.model) upstreamRequest.model = config.upstreamModel || currentChatRequest.model;
     logDebugPayload(config, upstreamRequest, {
-      stage: `${state.enabled ? 'web_search' : 'apply_patch'}_round_${round}`,
+      stage: `${state.enabled && webSearchStarted ? 'web_search' : state.enabled ? 'routing' : 'apply_patch'}_round_${round}`,
       rawRequest,
       requestHeaders,
       normalized,
@@ -980,6 +1007,7 @@ async function runWebSearchChatLoop({ rawRequest, requestHeaders, normalized, ch
       onSearchStart,
       onSearchDone,
     });
+    webSearchStarted = true;
     searches.push(...toolResult.searches);
     openedPages.push(...(toolResult.openedPages || []));
     noteWebSearchModelContinuation(webState, toolResult.hadProviderFailure);
@@ -1231,6 +1259,7 @@ async function runStreamingWebSearchTurn({ rawRequest, requestHeaders, normalize
     lastRoundValid: false,
     errorCategories: new Set(),
   };
+  let webSearchStarted = false;
 
   const buildUpstreamRequest = (stage) => {
     const upstreamRequest = toWebSearchUpstreamRequest(currentChatRequest, config, webTools);
@@ -1246,7 +1275,7 @@ async function runStreamingWebSearchTurn({ rawRequest, requestHeaders, normalize
   };
 
   const streamStage = state.enabled ? 'web_search_stream' : 'apply_patch_stream';
-  const firstUpstreamRequest = buildUpstreamRequest(`${streamStage}_round_0`);
+  const firstUpstreamRequest = buildUpstreamRequest(`${state.enabled ? 'routing_stream' : streamStage}_round_0`);
   let upstreamResponse = await callChatCompletions({
     baseUrl: config.upstreamBaseUrl,
     apiKey: config.upstreamApiKey,
@@ -1475,6 +1504,7 @@ async function runStreamingWebSearchTurn({ rawRequest, requestHeaders, normalize
             searchWriter.done(search);
           },
         });
+        webSearchStarted = true;
         searches.push(...toolResult.searches);
         openedPages.push(...(toolResult.openedPages || []));
         noteWebSearchModelContinuation(webState, toolResult.hadProviderFailure);
@@ -1484,7 +1514,7 @@ async function runStreamingWebSearchTurn({ rawRequest, requestHeaders, normalize
       if (clientSignal?.aborted) {
         return { handled: true };
       }
-      const upstreamRequest = buildUpstreamRequest(`${streamStage}_round_${round + 1}`);
+      const upstreamRequest = buildUpstreamRequest(`${state.enabled && webSearchStarted ? streamStage : state.enabled ? 'routing_stream' : streamStage}_round_${round + 1}`);
       upstreamResponse = await callChatCompletions({
         baseUrl: config.upstreamBaseUrl,
         apiKey: config.upstreamApiKey,
@@ -1516,6 +1546,7 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
     maxBytes: config.reasoningCacheMaxBytes,
   });
   let modelCache = null;
+  const visionReportCache = createVisionReportCache(config);
 
   async function getModelList() {
     const localModels = listModels(config);
@@ -1566,6 +1597,7 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
         config,
         res,
         clientSignal,
+        visionReportCache,
       });
       return;
     }
@@ -1573,6 +1605,18 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
     normalized.messages = prependMissingAssistantToolMessages(normalized.messages, reasoningCache);
     normalized.messages = restoreAssistantReasoningContent(normalized.messages, reasoningCache);
     normalized.messages = restoreCustomToolCallArguments(normalized.messages, reasoningCache);
+    try {
+      if ((config.upstreamProvider || 'deepseek') === 'deepseek') {
+        normalized.messages = await prepareVisionMessages(normalized.messages, config, clientSignal, {
+          reportCache: visionReportCache,
+          scope: visionRequestScope({ rawRequest: request, requestHeaders: req.headers }),
+        });
+      }
+    } catch (error) {
+      const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 502;
+      sendJson(res, statusCode, { error: { code: error.code || 'vision_unavailable', message: error.message || 'Vision request failed' } });
+      return;
+    }
 
     const chatRequest = toChatCompletionsRequest(normalized);
     if (compactionState.isCompaction) {

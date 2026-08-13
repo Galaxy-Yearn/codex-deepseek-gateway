@@ -31,11 +31,20 @@ import {
   SHUTDOWN_TOKEN_HEADER,
 } from '../src/runtime.js';
 import { findAvailableUpdate } from '../src/update-check.js';
+import { DEFAULT_VISION_BASE_URL, DEFAULT_VISION_MODEL } from '../src/vision.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const packageJson = require('../package.json');
 const UPDATE_CHECKED_ENV = 'CODEX_DEEPSEEK_GATEWAY_UPDATE_CHECKED';
+const LOCAL_CONFIG_DEFAULTS = {
+  upstreamWireApi: DEFAULT_UPSTREAM_WIRE_API,
+  visionEnabled: false,
+  visionApiKey: '',
+  visionBaseUrl: DEFAULT_VISION_BASE_URL,
+  visionModel: DEFAULT_VISION_MODEL,
+  visionReasoningEffort: 'high',
+};
 
 function print(message = '') {
   process.stdout.write(message);
@@ -280,8 +289,13 @@ function ensureLocalConfigDefaults(installDir) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`${localConfig} must contain a JSON object`);
   }
-  if (Object.prototype.hasOwnProperty.call(parsed, 'upstreamWireApi')) return;
-  parsed.upstreamWireApi = DEFAULT_UPSTREAM_WIRE_API;
+  let changed = false;
+  for (const [key, value] of Object.entries(LOCAL_CONFIG_DEFAULTS)) {
+    if (Object.prototype.hasOwnProperty.call(parsed, key)) continue;
+    parsed[key] = value;
+    changed = true;
+  }
+  if (!changed) return;
   writeFileSync(localConfig, `${JSON.stringify(parsed, null, 2)}\n`);
 }
 

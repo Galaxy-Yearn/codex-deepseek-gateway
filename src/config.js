@@ -5,12 +5,25 @@ import { parseBoolean, parseList } from './common.js';
 import { readCodexConfig } from './codex-config.js';
 import { catalogFileForPromptLanguage, normalizePromptLanguage } from './prompt-language.js';
 import { DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './runtime.js';
+import {
+  DEFAULT_VISION_BASE_URL,
+  DEFAULT_VISION_CACHE_MAX_ENTRIES,
+  DEFAULT_VISION_CACHE_TTL_MS,
+  DEFAULT_VISION_MAX_COMPLETION_TOKENS,
+  DEFAULT_VISION_MAX_IMAGE_BYTES,
+  DEFAULT_VISION_MAX_TOTAL_IMAGE_BYTES,
+  DEFAULT_VISION_MAX_IMAGES,
+  DEFAULT_VISION_MAX_REPORT_CHARS,
+  DEFAULT_VISION_MODEL,
+  DEFAULT_VISION_TIMEOUT_MS,
+} from './vision.js';
 
 export const DEFAULT_COMPACT_MAX_TOKENS = 20000;
 export const COMPACT_MAX_TOKENS_HARD_LIMIT = 20000;
 export const DEFAULT_COMPACT_TIMEOUT_MS = 240000;
 export const DEFAULT_UPSTREAM_WIRE_API = 'chat_completions';
 export const UPSTREAM_WIRE_APIS = new Set(['chat_completions', 'responses']);
+export const VISION_REASONING_EFFORTS = new Set(['low', 'high', 'max']);
 
 export function normalizeUpstreamWireApi(value) {
   const normalized = String(value || DEFAULT_UPSTREAM_WIRE_API).trim().toLowerCase();
@@ -24,6 +37,16 @@ export function normalizeUpstreamWireApi(value) {
 export function normalizeCompactReasoningEffort(value) {
   const normalized = String(value || '').trim().toLowerCase();
   return normalized === 'max' ? 'max' : 'high';
+}
+
+export function normalizeVisionReasoningEffort(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return VISION_REASONING_EFFORTS.has(normalized) ? normalized : 'high';
+}
+
+function normalizePositiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : fallback;
 }
 
 export function normalizeCompactMaxTokens(value) {
@@ -46,6 +69,7 @@ export function loadConfig(env = process.env) {
   const codexPromptLanguage = normalizePromptLanguage(localConfig.CODEX_PROMPT_LANGUAGE);
   const modelCatalogPath = resolve(dirname(localConfigPath), catalogFileForPromptLanguage(codexPromptLanguage));
   const codexConfig = readCodexConfig(mergedEnv);
+  const visionApiKey = mergedEnv.VISION_API_KEY || mergedEnv.KIMI_API_KEY || mergedEnv.MOONSHOT_API_KEY || '';
   return {
     port: Number(mergedEnv.PORT || 3000),
     host: mergedEnv.HOST || '127.0.0.1',
@@ -56,6 +80,19 @@ export function loadConfig(env = process.env) {
     upstreamWireApi: normalizeUpstreamWireApi(mergedEnv.UPSTREAM_WIRE_API),
     upstreamTimeoutMs: Number(mergedEnv.UPSTREAM_TIMEOUT_MS || 120000),
     upstreamMaxTokens: Number(mergedEnv.UPSTREAM_MAX_TOKENS || mergedEnv.DEEPSEEK_MAX_TOKENS || 0),
+    visionEnabled: parseBoolean(mergedEnv.VISION_ENABLED, Boolean(visionApiKey)),
+    visionApiKey,
+    visionBaseUrl: mergedEnv.VISION_BASE_URL || DEFAULT_VISION_BASE_URL,
+    visionModel: mergedEnv.VISION_MODEL || DEFAULT_VISION_MODEL,
+    visionTimeoutMs: normalizePositiveInteger(mergedEnv.VISION_TIMEOUT_MS, DEFAULT_VISION_TIMEOUT_MS),
+    visionReasoningEffort: normalizeVisionReasoningEffort(mergedEnv.VISION_REASONING_EFFORT),
+    visionMaxImages: normalizePositiveInteger(mergedEnv.VISION_MAX_IMAGES, DEFAULT_VISION_MAX_IMAGES),
+    visionMaxImageBytes: normalizePositiveInteger(mergedEnv.VISION_MAX_IMAGE_BYTES, DEFAULT_VISION_MAX_IMAGE_BYTES),
+    visionMaxTotalImageBytes: normalizePositiveInteger(mergedEnv.VISION_MAX_TOTAL_IMAGE_BYTES, DEFAULT_VISION_MAX_TOTAL_IMAGE_BYTES),
+    visionMaxReportChars: normalizePositiveInteger(mergedEnv.VISION_MAX_REPORT_CHARS, DEFAULT_VISION_MAX_REPORT_CHARS),
+    visionMaxCompletionTokens: normalizePositiveInteger(mergedEnv.VISION_MAX_COMPLETION_TOKENS, DEFAULT_VISION_MAX_COMPLETION_TOKENS),
+    visionCacheTtlMs: normalizePositiveInteger(mergedEnv.VISION_CACHE_TTL_MS, DEFAULT_VISION_CACHE_TTL_MS),
+    visionCacheMaxEntries: normalizePositiveInteger(mergedEnv.VISION_CACHE_MAX_ENTRIES, DEFAULT_VISION_CACHE_MAX_ENTRIES),
     compactReasoningEffort: normalizeCompactReasoningEffort(mergedEnv.COMPACT_REASONING_EFFORT),
     compactMaxTokens: normalizeCompactMaxTokens(mergedEnv.COMPACT_MAX_TOKENS),
     compactTimeoutMs: normalizeCompactTimeoutMs(mergedEnv.COMPACT_TIMEOUT_MS),

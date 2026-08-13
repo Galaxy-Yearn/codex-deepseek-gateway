@@ -148,6 +148,53 @@ test('session discovery and filtering', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
   });
+  await scenario('readSession skips a large image row and uses the first visible user instruction', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-sessions-image-title-'));
+  try {
+    const file = join(dir, 'main.jsonl');
+    writeJsonl(file, [
+      {
+        type: 'session_meta',
+        payload: {
+          id: 'image-session',
+          timestamp: '2026-06-01T00:00:00.000Z',
+          cwd: dir,
+          thread_source: 'user',
+          model_provider: 'deepseek-gateway',
+        },
+      },
+      {
+        timestamp: '2026-06-01T00:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: '<image name=[Image #1] path="image.png">' },
+            { type: 'input_image', image_url: `data:image/png;base64,${'A'.repeat(600000)}` },
+            { type: 'input_text', text: '</image>' },
+          ],
+        },
+      },
+      {
+        timestamp: '2026-06-01T00:00:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'UserMessage',
+            content: [{ type: 'local_image', path: 'image.png' }, { type: 'text', text: '分析这张微流控芯片图片' }],
+          },
+        },
+      },
+    ]);
+
+    const session = readSession(file, new Map([['image-session', { thread_name: '（untitled）' }]]));
+    assert.equal(session.title, '分析这张微流控芯片图片');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  });
   await scenario('readSession skips Codex subagent transcripts', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'codex-sessions-'));
   try {
@@ -312,6 +359,18 @@ test('session picker rendering and navigation', async () => {
           thread_source: 'user',
         },
       },
+      {
+        timestamp: '2026-07-11T00:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '检查视觉报告在中文会话中的标题显示' }],
+        },
+      },
+    ]);
+    writeJsonl(join(codexHome, 'session_index.jsonl'), [
+      JSON.stringify({ id: 'main-session', thread_name: '(untitled)', updated_at: '2026-07-11T00:00:01.000Z' }),
     ]);
 
     const printFixture = {
@@ -321,6 +380,8 @@ test('session picker rendering and navigation', async () => {
     };
     const printOutput = runSessionsCli(printFixture, ['--print']);
     assert.match(printOutput, /\(unknown\)/);
+    assert.match(printOutput, /检查视觉报告在中文会话中的标/);
+    assert.doesNotMatch(printOutput, /\(untitled\)/);
     assert.doesNotMatch(printOutput, /未知/);
 
     const moduleUrl = new URL('../src/codex-sessions.js', import.meta.url).href;
@@ -341,6 +402,8 @@ test('session picker rendering and navigation', async () => {
       timeout: 5000,
     });
     assert.match(output, /\(未知\)/);
+    assert.match(output, /检查视觉报告在中文会话中的标/);
+    assert.doesNotMatch(output, /\(untitled\)/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

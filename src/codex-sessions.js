@@ -128,15 +128,66 @@ function textFromContent(content) {
     .join(' ');
 }
 
-function firstUserPreview(lines) {
-  for (const line of lines.slice(1, 180)) {
-    const payload = parseJsonLine(line)?.payload;
-    if (payload?.type !== 'message' || payload.role !== 'user') continue;
-    const text = textFromContent(payload.content).trim().replace(/\s+/g, ' ');
-    if (!text || text.startsWith('<environment_context>') || text.startsWith('# AGENTS.md instructions')) continue;
-    return truncateDisplay(text, TITLE_WIDTH);
+function userPreviewFromRow(row) {
+  const payload = row?.payload;
+  let text = '';
+  if (row?.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
+    text = textFromContent(payload.content);
+  } else if (row?.type === 'event_msg' && payload?.type === 'user_message') {
+    text = payload.message || '';
+  } else if (row?.type === 'event_msg' && payload?.type === 'item_completed' && payload.item?.type === 'UserMessage') {
+    text = textFromContent(payload.item.content);
   }
-  return '';
+  text = String(text)
+    .replace(/<image\b[^>]*>/giu, '')
+    .replace(/<\/image>/giu, '')
+    .trim()
+    .replace(/\s+/g, ' ');
+  if (!text || text.startsWith('<environment_context>') || text.startsWith('# AGENTS.md instructions')) return '';
+  return truncateDisplay(text, TITLE_WIDTH);
+}
+
+function firstUserPreview(file, chunkSize = 256 * 1024, maxLineBytes = 512 * 1024) {
+  const handle = openSync(file, 'r');
+  try {
+    const size = statSync(file).size;
+    let position = 0;
+    let prefix = Buffer.alloc(0);
+    let skipLine = false;
+    while (position < size) {
+      const buffer = Buffer.alloc(Math.min(chunkSize, size - position));
+      const length = readSync(handle, buffer, 0, buffer.length, position);
+      position += length;
+      let start = 0;
+      for (let index = 0; index < length; index += 1) {
+        if (buffer[index] !== 10) continue;
+        if (!skipLine) {
+          const line = Buffer.concat([prefix, buffer.subarray(start, index)]).toString('utf8').trim();
+          const preview = userPreviewFromRow(parseJsonLine(line));
+          if (preview) return preview;
+        }
+        prefix = Buffer.alloc(0);
+        skipLine = false;
+        start = index + 1;
+      }
+      const suffix = buffer.subarray(start, length);
+      if (skipLine) continue;
+      if (prefix.length + suffix.length > maxLineBytes) {
+        prefix = Buffer.alloc(0);
+        skipLine = true;
+      } else {
+        prefix = prefix.length ? Buffer.concat([prefix, suffix]) : Buffer.from(suffix);
+      }
+    }
+    return skipLine ? '' : userPreviewFromRow(parseJsonLine(prefix.toString('utf8').trim()));
+  } finally {
+    closeSync(handle);
+  }
+}
+
+function meaningfulThreadName(value) {
+  const title = String(value || '').trim();
+  return title && !/^[（(]?untitled[)）]?$/iu.test(title) ? title : '';
 }
 
 function formatTime(value) {
@@ -167,7 +218,7 @@ export function readSession(file, indexById) {
     provider: meta.model_provider || '',
     cwd: meta.cwd || '',
     updatedAt: readLastUserMessageTimestamp(file) || index.updated_at || meta.timestamp || '',
-    title: index.thread_name || firstUserPreview(lines) || '(untitled)',
+    title: meaningfulThreadName(index.thread_name) || firstUserPreview(file) || '(untitled)',
   };
 }
 

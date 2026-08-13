@@ -535,10 +535,12 @@ export async function inspectGatewayDoctor({
       const missing = [];
       if (tavily.enabled && !tavily.configured) missing.push('Tavily API key');
       if (firecrawl.enabled && !firecrawl.configured) missing.push('Firecrawl API key');
-      if (missing.length) return diagnosticResult('warning', `optional backend configuration is incomplete: ${missing.join(', ')}`, { tavily, firecrawl, activeProbe: false }, `Configure the missing keys in ${paths.config} or disable the backend.`);
-      if (!tavily.enabled && !firecrawl.enabled) return diagnosticResult('skipped', 'optional web backends are disabled', { tavily, firecrawl, activeProbe: false });
-      const enabled = [tavily.enabled ? 'Tavily' : '', firecrawl.enabled ? 'Firecrawl' : ''].filter(Boolean).join(' and ');
-      return diagnosticResult('ok', `${enabled} credentials are configured (not actively probed)`, { tavily, firecrawl, activeProbe: false });
+      const vision = { enabled: config.visionEnabled !== false, configured: Boolean(config.visionApiKey), model: config.visionModel, reasoningEffort: config.visionReasoningEffort, baseUrl: safeUrl(config.visionBaseUrl) };
+      if (vision.enabled && !vision.configured) missing.push('Kimi vision API key');
+      if (missing.length) return diagnosticResult('warning', `optional backend configuration is incomplete: ${missing.join(', ')}`, { tavily, firecrawl, vision, activeProbe: false }, `Configure the missing keys in ${paths.config} or disable the backend.`);
+      if (!tavily.enabled && !firecrawl.enabled && !vision.enabled) return diagnosticResult('skipped', 'optional web and vision backends are disabled', { tavily, firecrawl, vision, activeProbe: false });
+      const enabled = [tavily.enabled ? 'Tavily' : '', firecrawl.enabled ? 'Firecrawl' : '', vision.enabled ? 'Kimi vision' : ''].filter(Boolean).join(' and ');
+      return diagnosticResult('ok', `${enabled} credentials are configured (not actively probed)`, { tavily, firecrawl, vision, activeProbe: false });
     }),
   ]);
 

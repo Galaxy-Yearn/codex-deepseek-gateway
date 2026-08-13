@@ -13,7 +13,7 @@ async function scenario(name, run) {
   }
 }
 import { inspectCodexConfig, readCodexConfig } from '../src/codex-config.js';
-import { loadConfig, normalizeCompactMaxTokens, normalizeCompactReasoningEffort, normalizeCompactTimeoutMs, normalizeUpstreamWireApi } from '../src/config.js';
+import { loadConfig, normalizeCompactMaxTokens, normalizeCompactReasoningEffort, normalizeCompactTimeoutMs, normalizeUpstreamWireApi, normalizeVisionReasoningEffort } from '../src/config.js';
 import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from '../src/local-config.js';
 import { catalogFileForPromptLanguage, normalizePromptLanguage } from '../src/prompt-language.js';
 
@@ -53,6 +53,15 @@ test('gateway configuration precedence and defaults', async () => {
     assert.equal(config.compactReasoningEffort, 'high');
     assert.equal(config.compactMaxTokens, 20000);
     assert.equal(config.compactTimeoutMs, 240000);
+    assert.equal(config.visionEnabled, false);
+    assert.equal(config.visionModel, 'kimi-k3');
+    assert.equal(config.visionReasoningEffort, 'high');
+    assert.equal(config.visionTimeoutMs, 120000);
+    assert.equal(config.visionMaxImages, 16);
+    assert.equal(config.visionMaxImageBytes, 25165824);
+    assert.equal(config.visionMaxTotalImageBytes, 41943040);
+    assert.equal(config.visionMaxReportChars, 64000);
+    assert.equal(config.visionMaxCompletionTokens, 131072);
     assert.equal(config.requestBodyMaxBytes, 1048576);
     assert.equal(config.shutdownTimeoutMs, 4000);
     assert.equal(config.tavilyWebSearchEnabled, false);
@@ -74,6 +83,37 @@ test('gateway configuration precedence and defaults', async () => {
     assert.equal(config.reasoningCachePath, join(dir, 'state', 'reasoning-cache.jsonl'));
     assert.equal(config.reasoningCacheMaxMessages, 1000);
     assert.equal(config.legacyReasoningCachePath, join(dir, 'state', 'sessions.json'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  });
+  await scenario('normalizes configurable Kimi vision reasoning effort and limits', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gateway-vision-config-'));
+  try {
+    await mkdir(join(dir, 'config'));
+    const file = join(dir, 'config', 'gateway.local.json');
+    await writeFile(file, JSON.stringify({
+      upstreamApiKey: 'from-file',
+      visionApiKey: 'kimi-key',
+      visionReasoningEffort: 'max',
+      visionMaxReportChars: 64000,
+      visionMaxCompletionTokens: 12000,
+    }));
+    const localConfig = loadConfig({ GATEWAY_CONFIG_FILE: file });
+    assert.equal(localConfig.visionEnabled, true);
+    assert.equal(localConfig.visionReasoningEffort, 'max');
+    assert.equal(localConfig.visionMaxReportChars, 64000);
+    assert.equal(localConfig.visionMaxCompletionTokens, 12000);
+
+    const envConfig = loadConfig({
+      GATEWAY_CONFIG_FILE: file,
+      VISION_REASONING_EFFORT: 'low',
+      VISION_MAX_REPORT_CHARS: '48000',
+    });
+    assert.equal(envConfig.visionReasoningEffort, 'low');
+    assert.equal(envConfig.visionMaxReportChars, 48000);
+    assert.equal(normalizeVisionReasoningEffort(' MAX '), 'max');
+    assert.equal(normalizeVisionReasoningEffort('future'), 'high');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -256,6 +296,8 @@ test('gateway configuration precedence and defaults', async () => {
   await scenario('normalizes standalone compact, prompt-language, and local-config boundaries', async () => {
   assert.equal(normalizeCompactReasoningEffort('high'), 'high');
   assert.equal(normalizeCompactReasoningEffort('future'), 'high');
+  assert.equal(normalizeVisionReasoningEffort('low'), 'low');
+  assert.equal(normalizeVisionReasoningEffort('invalid'), 'high');
   assert.equal(normalizeCompactMaxTokens('50000'), 20000);
   assert.equal(normalizeCompactMaxTokens('200000'), 20000);
   assert.equal(normalizeCompactMaxTokens('0'), 20000);

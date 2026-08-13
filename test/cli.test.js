@@ -156,6 +156,11 @@ test('CLI version and installation lifecycle', async () => {
     assert.deepEqual(JSON.parse(readFileSync(localConfigPath, 'utf8')), {
       ...localConfig,
       upstreamWireApi: 'chat_completions',
+      visionEnabled: false,
+      visionApiKey: '',
+      visionBaseUrl: 'https://api.moonshot.cn/v1',
+      visionModel: 'kimi-k3',
+      visionReasoningEffort: 'high',
     });
     assert.equal(readFileSync(reasoningCachePath, 'utf8'), reasoningCache);
     assert.equal(existsSync(join(dir, 'bin', 'codex-deepseek-gateway.js')), true);
@@ -173,12 +178,20 @@ test('CLI version and installation lifecycle', async () => {
     await rm(dir, { recursive: true, force: true });
   }
   });
-  await scenario('install preserves an explicitly selected upstream wire API', async () => {
+  await scenario('install preserves existing wire and vision settings', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-cli-wire-api-'));
   try {
     await mkdir(join(dir, 'config'), { recursive: true });
     const localConfigPath = join(dir, 'config', 'gateway.local.json');
-    await writeFile(localConfigPath, JSON.stringify({ upstreamApiKey: 'sk-REPLACE_ME', upstreamWireApi: 'responses' }));
+    await writeFile(localConfigPath, JSON.stringify({
+      upstreamApiKey: 'sk-REPLACE_ME',
+      upstreamWireApi: 'responses',
+      visionEnabled: true,
+      visionApiKey: 'existing-kimi-key',
+      visionBaseUrl: 'https://vision.example/v1',
+      visionModel: 'custom-vision-model',
+      visionReasoningEffort: 'max',
+    }));
     const env = { ...process.env };
     delete env.DEEPSEEK_API_KEY;
     delete env.UPSTREAM_API_KEY;
@@ -190,6 +203,11 @@ test('CLI version and installation lifecycle', async () => {
     assert.deepEqual(JSON.parse(readFileSync(localConfigPath, 'utf8')), {
       upstreamApiKey: 'sk-REPLACE_ME',
       upstreamWireApi: 'responses',
+      visionEnabled: true,
+      visionApiKey: 'existing-kimi-key',
+      visionBaseUrl: 'https://vision.example/v1',
+      visionModel: 'custom-vision-model',
+      visionReasoningEffort: 'max',
     });
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -346,6 +364,11 @@ test('CLI version and installation lifecycle', async () => {
     assert.deepEqual(JSON.parse(readFileSync(join(dir, 'config', 'gateway.local.json'), 'utf8')), {
       ...localConfig,
       upstreamWireApi: 'chat_completions',
+      visionEnabled: false,
+      visionApiKey: '',
+      visionBaseUrl: 'https://api.moonshot.cn/v1',
+      visionModel: 'kimi-k3',
+      visionReasoningEffort: 'high',
     });
     assert.equal(readFileSync(join(dir, 'state', 'reasoning-cache.jsonl'), 'utf8'), reasoningCache);
   } finally {
