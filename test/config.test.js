@@ -15,7 +15,7 @@ async function scenario(name, run) {
 import { inspectCodexConfig, readCodexConfig } from '../src/codex-config.js';
 import { loadConfig, normalizeCompactMaxTokens, normalizeCompactReasoningEffort, normalizeCompactTimeoutMs, normalizeUpstreamWireApi, normalizeVisionReasoningEffort } from '../src/config.js';
 import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from '../src/local-config.js';
-import { catalogFileForPromptLanguage, normalizePromptLanguage } from '../src/prompt-language.js';
+import { catalogFileForPromptLanguage, catalogFileForProvider, normalizePromptLanguage } from '../src/prompt-language.js';
 
 test('gateway configuration precedence and defaults', async () => {
   await scenario('loads local gateway config and lets env override it', async () => {
@@ -54,7 +54,7 @@ test('gateway configuration precedence and defaults', async () => {
     assert.equal(config.compactMaxTokens, 20000);
     assert.equal(config.compactTimeoutMs, 240000);
     assert.equal(config.visionEnabled, false);
-    assert.equal(config.visionModel, 'kimi-k3');
+    assert.equal(config.visionModel, 'deepseek-v4-flash-vision-exp');
     assert.equal(config.visionReasoningEffort, 'high');
     assert.equal(config.visionTimeoutMs, 120000);
     assert.equal(config.visionMaxImages, 16);
@@ -86,6 +86,21 @@ test('gateway configuration precedence and defaults', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+  });
+  await scenario('uses OrcaRouter defaults and dedicated API key environment variable', async () => {
+    const config = loadConfig({
+      UPSTREAM_PROVIDER: 'OrcaRouter',
+      ORCAROUTER_API_KEY: 'orca-key',
+      GATEWAY_CONFIG_FILE: join(tmpdir(), 'gateway-orca-config-missing.json'),
+    });
+    assert.equal(config.upstreamProvider, 'orcarouter');
+    assert.equal(config.upstreamBaseUrl, 'https://api.orcarouter.ai/v1');
+    assert.equal(config.upstreamApiKey, 'orca-key');
+    assert.equal(loadConfig({
+      UPSTREAM_PROVIDER: 'orcarouter',
+      DEEPSEEK_API_KEY: 'deepseek-key',
+      GATEWAY_CONFIG_FILE: join(tmpdir(), 'gateway-orca-no-fallback.json'),
+    }).upstreamApiKey, '');
   });
   await scenario('normalizes configurable Kimi vision reasoning effort and limits', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gateway-vision-config-'));
@@ -305,6 +320,9 @@ test('gateway configuration precedence and defaults', async () => {
   assert.equal(normalizePromptLanguage('fr'), 'en');
   assert.equal(catalogFileForPromptLanguage('zh'), 'model-catalog.zh.json');
   assert.equal(catalogFileForPromptLanguage('invalid'), 'model-catalog.json');
+  assert.equal(catalogFileForProvider('en', 'orcarouter'), 'model-catalog.orcarouter.json');
+  assert.equal(catalogFileForProvider('zh', 'orcarouter'), 'model-catalog.orcarouter.json');
+  assert.equal(catalogFileForProvider('en', 'deepseek'), 'model-catalog.json');
 
   const dir = await mkdtemp(join(tmpdir(), 'gateway-local-config-'));
   try {

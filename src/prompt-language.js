@@ -11,3 +11,8 @@ export function catalogFileForPromptLanguage(language) {
     ? 'model-catalog.zh.json'
     : 'model-catalog.json';
 }
+
+export function catalogFileForProvider(language, provider) {
+  if (String(provider || '').trim().toLowerCase() !== 'orcarouter') return catalogFileForPromptLanguage(language);
+  return 'model-catalog.orcarouter.json';
+}

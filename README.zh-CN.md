@@ -2,44 +2,38 @@
 
 [English](README.md) | 简体中文
 
-轻量级本地网关，让 Codex 使用 DeepSeek，同时保留 Codex 的 agent 工作流。默认将 Responses 请求桥接到 Chat Completions，也可透传 DeepSeek 原生 Responses JSON/SSE；工具执行、历史和会话恢复仍由 Codex 管理。
+轻量级本地网关，让 Codex 使用 DeepSeek 兼容接口，同时保留 Codex 的 agent 工作流。工具、历史、执行和会话恢复由 Codex 管理；网关负责协议兼容、模型目录和可选的图片/网络适配。
+
+## 请求路径
 
 ```text
 Codex /v1/responses
         |
-        v
-     网关 wire API
-       |              \
-       |               \-- responses ------> DeepSeek /responses
-       v                                      |
-chat_completions                              \-- 原生 JSON/SSE
-       |
-       v
-网关规范化 -> DeepSeek /chat/completions
-                              |
-                              v
-                       网关 JSON/SSE 映射
-                              |
-                              v
-                    Codex Responses items/events
+      网关
+      /   \
+ Chat 桥接  原生 Responses
+      |           |
+ /chat/completions  /responses
+      |           |
+      +-----> Codex Responses items/events
 ```
 
-核心优势包括：
+默认的 `chat_completions` 路径会规范化 Responses 请求，并把 JSON/SSE 结果映射回 Codex。将 `upstreamWireApi` 设为 `responses` 可转发上游原生 Responses JSON/SSE；`/v1/chat/completions` 始终可直接透传。
 
-- 支持 Codex 工具，包括并行调用和会话中通过 `tool_search` 公开的工具。
-- 随包 model catalog：把 DeepSeek 模型与 reasoning 档位注册进 Codex，支持 `/model` 切换以及需要校验模型名的功能，如原生 sub-agents。
-- 高缓存命中率：请求构造针对 DeepSeek 上下文缓存进行优化，可降低多轮会话的费用与响应延迟。
-- 网络搜索：可选接入 Tavily 和 Firecrawl，支持 Codex 的网络搜索请求，并针对多轮搜索优化效率。
-- 视觉桥接：Codex 图片附件和 `view_image` 结果会转换为可复用的文本报告供 DeepSeek 使用。
-- 调优的系统提示词：随包提供为 DeepSeek 适配的双语 system prompts 与 personalities。
-- 更强的 compact 机制：从桥接后的 Chat 历史或原生 Responses 历史生成通过 schema 校验的 checkpoint；无法安全完成时回退到确定性的可信状态。
+## 核心能力
+
+- Codex 工具、reasoning、历史重放、compact 和会话恢复。
+- 随包 model catalog，支持 `/model` 切换、reasoning 档位、personality，以及 OrcaRouter 目录。
+- 原生多模态模型支持；对仅接受文本的模型提供可选视觉适配。
+- Chat Completions 路径可选 Tavily 搜索和 Firecrawl 页面读取。
+- 双语提示词，并保留 DeepSeek 工具回合的原始 reasoning。
 
 软件包：[@galaxy-yearn/codex-deepseek-gateway](https://www.npmjs.com/package/@galaxy-yearn/codex-deepseek-gateway)
 
 ## 要求
 
 - [Node.js](https://nodejs.org/en/download) 22 或更新版本
-- [DeepSeek API key](https://platform.deepseek.com/api_keys)
+- Provider API key：[DeepSeek](https://platform.deepseek.com/api_keys) 或 [OrcaRouter](https://www.orcarouter.ai/console/keys)
 - [Codex CLI](https://developers.openai.com/codex) 0.144.0 或更新版本
 
 ## 安装
@@ -53,7 +47,7 @@ codex-deepseek-gateway install            # 首次安装会自动打开配置文
 codex-deepseek-gateway install --no-edit  # 安装但不打开配置文件
 ```
 
-把你的 DeepSeek API key 填入 `~/.codex/deepseek-gateway/config/gateway.local.json`：
+把你的 provider API key 填入 `~/.codex/deepseek-gateway/config/gateway.local.json`：
 
 ```json
 {
@@ -61,7 +55,42 @@ codex-deepseek-gateway install --no-edit  # 安装但不打开配置文件
 }
 ```
 
-`install` 不会覆盖 `gateway.local.json` 中已有的设置；从旧版本升级时，只会为缺少该字段的配置补上兼容旧行为的 `upstreamWireApi: "chat_completions"`。
+`install` 不会覆盖 `gateway.local.json` 中已有的设置；从旧版本升级时，会补充缺失的 `upstreamProvider`、`upstreamBaseUrl` 和 `upstreamWireApi`（兼容默认值为 DeepSeek/Chat Completions），并把 `upstreamProvider` 放在首项。
+
+## OrcaRouter Provider
+
+[OrcaRouter](https://www.orcarouter.ai) 提供 OpenAI 兼容模型接口和自适应路由 `orcarouter/auto`。请以其[模型目录](https://www.orcarouter.ai/console/catalog)显示的端点和模型 ID 为准；免费资格与额度可能随账户变化，网关不硬编码 provider 专属请求逻辑。
+
+在 `gateway.local.json` 中设置 OrcaRouter 端点和密钥：
+
+```json
+{
+  "upstreamProvider": "orcarouter",
+  "upstreamApiKey": "or-...",
+  "upstreamBaseUrl": "https://api.orcarouter.ai/v1",
+  "upstreamWireApi": "chat_completions"
+}
+```
+
+也可使用环境变量 `ORCAROUTER_API_KEY`、`UPSTREAM_API_KEY` 和 `UPSTREAM_BASE_URL`。修改后重启网关。在 Codex 中选择模型，ID 会原样转发：
+
+```toml
+model_provider = "deepseek-gateway"
+model = "orcarouter/auto"
+model_reasoning_effort = "high"
+```
+
+需要路由器自动选择上游时使用 `orcarouter/auto`；需要固定模型或能力时使用目录中的精确 ID。接入其他 OrcaRouter 模型无需修改网关代码。可通过 `MODEL_ALIASES_JSON` 定义本地别名：
+
+```powershell
+$env:MODEL_ALIASES_JSON = '{"my-kimi":{"model":"kimi/kimi-k3"}}'
+```
+
+启动网关后在 Codex 中选择 `my-kimi`。别名还可提供 `thinking`、`reasoning_effort` 和模型专用的 `extra_body`。
+
+OrcaRouter 只改变上游 URL。DeepSeek 和 OrcaRouter 共用同一套模型与 Codex 规范化逻辑。按所选路由支持的协议将 `upstreamWireApi` 设为 `chat_completions`（默认）或 `responses`；模型专用参数放入 OrcaRouter 文档规定的 `extra_body`。
+
+当 `upstreamProvider` 为 `orcarouter` 时，`new` 和 `sessions` 会自动加载随包的英文 `model-catalog.orcarouter.json`，无需修改 `config.toml` 中的 catalog。直接运行 `codex` 仍使用自身 `model_catalog_json` 指定的目录。当前随包目录包含 `orcarouter/auto`、`orcarouter/free`、`deepseek/deepseek-v4-flash-free` 和 `qwen/qwen3.8-27b-free`；使用免费路由前请以 OrcaRouter 目录为准。
 
 ## 配置 Codex Provider
 
@@ -164,7 +193,7 @@ codex-deepseek-gateway sessions --exec <id-or-row>  # 按行号或 session id �
 
 当前选中的 catalog 是安装后唯一的模型清单：其中的模型 slug 同时驱动 launcher、网关 `/v1/models` 端点以及默认的 DeepSeek 同名模型映射。
 
-网关提供两个模型 ID：`deepseek-v4-flash` 和 `deepseek-v4-pro`。随包 catalog 直接提供与 DeepSeek V4 对齐的三个 reasoning 档位：
+网关提供 `deepseek-v4-flash`、`deepseek-v4-pro` 和原生多模态模型 `deepseek-v4-flash-vision-exp`。vision-exp 沿用 Flash 模型的 Codex 系统提示，并增加原生图片输入。OrcaRouter catalog 包含已核实的免费入口 `orcarouter/auto`、`orcarouter/free`、`deepseek/deepseek-v4-flash-free` 和 `qwen/qwen3.8-27b-free`。
 
 | Reasoning 档位 | 含义 | DeepSeek 请求 |
 | --- | --- | --- |
@@ -186,7 +215,7 @@ DeepSeek 的思维链会在 Codex TUI 中完整显示，原始 `reasoning_conten
 
 ## 视觉能力（可选）
 
-视觉能力在配置 API key 前保持关闭。网关通过独立的 OpenAI 兼容视觉端点，把 Codex 的图片输入转换成供 DeepSeek 使用的文本证据。推荐和默认的视觉模型是 `kimi-k3`。
+视觉能力在配置 API key 前保持关闭。对于不支持图片的主模型，网关通过独立的 OpenAI 兼容视觉端点把图片转换成文本证据；原生多模态模型保留图片内容直接发送。默认视觉模型是 `deepseek-v4-flash-vision-exp`，也推荐使用 `kimi-k3`。
 
 ```json
 {
@@ -263,6 +292,7 @@ codex-deepseek-gateway uninstall  # 删除本地运行时
 
 ```json
 {
+  "upstreamProvider": "deepseek",
   "upstreamApiKey": "sk-REPLACE_ME",
   "upstreamBaseUrl": "https://api.deepseek.com",
   "upstreamWireApi": "chat_completions",
@@ -270,7 +300,7 @@ codex-deepseek-gateway uninstall  # 删除本地运行时
   "visionEnabled": false,
   "visionApiKey": "",
   "visionBaseUrl": "https://api.moonshot.cn/v1",
-  "visionModel": "kimi-k3",
+  "visionModel": "deepseek-v4-flash-vision-exp",
   "visionReasoningEffort": "high",
   "visionTimeoutMs": 120000,
   "visionMaxImages": 16,
@@ -296,10 +326,11 @@ codex-deepseek-gateway uninstall  # 删除本地运行时
 }
 ```
 
-- `upstreamApiKey` — 你的 [DeepSeek API key](https://platform.deepseek.com/api_keys)（也可用 `DEEPSEEK_API_KEY`）。
-- `upstreamBaseUrl` — DeepSeek API 端点；参见 [DeepSeek API 文档](https://api-docs.deepseek.com/)。
+- `upstreamProvider` — `deepseek`（默认）或 `orcarouter`；端点和模型规则见 [OrcaRouter Provider](#orcarouter-provider)。
+- `upstreamApiKey` — provider API key；对应 provider 也可使用 `DEEPSEEK_API_KEY` 或 `ORCAROUTER_API_KEY`。
+- `upstreamBaseUrl` — provider API 端点；参见对应 provider 的官方文档。
 - `upstreamWireApi` — `/v1/responses` 的上游协议，默认 `chat_completions`，也可设为原生 `responses`；无论该值如何，`/v1/chat/completions` 都保持 Chat 直通。
-- `upstreamMaxTokens` — DeepSeek 输出 token 上限；`0` 表示使用 catalog 的默认约 100K 预算。
+- `upstreamMaxTokens` — provider 输出 token 上限；`0` 表示使用 catalog 的默认预算。
 - `visionEnabled`、`visionApiKey` — 开启 Codex 图片桥接并配置视觉端点 API key（也可使用 `VISION_API_KEY` 或 `MOONSHOT_API_KEY`）。示例默认关闭，配置 key 后再开启。
 - `visionBaseUrl`、`visionModel` — OpenAI 兼容视觉 API 的基址和模型；图片输入使用 base64 Data URL，不支持公网图片 URL。
 - `visionReasoningEffort` — 视觉推理强度，默认 `high`，可配置为 `low`、`high` 或 `max`。

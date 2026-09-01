@@ -3,7 +3,9 @@ import { createHash } from 'node:crypto';
 import { CODEX_SUMMARY_PREFIX_START, generateId, isObject, normalizeRole, parseJsonObject, safeJsonParse, toText } from './common.js';
 import {
   deepseekReasoningPayload,
+  isDeepSeekModel,
   resolveModelAlias,
+  supportsNativeVisionModel,
 } from './model-map.js';
 import { webSearchEvidenceNote } from './web-search-evidence.js';
 import {
@@ -1327,8 +1329,8 @@ function isDeepSeekBetaBaseUrl(baseUrl) {
   return /\/beta\/?$/.test(String(baseUrl || ''));
 }
 
-function adaptToolsForProvider(tools, provider, config = {}) {
-  if (provider !== 'deepseek' || !Array.isArray(tools)) return tools;
+function adaptToolsForDeepSeek(tools, config = {}) {
+  if (!Array.isArray(tools)) return tools;
   const keepStrict = isDeepSeekBetaBaseUrl(config.upstreamBaseUrl);
   return tools.map((tool) => {
     const simplified = simplifyToolForDeepSeek(tool);
@@ -1446,19 +1448,20 @@ function deepseekTextOnlyContent(content) {
   return chunks.filter((chunk) => chunk !== '').join('\n');
 }
 
-function sanitizeMessageForChatCompletion(message, provider = 'generic') {
+function sanitizeMessageForChatCompletion(message, model = '', { preserveMultimodal = false } = {}) {
   if (!isObject(message)) return message;
+  const deepSeekModel = isDeepSeekModel(model);
   const chatContent = contentToChatContent(message.content);
   const sanitized = {
-    role: normalizeRole(message.role, provider),
-    content: provider === 'deepseek' ? deepseekTextOnlyContent(chatContent) : chatContent,
+    role: normalizeRole(message.role),
+    content: deepSeekModel && !preserveMultimodal ? deepseekTextOnlyContent(chatContent) : chatContent,
   };
   if (message.name !== undefined) sanitized.name = message.name;
   if (Array.isArray(message.tool_calls)) {
     sanitized.tool_calls = sanitizeToolCallsForChatCompletion(message.tool_calls);
   }
   if (message.tool_call_id !== undefined) sanitized.tool_call_id = message.tool_call_id;
-  if (provider === 'deepseek' && message.role === 'assistant' && typeof message.reasoning_content === 'string') {
+  if (deepSeekModel && message.role === 'assistant' && typeof message.reasoning_content === 'string') {
     sanitized.reasoning_content = message.reasoning_content;
   }
   return sanitized;
@@ -1474,11 +1477,10 @@ function deepSeekInstructionBlock(message, includePriorityLabels) {
   return `${label}\n${content}`;
 }
 
-function sanitizeMessagesForChatCompletion(messages, provider = 'generic') {
+function sanitizeMessagesForChatCompletion(messages, model = '', options = {}) {
   const source = Array.isArray(messages) ? messages : [];
-  if (provider !== 'deepseek') {
-    return source.map((message) => sanitizeMessageForChatCompletion(message, provider));
-  }
+  const deepSeekModel = isDeepSeekModel(model);
+  if (!deepSeekModel) return source.map((message) => sanitizeMessageForChatCompletion(message, model, options));
 
   const result = [];
   let instructionBlock = [];
@@ -1499,7 +1501,7 @@ function sanitizeMessagesForChatCompletion(messages, provider = 'generic') {
       continue;
     }
     flushInstructionBlock();
-    result.push(sanitizeMessageForChatCompletion(message, provider));
+    result.push(sanitizeMessageForChatCompletion(message, model, options));
   }
   flushInstructionBlock();
   return result;
@@ -1866,14 +1868,16 @@ function addInternalCommentaryTool(tools, toolChoice) {
 }
 
 export function toProviderChatCompletionsRequest(chatRequest, config = {}) {
-  const provider = config.upstreamProvider || 'generic';
   const modelAlias = resolveModelAlias(chatRequest.model, config);
+  const upstreamModel = modelAlias.upstreamModel || config.upstreamModel || chatRequest.model;
+  const deepSeekModel = isDeepSeekModel(upstreamModel, config);
   const fallbackReasoning = !chatRequest.reasoning && config.codexReasoningEffort
     ? { effort: config.codexReasoningEffort }
     : chatRequest.reasoning;
-  const messages = sanitizeMessagesForChatCompletion(chatRequest.messages, provider);
+  const nativeVision = supportsNativeVisionModel(chatRequest.model, config);
+  const messages = sanitizeMessagesForChatCompletion(chatRequest.messages, upstreamModel, { preserveMultimodal: nativeVision });
   const request = {
-    model: modelAlias.upstreamModel || config.upstreamModel || chatRequest.model,
+    model: upstreamModel,
     messages,
     temperature: chatRequest.temperature,
     top_p: chatRequest.top_p,
@@ -1897,12 +1901,12 @@ export function toProviderChatCompletionsRequest(chatRequest, config = {}) {
     }
   }
 
-  if (provider === 'deepseek') {
+  if (deepSeekModel) {
     delete request.reasoning_effort;
     delete request.parallel_tool_calls;
     delete request.frequency_penalty;
     delete request.presence_penalty;
-    request.tools = addInternalCommentaryTool(adaptToolsForProvider(request.tools, provider, config), chatRequest.tool_choice);
+    request.tools = addInternalCommentaryTool(adaptToolsForDeepSeek(request.tools, config), chatRequest.tool_choice);
     assertDeepSeekToolCapacity(request.tools);
     request.messages = addDeepSeekToolInstructions(request.messages, request.tools);
     if (!config.compactionRequest) request.messages = addDeepSeekCompactionInstructions(request.messages);
@@ -1927,7 +1931,7 @@ export function toProviderChatCompletionsRequest(chatRequest, config = {}) {
 
   Object.assign(request, modelAlias.extraBody);
 
-  if (provider === 'deepseek') {
+  if (deepSeekModel) {
     request.messages = patchDeepSeekThinkingHistory(request.messages, request);
   }
   request.tools = stripGatewayToolMarkers(request.tools);
@@ -2433,7 +2437,7 @@ export class ResponsesStreamMapper {
   }
 
   messageStartsAsCommentary() {
-    return this.toolItems.size > 0 || (this.config.upstreamProvider === 'deepseek' && hasRunnableChatTools(this.normalized));
+    return this.toolItems.size > 0 || hasRunnableChatTools(this.normalized);
   }
 
   finalizeMessagePhase() {

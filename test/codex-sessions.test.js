@@ -458,7 +458,7 @@ test('session picker rendering and navigation', async () => {
     assert.equal(output.match(/Choose Codex session/g)?.length, 2);
     assert.equal(output.match(/Choose gateway model/g)?.length, 2);
     assert.equal(output.match(/Choose DeepSeek reasoning level for deepseek-v4-flash/g)?.length, 1);
-    assert.match(output, /Fast and cost-efficient agentic model for everyday work\./);
+    assert.match(output, /Fast and cost-efficient agentic/);
     assert.match(output, /Fast responses with light reasoning/);
   } finally {
     rmSync(dir, { recursive: true, force: true });

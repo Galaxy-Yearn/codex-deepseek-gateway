@@ -67,6 +67,27 @@ test('native Responses request mapping', async () => {
   });
 });
 
+test('provider compatibility boundaries', async () => {
+  const image = { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } };
+  const vision = toProviderChatCompletionsRequest({
+    model: 'deepseek-v4-flash-vision-exp',
+    messages: [{ role: 'user', content: [image, { type: 'text', text: 'describe' }] }],
+    stream: false,
+  }, { upstreamProvider: 'deepseek' });
+  assert.equal(vision.messages[0].content[0].type, 'image_url');
+
+  const orca = toProviderChatCompletionsRequest({
+    model: 'kimi/kimi-k3',
+    messages: [{ role: 'user', content: [image] }],
+    stream: false,
+    temperature: 0.2,
+  }, { upstreamProvider: 'orcarouter' });
+  assert.equal(orca.model, 'kimi/kimi-k3');
+  assert.equal(orca.temperature, 0.2);
+  assert.equal(orca.messages[0].content[0].type, 'image_url');
+
+});
+
 test('Responses input and history normalization', async () => {
   await scenario('normalizes Responses input to chat completions messages', async () => {
   const normalized = normalizeResponsesRequest({

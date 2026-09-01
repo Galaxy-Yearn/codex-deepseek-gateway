@@ -111,8 +111,8 @@ test('shared normalization and parsing contracts', () => {
   assert.equal(isObject({}), true);
   assert.equal(isObject([]), false);
   assert.match(generateId('call'), /^call_[0-9a-f]{32}$/);
-  assert.equal(normalizeRole('developer', 'deepseek'), 'system');
-  assert.equal(normalizeRole('', 'deepseek'), 'user');
+  assert.equal(normalizeRole('developer'), 'system');
+  assert.equal(normalizeRole(''), 'user');
   assert.equal(toText([
     { type: 'input_text', text: 'one' },
     { type: 'message', content: [{ type: 'output_text', text: 'two' }] },

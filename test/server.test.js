@@ -424,6 +424,46 @@ test('health, models, authentication, and request validation', async () => {
   });
 });
 
+test('OrcaRouter Chat Completions end-to-end bridge preserves provider model and multimodal input', async () => {
+  const requests = [];
+  const upstream = http.createServer(async (req, res) => {
+    const body = JSON.parse(await new Promise((resolveBody) => {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => resolveBody(Buffer.concat(chunks).toString('utf8')));
+    }));
+    requests.push(body);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'chatcmpl-orca', object: 'chat.completion', model: body.model, choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 } }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    config: {
+      upstreamProvider: 'orcarouter',
+      upstreamBaseUrl: upstreamUrl,
+      upstreamApiKey: 'orca-test-key',
+      upstreamTimeoutMs: 120000,
+      modelAliases: { 'kimi/kimi-k3': { model: 'kimi/kimi-k3', thinking: 'auto' } },
+    },
+    reasoningCache: new ReasoningCache(),
+  });
+  const proxyUrl = await listen(proxy);
+  try {
+    const response = await fetch(`${proxyUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'kimi/kimi-k3', input: [{ role: 'user', content: [{ type: 'input_text', text: 'look' }, { type: 'input_image', image_url: 'data:image/png;base64,AA==' }] }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).output[0].content[0].text, 'ok');
+    assert.equal(requests[0].model, 'kimi/kimi-k3');
+    assert.equal(requests[0].messages[0].content[1].type, 'image_url');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('native Responses upstream mode', async () => {
   const upstreamRequests = [];
   const upstream = http.createServer(async (req, res) => {
@@ -515,7 +555,7 @@ test('native Responses upstream mode', async () => {
 
     const models = await fetch(`${proxyUrl}/v1/models`);
     assert.equal(models.status, 200);
-    assert.deepEqual((await models.json()).data.map((model) => model.id), ['deepseek-v4-flash', 'deepseek-v4-pro']);
+    assert.deepEqual((await models.json()).data.map((model) => model.id), ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro']);
 
     const providerError = await fetch(`${proxyUrl}/v1/responses`, {
       method: 'POST',

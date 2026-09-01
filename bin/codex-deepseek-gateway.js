@@ -13,7 +13,7 @@ import {
 import { createRequire } from 'node:module';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_UPSTREAM_WIRE_API, loadConfig } from '../src/config.js';
+import { DEFAULT_UPSTREAM_BASE_URLS, DEFAULT_UPSTREAM_PROVIDER, DEFAULT_UPSTREAM_WIRE_API, loadConfig } from '../src/config.js';
 import { newConversation } from '../src/codex-launch.js';
 import { DEFAULT_SESSION_LIMIT, sessions } from '../src/codex-sessions.js';
 import {
@@ -38,6 +38,7 @@ const require = createRequire(import.meta.url);
 const packageJson = require('../package.json');
 const UPDATE_CHECKED_ENV = 'CODEX_DEEPSEEK_GATEWAY_UPDATE_CHECKED';
 const LOCAL_CONFIG_DEFAULTS = {
+  upstreamProvider: DEFAULT_UPSTREAM_PROVIDER,
   upstreamWireApi: DEFAULT_UPSTREAM_WIRE_API,
   visionEnabled: false,
   visionApiKey: '',
@@ -192,6 +193,12 @@ function isConfigured(installDir) {
   return Boolean(config.upstreamApiKey);
 }
 
+function upstreamCredentialLabel(config) {
+  if (config?.upstreamProvider === 'orcarouter') return 'OrcaRouter API key';
+  if (config?.upstreamProvider === 'deepseek') return 'DeepSeek API key';
+  return 'upstream provider API key';
+}
+
 async function health(config) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1500);
@@ -295,8 +302,17 @@ function ensureLocalConfigDefaults(installDir) {
     parsed[key] = value;
     changed = true;
   }
+  if (!Object.prototype.hasOwnProperty.call(parsed, 'upstreamBaseUrl')) {
+    const provider = String(parsed.upstreamProvider || DEFAULT_UPSTREAM_PROVIDER).trim().toLowerCase();
+    parsed.upstreamBaseUrl = DEFAULT_UPSTREAM_BASE_URLS[provider] || DEFAULT_UPSTREAM_BASE_URLS.deepseek;
+    changed = true;
+  }
+  const output = Object.keys(parsed)[0] === 'upstreamProvider'
+    ? parsed
+    : { upstreamProvider: parsed.upstreamProvider, ...parsed };
+  if (output !== parsed) changed = true;
   if (!changed) return;
-  writeFileSync(localConfig, `${JSON.stringify(parsed, null, 2)}\n`);
+  writeFileSync(localConfig, `${JSON.stringify(output, null, 2)}\n`);
 }
 
 function copyRuntime(installDir) {
@@ -312,6 +328,8 @@ function copyRuntime(installDir) {
   rmSync(join(installDir, 'config', 'codex-model-catalog.zh.json'), { force: true });
   copyFileSync(join(ROOT, 'config', 'model-catalog.json'), join(installDir, 'config', 'model-catalog.json'));
   copyFileSync(join(ROOT, 'config', 'model-catalog.zh.json'), join(installDir, 'config', 'model-catalog.zh.json'));
+  copyFileSync(join(ROOT, 'config', 'model-catalog.orcarouter.json'), join(installDir, 'config', 'model-catalog.orcarouter.json'));
+  rmSync(join(installDir, 'config', 'model-catalog.orcarouter.zh.json'), { force: true });
   rmSync(join(installDir, 'config', 'frontend-design-guidance'), { recursive: true, force: true });
   cpSync(join(ROOT, 'config', 'frontend-design-guidance'), join(installDir, 'config', 'frontend-design-guidance'), { recursive: true });
   rmSync(join(installDir, 'config', 'codex-model-catalog.base.json'), { force: true });
@@ -339,7 +357,8 @@ async function install(options) {
   copyRuntime(options.dir);
   print(`Installed to ${options.dir}\n`);
   if (!isConfigured(options.dir)) {
-    print(`Edit this file and put your DeepSeek API key:\n  ${configPath(options.dir)}\n`);
+    const config = loadInstalledConfig(options.dir);
+    print(`Edit this file and put your ${upstreamCredentialLabel(config)}:\n  ${configPath(options.dir)}\n`);
     if (!options.noEdit) openConfig(configPath(options.dir));
     return;
   }
@@ -398,7 +417,9 @@ async function update(options) {
     throw new Error(`Missing runtime at ${options.dir}. Run install first.`);
   }
   if (!isConfigured(options.dir)) {
-    throw new Error(`Missing DeepSeek API key in ${configPath(options.dir)} or DEEPSEEK_API_KEY. Run install first.`);
+    const config = loadInstalledConfig(options.dir);
+    const localConfigPath = configPath(options.dir);
+    throw new Error(`Missing ${upstreamCredentialLabel(config)} in ${localConfigPath} or UPSTREAM_API_KEY. Run install first.`);
   }
   await stop(options);
   const target = `${packageJson.name}@latest`;
@@ -425,7 +446,8 @@ async function start(options) {
     throw new Error(`Missing runtime at ${options.dir}. Run install first.`);
   }
   if (!isConfigured(options.dir)) {
-    throw new Error(`Missing DeepSeek API key in ${configPath(options.dir)} or DEEPSEEK_API_KEY`);
+    const config = loadInstalledConfig(options.dir);
+    throw new Error(`Missing ${upstreamCredentialLabel(config)} in ${configPath(options.dir)} or UPSTREAM_API_KEY`);
   }
   const config = loadInstalledConfig(options.dir);
   const existingRecord = readProcessRecord(options.dir);

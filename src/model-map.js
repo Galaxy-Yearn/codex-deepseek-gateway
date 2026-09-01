@@ -6,7 +6,17 @@ import { modelAliasesFromCatalog, readModelCatalog } from './model-catalog.js';
 const DEEPSEEK_REASONING_EFFORTS = new Set(['none', 'low', 'high', 'max']);
 const DEPRECATED_MODEL_PATTERN = /^deepseek-(?:chat|reasoner)$/;
 const DEFAULT_MODEL_CATALOG_FILE = new URL('../config/model-catalog.json', import.meta.url);
-const NATIVE_RESPONSES_MODELS = new Set(['deepseek-v4-flash', 'deepseek-v4-pro']);
+const NATIVE_RESPONSES_MODELS = new Set(['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4-flash-vision-exp']);
+
+export function supportsNativeVisionModel(requestedModel, config = {}) {
+  const model = resolveModelAlias(requestedModel, config).upstreamModel || requestedModel || '';
+  return /(?:^|[/:_-])vision(?:$|[/:_-])/iu.test(String(model));
+}
+
+export function isDeepSeekModel(requestedModel, config = {}) {
+  const model = resolveModelAlias(requestedModel, config).upstreamModel || requestedModel || '';
+  return /^(?:deepseek(?:\/|[-_]))/iu.test(String(model));
+}
 
 export const DEFAULT_MODEL_ALIASES = modelAliasesFromCatalog(readModelCatalog(DEFAULT_MODEL_CATALOG_FILE));
 
@@ -66,8 +76,7 @@ export function resolveModelAlias(requestedModel, config = {}) {
 }
 
 export function supportsNativeResponsesModel(requestedModel, config = {}) {
-  if ((config.upstreamProvider || 'deepseek') !== 'deepseek') return true;
-  return NATIVE_RESPONSES_MODELS.has(resolveModelAlias(requestedModel, config).upstreamModel);
+  return true;
 }
 
 function validateDeepSeekReasoningEffort(effort) {
@@ -97,7 +106,7 @@ export function deepseekReasoningPayload({ alias, reasoning } = {}) {
 export function listModels(config = {}) {
   const aliases = isObject(config.modelAliases) ? config.modelAliases : {};
   const configuredModels = Array.isArray(config.upstreamModels) ? config.upstreamModels : [];
-  const nativeResponses = config.upstreamWireApi === 'responses' && (config.upstreamProvider || 'deepseek') === 'deepseek';
+  const nativeResponses = config.upstreamWireApi === 'responses';
   return [...new Set([...Object.keys(aliases), ...configuredModels])]
     .filter((id) => id && !isDeprecatedModel(id))
     .filter((id) => !nativeResponses || supportsNativeResponsesModel(id, config))

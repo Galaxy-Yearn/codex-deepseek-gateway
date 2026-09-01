@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { callChatCompletions, readJsonResponse } from './upstream.js';
 import { isCodexContextualUserText, isObject, toText } from './common.js';
 
-export const DEFAULT_VISION_MODEL = 'kimi-k3';
+export const DEFAULT_VISION_MODEL = 'deepseek-v4-flash-vision-exp';
 export const DEFAULT_VISION_BASE_URL = 'https://api.moonshot.cn/v1';
 export const DEFAULT_VISION_TIMEOUT_MS = 120000;
 export const DEFAULT_VISION_MAX_IMAGES = 16;
@@ -77,7 +77,7 @@ function normalizeDataUrl(value) {
 function validateImageUrl(value, config) {
   const info = normalizeDataUrl(value);
   if (!info) {
-    throw visionError('Kimi K3 vision requires a supported base64 image Data URL; public URLs and unsupported image formats are not accepted.');
+    throw visionError('Visual capability requires a supported base64 image Data URL; public URLs and unsupported image formats are not accepted.');
   }
   const maxBytes = Number(config.visionMaxImageBytes);
   if (Number.isFinite(maxBytes) && maxBytes > 0 && info.bytes > maxBytes) {
@@ -97,7 +97,7 @@ function reportTextFromResponse(data) {
 
 function capReport(text, maxChars) {
   const value = String(text || '').trim();
-  if (!value) throw visionError('Kimi K3 returned an empty vision report.');
+  if (!value) throw visionError('Visual capability returned an empty image description.');
   const limit = Number(maxChars);
   if (!Number.isFinite(limit) || limit <= 0 || value.length <= limit) return value;
   return `${value.slice(0, Math.max(0, Math.floor(limit) - 3)).trimEnd()}...`;
@@ -184,7 +184,7 @@ function hasVisionImage(value) {
   return Object.values(value).some(hasVisionImage);
 }
 
-function imageUrlForKimi(part, config) {
+function imageUrlForVision(part, config) {
   const value = imageUrlFromPart(part);
   if (!value) {
     throw visionError('Vision image does not contain an image URL or Data URL.');
@@ -192,18 +192,18 @@ function imageUrlForKimi(part, config) {
   return validateImageUrl(value, config);
 }
 
-function kimiRequestText(query) {
+function visionRequestText(query) {
   return query ? `${VISION_REQUEST_TEXT}\n\nUser request:\n${query}` : VISION_REQUEST_TEXT;
 }
 
-function kimiRequestForImage(imageUrl, query, config) {
+function visionRequestForImage(imageUrl, query, config) {
   return {
     model: config.visionModel || DEFAULT_VISION_MODEL,
     messages: [{
       role: 'user',
       content: [
         { type: 'image_url', image_url: { url: imageUrl } },
-        { type: 'text', text: kimiRequestText(query) },
+        { type: 'text', text: visionRequestText(query) },
       ],
     }],
     reasoning_effort: config.visionReasoningEffort || 'high',
@@ -214,33 +214,33 @@ function kimiRequestForImage(imageUrl, query, config) {
   };
 }
 
-async function requestKimiVision({ imageUrl, query, config, signal }) {
+async function requestVision({ imageUrl, query, config, signal }) {
   if (config.visionEnabled === false) throw visionError('Vision bridging is disabled.');
-  if (!config.visionApiKey) throw visionError('Kimi K3 vision API key is missing. Configure visionApiKey or KIMI_API_KEY.');
+  if (!config.visionApiKey) throw visionError('Visual capability is unavailable because its API key is missing. Configure visionApiKey or VISION_API_KEY.');
   let response;
   try {
     response = await callChatCompletions({
       baseUrl: config.visionBaseUrl || DEFAULT_VISION_BASE_URL,
       apiKey: config.visionApiKey,
-      request: kimiRequestForImage(imageUrl, query, config),
+      request: visionRequestForImage(imageUrl, query, config),
       timeoutMs: config.visionTimeoutMs || DEFAULT_VISION_TIMEOUT_MS,
       signal,
     });
   } catch (error) {
     if (signal?.aborted) throw error;
-    throw visionError(`Kimi K3 vision request failed: ${error.message || error}`, error);
+    throw visionError(`Visual capability request failed: ${error.message || error}`, error);
   }
   if (!response.ok) {
     const data = await readJsonResponse(response);
     const providerMessage = data?.error?.message || `HTTP ${response.status}`;
-    throw visionError(`Kimi K3 vision request failed: ${providerMessage}`);
+    throw visionError(`Visual capability request failed: ${providerMessage}`);
   }
   return capReport(reportTextFromResponse(await readJsonResponse(response)), config.visionMaxReportChars || DEFAULT_VISION_MAX_REPORT_CHARS);
 }
 
-export async function callKimiVision({ imageUrl, query = '', config = {}, signal }) {
-  const image = imageUrlForKimi({ image_url: imageUrl }, config);
-  return requestKimiVision({ imageUrl: image.normalized, query: cleanVisionQuery(query), config, signal });
+export async function callVision({ imageUrl, query = '', config = {}, signal }) {
+  const image = imageUrlForVision({ image_url: imageUrl }, config);
+  return requestVision({ imageUrl: image.normalized, query: cleanVisionQuery(query), config, signal });
 }
 
 function positiveInteger(value, fallback) {
@@ -311,7 +311,7 @@ function createReportResolver(config, signal, options = {}) {
   const seenImages = new Map();
   let totalBytes = 0;
   return async (part, context = {}) => {
-    const image = imageUrlForKimi(part, config);
+    const image = imageUrlForVision(part, config);
     if (!seenImages.has(image.hash) && seenImages.size >= Number(config.visionMaxImages || DEFAULT_VISION_MAX_IMAGES)) {
       throw visionError(`A request may contain at most ${Number(config.visionMaxImages || DEFAULT_VISION_MAX_IMAGES)} vision images.`);
     }
@@ -338,7 +338,7 @@ function createReportResolver(config, signal, options = {}) {
       local.set(key, report);
       return report;
     }
-    const report = requestKimiVision({ imageUrl: image.normalized, query, config, signal }).then((value) => {
+    const report = requestVision({ imageUrl: image.normalized, query, config, signal }).then((value) => {
       if (options.scope && options.reportCache) options.reportCache.set(key, value);
       return value;
     });

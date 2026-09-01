@@ -6,7 +6,7 @@ import { clearScreenDown, cursorTo } from 'node:readline';
 import { readCodexConfig } from './codex-config.js';
 import { readLocalConfigFile } from './local-config.js';
 import { modelCatalogEntries, readModelCatalog } from './model-catalog.js';
-import { catalogFileForPromptLanguage, normalizePromptLanguage } from './prompt-language.js';
+import { catalogFileForProvider, normalizePromptLanguage } from './prompt-language.js';
 import { displayWidth, padDisplay, truncateDisplay } from './terminal-text.js';
 
 export const DEFAULT_PROVIDER = 'deepseek-gateway';
@@ -80,6 +80,12 @@ function readPromptLanguage(installDir) {
   return normalizePromptLanguage(localConfig.CODEX_PROMPT_LANGUAGE);
 }
 
+function readUpstreamProvider(installDir) {
+  const configFile = join(installDir, 'config', 'gateway.local.json');
+  const localConfig = readLocalConfigFile(configFile);
+  return String(localConfig.UPSTREAM_PROVIDER || '').trim().toLowerCase();
+}
+
 function readPickerCatalog(file) {
   const catalog = readModelCatalog(file);
   const models = [];
@@ -115,7 +121,8 @@ export function createLaunchContext(options) {
   const codexHome = defaultCodexHome();
   const codexConfig = readCodexConfig();
   const promptLanguage = readPromptLanguage(options.dir);
-  const modelCatalogPath = join(options.dir, 'config', catalogFileForPromptLanguage(promptLanguage));
+  const upstreamProvider = readUpstreamProvider(options.dir);
+  const modelCatalogPath = join(options.dir, 'config', catalogFileForProvider(promptLanguage, upstreamProvider));
   const pickerCatalog = readPickerCatalog(modelCatalogPath);
   const models = pickerCatalog.models;
   const provider = options.provider || DEFAULT_PROVIDER;
@@ -131,6 +138,7 @@ export function createLaunchContext(options) {
     defaultReasoningEfforts: pickerCatalog.defaultReasoningEfforts,
     models,
     promptLanguage,
+    upstreamProvider,
     projectRoot: findProjectRoot(process.cwd()),
     provider,
     reasoningDescriptions: pickerCatalog.reasoningDescriptions,

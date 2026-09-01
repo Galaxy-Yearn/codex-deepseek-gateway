@@ -72,6 +72,22 @@ test('Codex launch configuration and catalogs', async () => {
     ...codexNewArgs(context),
   ]);
   });
+  await scenario('launch context selects the OrcaRouter catalog from local provider config', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-launch-orca-'));
+    try {
+      mkdirSync(join(dir, 'config'));
+      writeFileSync(join(dir, 'config', 'gateway.local.json'), JSON.stringify({ upstreamProvider: 'orcarouter', upstreamApiKey: 'test-key' }));
+      writeFileSync(join(dir, 'config', 'model-catalog.orcarouter.json'), JSON.stringify({
+        models: [{ slug: 'orcarouter/auto', description: 'auto', default_reasoning_level: 'high', supported_reasoning_levels: [{ effort: 'high', description: 'deep' }] }],
+      }));
+      const context = createLaunchContext({ dir });
+      assert.equal(context.upstreamProvider, 'orcarouter');
+      assert.equal(context.modelCatalogPath.endsWith(join('config', 'model-catalog.orcarouter.json')), true);
+      assert.deepEqual(context.models, ['orcarouter/auto']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   await scenario('printed resume commands quote config overrides', async () => {
   assert.equal(
     codexResumeCommand('session-1', context),
@@ -111,7 +127,7 @@ test('Codex launch configuration and catalogs', async () => {
 
     const context = createLaunchContext({ dir });
     assert.equal(context.promptLanguage, 'en');
-    assert.deepEqual(context.models, ['deepseek-v4-flash', 'deepseek-v4-pro']);
+    assert.deepEqual(context.models, ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro']);
     assert.equal(context.modelCatalogPath.endsWith(join('config', 'model-catalog.json')), true);
     assert.equal(context.modelDescriptions['deepseek-v4-flash'], 'Fast and cost-efficient agentic model for everyday work.');
     assert.deepEqual(context.reasoningEfforts['deepseek-v4-flash'], ['low', 'high', 'max']);
@@ -133,7 +149,7 @@ test('Codex launch configuration and catalogs', async () => {
 
     const context = createLaunchContext({ dir });
     assert.equal(context.promptLanguage, 'zh');
-    assert.deepEqual(context.models, ['deepseek-v4-flash', 'deepseek-v4-pro']);
+    assert.deepEqual(context.models, ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro']);
     assert.equal(context.modelCatalogPath.endsWith(join('config', 'model-catalog.zh.json')), true);
     assert.equal(context.modelDescriptions['deepseek-v4-flash'], '面向日常工作的快速、经济型 Agent 模型。');
     assert.deepEqual(context.reasoningEfforts['deepseek-v4-flash'], ['low', 'high', 'max']);
@@ -168,13 +184,15 @@ test('Codex launch configuration and catalogs', async () => {
   });
   await scenario('gateway Codex model catalogs satisfy the shared structural contract', async () => {
   const files = ['model-catalog.json', 'model-catalog.zh.json'];
-  const expectedSlugs = ['deepseek-v4-flash', 'deepseek-v4-pro'];
+  const expectedSlugs = ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4-flash-vision-exp'];
   const expectedEfforts = {
     'deepseek-v4-flash': ['low', 'high', 'max'],
+    'deepseek-v4-flash-vision-exp': ['low', 'high', 'max'],
     'deepseek-v4-pro': ['low', 'high', 'max'],
   };
   const expectedPriorities = {
     'deepseek-v4-flash': 1,
+    'deepseek-v4-flash-vision-exp': 3,
     'deepseek-v4-pro': 2,
   };
   assert.deepEqual(REASONING_EFFORTS, ['low', 'high', 'max']);
@@ -182,10 +200,12 @@ test('Codex launch configuration and catalogs', async () => {
     'model-catalog.json': [
       'Fast and cost-efficient agentic model for everyday work.',
       'Frontier agentic model for complex coding, reasoning, and knowledge-intensive work.',
+      'Native multimodal Flash model for image-aware agentic work.',
     ],
     'model-catalog.zh.json': [
       '面向日常工作的快速、经济型 Agent 模型。',
       '面向复杂编程、深度推理与知识密集型工作的前沿 Agent 模型。',
+      '原生多模态 Flash 模型，适用于图像感知 Agent 任务。',
     ],
   };
   const expectedDescriptions = {
@@ -200,6 +220,11 @@ test('Codex launch configuration and catalogs', async () => {
         'Deep reasoning for complex tasks',
         'Maximum reasoning for the hardest agentic tasks',
       ],
+      'deepseek-v4-flash-vision-exp': [
+        'Fast responses with light reasoning',
+        'Deep reasoning for complex tasks',
+        'Maximum reasoning for the hardest agentic tasks',
+      ],
     },
     'model-catalog.zh.json': {
       'deepseek-v4-flash': [
@@ -209,6 +234,11 @@ test('Codex launch configuration and catalogs', async () => {
       ],
       'deepseek-v4-pro': [
         '低思考强度，响应更快',
+        '深度推理，适合复杂任务',
+        '最大推理强度，适合最困难的 Agent 任务',
+      ],
+      'deepseek-v4-flash-vision-exp': [
+        '低推理强度，响应更快',
         '深度推理，适合复杂任务',
         '最大推理强度，适合最困难的 Agent 任务',
       ],
@@ -273,9 +303,10 @@ test('interactive picker rendering and navigation', async () => {
   await scenario('renders bilingual catalog choices within real terminal widths', async () => {
   const stripAnsi = (row) => row.replace(/\x1b\[[0-9;]*m/g, '');
   const english = pickerChoiceRows(
-    ['deepseek-v4-flash', 'deepseek-v4-pro'],
+    ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro'],
     {
       'deepseek-v4-flash': 'Fast and cost-efficient agentic model for everyday work.',
+    'deepseek-v4-flash-vision-exp': 'Native multimodal Flash model for image-aware agentic work.',
       'deepseek-v4-pro': 'Frontier agentic model for complex coding, reasoning, and knowledge-intensive work.',
     },
     60,
@@ -284,11 +315,12 @@ test('interactive picker rendering and navigation', async () => {
     assert.ok(displayWidth(stripAnsi(row)) <= 58);
     assert.ok(2 + displayWidth(stripAnsi(row)) <= 60);
   }
-  assert.match(stripAnsi(english[0]), /^deepseek-v4-flash {2}Fast and cost-efficient agentic mode\.\.\.$/);
-  assert.match(stripAnsi(english[1]), /^deepseek-v4-pro {4}Frontier agentic model for complex c\.\.\.$/);
+  assert.match(stripAnsi(english[0]), /^deepseek-v4-flash\s+Fast and cost-efficient/);
+  assert.match(stripAnsi(english[1]), /^deepseek-v4-flash-vision-exp\s+Native multimodal/);
+  assert.match(stripAnsi(english[2]), /^deepseek-v4-pro\s+Frontier agentic model/);
 
   const chinese = pickerChoiceRows(
-    ['deepseek-v4-flash', 'deepseek-v4-pro'],
+    ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro'],
     {
       'deepseek-v4-flash': '面向日常工作的快速、经济型 Agent 模型。',
       'deepseek-v4-pro': '面向复杂编程、深度推理与知识密集型工作的前沿 Agent 模型。',
@@ -298,8 +330,9 @@ test('interactive picker rendering and navigation', async () => {
   for (const row of chinese) {
     assert.ok(displayWidth(stripAnsi(row)) <= 58);
   }
-  assert.match(stripAnsi(chinese[0]), /^deepseek-v4-flash {2}面向日常工作的快速、经济型 Agent 模型。$/);
-  assert.match(stripAnsi(chinese[1]), /^deepseek-v4-pro {4}面向复杂编程、深度推理与知识密集型工\.\.\.$/);
+  assert.match(stripAnsi(chinese[0]), /^deepseek-v4-flash\s+/);
+  assert.match(stripAnsi(chinese[1]), /^deepseek-v4-flash-vision-exp(?:\s+|$)/);
+  assert.match(stripAnsi(chinese[2]), /^deepseek-v4-pro\s+/);
 
   assert.deepEqual(
     pickerChoiceRows(REASONING_EFFORTS, {
@@ -410,9 +443,9 @@ test('interactive picker rendering and navigation', async () => {
     });
     assert.match(output, /选择网关模型/);
     assert.match(output, /面向日常工作的快速、经济型 Agent 模型。/);
-    assert.match(output, /面向复杂编程、深度推理与知识密集型工作的前沿 Agent 模型。/);
-    assert.match(output, /\x1b\[38;2;57;100;254m> deepseek-v4-flash {2}面向日常工作的快速、经济型 Agent 模型。\x1b\[0m/);
-    assert.match(output, /  deepseek-v4-pro {4}\x1b\[90m面向复杂编程、深度推理与知识密集型工作的前沿 Agent 模型。\x1b\[0m/);
+    assert.match(output, /面向复杂编程、深度推理/);
+    assert.match(output, /\x1b\[38;2;57;100;254m> deepseek-v4-flash\s+面向日常工作的快速、经济型 Agent 模型。\x1b\[0m/);
+    assert.match(output, /deepseek-v4-pro\s+\x1b\[90m面向复杂编程、深度推理/);
     assert.match(output, /为 deepseek-v4-flash 选择 DeepSeek 推理强度/);
     assert.match(output, /低思考强度，响应更快/);
     assert.match(output, /深度推理，适合复杂任务/);

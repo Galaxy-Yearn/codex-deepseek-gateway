@@ -155,11 +155,13 @@ test('CLI version and installation lifecycle', async () => {
 
     assert.deepEqual(JSON.parse(readFileSync(localConfigPath, 'utf8')), {
       ...localConfig,
+      upstreamProvider: 'deepseek',
+      upstreamBaseUrl: 'https://api.deepseek.com',
       upstreamWireApi: 'chat_completions',
       visionEnabled: false,
       visionApiKey: '',
       visionBaseUrl: 'https://api.moonshot.cn/v1',
-      visionModel: 'kimi-k3',
+      visionModel: 'deepseek-v4-flash-vision-exp',
       visionReasoningEffort: 'high',
     });
     assert.equal(readFileSync(reasoningCachePath, 'utf8'), reasoningCache);
@@ -202,6 +204,8 @@ test('CLI version and installation lifecycle', async () => {
     });
     assert.deepEqual(JSON.parse(readFileSync(localConfigPath, 'utf8')), {
       upstreamApiKey: 'sk-REPLACE_ME',
+      upstreamProvider: 'deepseek',
+      upstreamBaseUrl: 'https://api.deepseek.com',
       upstreamWireApi: 'responses',
       visionEnabled: true,
       visionApiKey: 'existing-kimi-key',
@@ -363,11 +367,12 @@ test('CLI version and installation lifecycle', async () => {
     assert.equal(processExists(newPid), true);
     assert.deepEqual(JSON.parse(readFileSync(join(dir, 'config', 'gateway.local.json'), 'utf8')), {
       ...localConfig,
+      upstreamProvider: 'deepseek',
       upstreamWireApi: 'chat_completions',
       visionEnabled: false,
       visionApiKey: '',
       visionBaseUrl: 'https://api.moonshot.cn/v1',
-      visionModel: 'kimi-k3',
+      visionModel: 'deepseek-v4-flash-vision-exp',
       visionReasoningEffort: 'high',
     });
     assert.equal(readFileSync(join(dir, 'state', 'reasoning-cache.jsonl'), 'utf8'), reasoningCache);

@@ -3,7 +3,7 @@ import { loadModelAliases } from './model-map.js';
 import { mergeLocalConfig, readLocalConfigFile, resolveLocalConfigPath } from './local-config.js';
 import { parseBoolean, parseList } from './common.js';
 import { readCodexConfig } from './codex-config.js';
-import { catalogFileForPromptLanguage, normalizePromptLanguage } from './prompt-language.js';
+import { catalogFileForProvider, normalizePromptLanguage } from './prompt-language.js';
 import { DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './runtime.js';
 import {
   DEFAULT_VISION_BASE_URL,
@@ -24,6 +24,11 @@ export const DEFAULT_COMPACT_TIMEOUT_MS = 240000;
 export const DEFAULT_UPSTREAM_WIRE_API = 'chat_completions';
 export const UPSTREAM_WIRE_APIS = new Set(['chat_completions', 'responses']);
 export const VISION_REASONING_EFFORTS = new Set(['low', 'high', 'max']);
+export const DEFAULT_UPSTREAM_PROVIDER = 'deepseek';
+export const DEFAULT_UPSTREAM_BASE_URLS = Object.freeze({
+  deepseek: 'https://api.deepseek.com',
+  orcarouter: 'https://api.orcarouter.ai/v1',
+});
 
 export function normalizeUpstreamWireApi(value) {
   const normalized = String(value || DEFAULT_UPSTREAM_WIRE_API).trim().toLowerCase();
@@ -67,16 +72,18 @@ export function loadConfig(env = process.env) {
   const mergedEnv = mergeLocalConfig(env);
   const localConfig = readLocalConfigFile(localConfigPath);
   const codexPromptLanguage = normalizePromptLanguage(localConfig.CODEX_PROMPT_LANGUAGE);
-  const modelCatalogPath = resolve(dirname(localConfigPath), catalogFileForPromptLanguage(codexPromptLanguage));
   const codexConfig = readCodexConfig(mergedEnv);
+  const upstreamProvider = String(mergedEnv.UPSTREAM_PROVIDER || DEFAULT_UPSTREAM_PROVIDER).trim().toLowerCase();
+  const modelCatalogPath = resolve(dirname(localConfigPath), catalogFileForProvider(codexPromptLanguage, upstreamProvider));
+  const defaultUpstreamBaseUrl = DEFAULT_UPSTREAM_BASE_URLS[upstreamProvider] || DEFAULT_UPSTREAM_BASE_URLS.deepseek;
   const visionApiKey = mergedEnv.VISION_API_KEY || mergedEnv.KIMI_API_KEY || mergedEnv.MOONSHOT_API_KEY || '';
   return {
     port: Number(mergedEnv.PORT || 3000),
     host: mergedEnv.HOST || '127.0.0.1',
-    upstreamBaseUrl: mergedEnv.UPSTREAM_BASE_URL || 'https://api.deepseek.com',
-    upstreamApiKey: mergedEnv.UPSTREAM_API_KEY || mergedEnv.DEEPSEEK_API_KEY || '',
+    upstreamBaseUrl: mergedEnv.UPSTREAM_BASE_URL || defaultUpstreamBaseUrl,
+    upstreamApiKey: mergedEnv.UPSTREAM_API_KEY || (upstreamProvider === 'orcarouter' ? mergedEnv.ORCAROUTER_API_KEY : mergedEnv.DEEPSEEK_API_KEY) || '',
     upstreamModel: mergedEnv.UPSTREAM_MODEL || '',
-    upstreamProvider: mergedEnv.UPSTREAM_PROVIDER || 'deepseek',
+    upstreamProvider,
     upstreamWireApi: normalizeUpstreamWireApi(mergedEnv.UPSTREAM_WIRE_API),
     upstreamTimeoutMs: Number(mergedEnv.UPSTREAM_TIMEOUT_MS || 120000),
     upstreamMaxTokens: Number(mergedEnv.UPSTREAM_MAX_TOKENS || mergedEnv.DEEPSEEK_MAX_TOKENS || 0),

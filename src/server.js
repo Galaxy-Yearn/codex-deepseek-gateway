@@ -11,7 +11,7 @@ import {
   readCodexCompactionMetadata,
   runCompactionPlan,
 } from './compaction.js';
-import { listModels, mergeModelLists, normalizeModelList, supportsNativeResponsesModel } from './model-map.js';
+import { isDeepSeekModel, listModels, mergeModelLists, normalizeModelList, supportsNativeResponsesModel, supportsNativeVisionModel } from './model-map.js';
 import {
   assistantMessageFromResponseOutput,
   bridgedCommentaryToolCallsFromMessage,
@@ -785,7 +785,7 @@ function writeNativeResponsesFailure(res, error) {
 async function handleNativeResponses({ request, requestHeaders, config, res, clientSignal, visionReportCache }) {
   let upstreamRequest;
   try {
-    const visionRequest = (config.upstreamProvider || 'deepseek') === 'deepseek'
+    const visionRequest = isDeepSeekModel(request.model, config) && !supportsNativeVisionModel(request.model, config)
       ? await prepareVisionResponsesRequest(request, config, clientSignal, {
         reportCache: visionReportCache,
         scope: visionRequestScope({ rawRequest: request, requestHeaders }),
@@ -1606,7 +1606,7 @@ export function createProxyServer({ config = loadConfig(), reasoningCache } = {}
     normalized.messages = restoreAssistantReasoningContent(normalized.messages, reasoningCache);
     normalized.messages = restoreCustomToolCallArguments(normalized.messages, reasoningCache);
     try {
-      if ((config.upstreamProvider || 'deepseek') === 'deepseek') {
+      if (isDeepSeekModel(normalized.model, config) && !supportsNativeVisionModel(normalized.model, config)) {
         normalized.messages = await prepareVisionMessages(normalized.messages, config, clientSignal, {
           reportCache: visionReportCache,
           scope: visionRequestScope({ rawRequest: request, requestHeaders: req.headers }),

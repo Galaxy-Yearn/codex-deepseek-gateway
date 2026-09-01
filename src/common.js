@@ -72,8 +72,8 @@ export function generateId(prefix) {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`;
 }
 
-export function normalizeRole(role, provider = 'generic') {
-  if (provider === 'deepseek' && role === 'developer') return 'system';
+export function normalizeRole(role) {
+  if (role === 'developer') return 'system';
   return role || 'user';
 }
 

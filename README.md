@@ -2,44 +2,38 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A lightweight local gateway that connects Codex to DeepSeek while preserving Codex's agent workflow. It bridges Responses requests to Chat Completions by default or forwards native Responses JSON/SSE, while Codex retains tools, history, execution, and session resume.
+A lightweight local gateway that connects Codex to DeepSeek-compatible endpoints while keeping the agent loop in Codex. Codex owns tools, history, execution, and session resume; the gateway handles protocol compatibility, catalog selection, and optional image/web adapters.
+
+## Request path
 
 ```text
 Codex /v1/responses
         |
-        v
-   Gateway wire API
-     |             \
-     |              \-- responses ------> DeepSeek /responses
-     v                                      |
-chat_completions                            \-- native JSON/SSE
-     |
-     v
-Gateway normalize -> DeepSeek /chat/completions
-                              |
-                              v
-                       Gateway JSON/SSE map
-                              |
-                              v
-                    Codex Responses items/events
+      Gateway
+      /     \
+ Chat bridge  Native Responses
+      |             |
+ /chat/completions  /responses
+      |             |
+      +------> Codex Responses items/events
 ```
 
-Core strengths include:
+The default `chat_completions` path normalizes Responses requests and maps JSON/SSE results back to Codex. Set `upstreamWireApi` to `responses` to relay the upstream Responses JSON/SSE path. `/v1/chat/completions` remains available as a direct pass-through.
 
-- Codex tools, including parallel calls and tools revealed during a session through `tool_search`.
-- A packaged model catalog that registers DeepSeek models and reasoning levels with Codex, enabling `/model` switching and features that validate model names, such as native sub-agents.
-- High cache hit rates: request construction is tuned for DeepSeek context caching to reduce cost and response latency in multi-turn sessions.
-- Web search: optional Tavily and Firecrawl backends support Codex web-search requests.
-- Vision bridging: Codex image attachments and `view_image` results are converted into reusable text reports for DeepSeek.
-- Tuned system prompts: bilingual system prompts and personalities adapted for DeepSeek.
-- Stronger compaction that produces a schema-validated checkpoint from bridged Chat or native Responses history, with a deterministic trusted fallback when compaction cannot complete safely.
+## Core capabilities
+
+- Codex-compatible tools, reasoning, history replay, compaction, and session resume.
+- Bundled model catalogs with `/model` switching, reasoning levels, personalities, and an OrcaRouter catalog.
+- Native multimodal model support, plus an optional vision adapter for models that accept text only.
+- Optional Tavily search and Firecrawl page reading on the Chat Completions path.
+- Bilingual prompts and preserved raw reasoning for DeepSeek tool turns.
 
 Package: [@galaxy-yearn/codex-deepseek-gateway](https://www.npmjs.com/package/@galaxy-yearn/codex-deepseek-gateway)
 
 ## Requirements
 
 - [Node.js](https://nodejs.org/en/download) 22 or newer
-- [DeepSeek API key](https://platform.deepseek.com/api_keys)
+- A provider API key: [DeepSeek](https://platform.deepseek.com/api_keys) or [OrcaRouter](https://www.orcarouter.ai/console/keys)
 - [Codex CLI](https://developers.openai.com/codex) 0.144.0 or newer
 
 ## Install
@@ -53,7 +47,7 @@ codex-deepseek-gateway install            # a first install opens the config fil
 codex-deepseek-gateway install --no-edit  # install without opening the config file
 ```
 
-Put your DeepSeek API key in `~/.codex/deepseek-gateway/config/gateway.local.json`:
+Put your provider API key in `~/.codex/deepseek-gateway/config/gateway.local.json`:
 
 ```json
 {
@@ -61,7 +55,42 @@ Put your DeepSeek API key in `~/.codex/deepseek-gateway/config/gateway.local.jso
 }
 ```
 
-`install` never overwrites existing settings in `gateway.local.json`; when upgrading an older install it adds the missing `upstreamWireApi` key with the backwards-compatible `chat_completions` default.
+`install` never overwrites existing settings in `gateway.local.json`; when upgrading an older install it adds missing `upstreamProvider`, `upstreamBaseUrl`, and `upstreamWireApi` keys with backwards-compatible DeepSeek/Chat Completions defaults, and places `upstreamProvider` first.
+
+## OrcaRouter Provider
+
+[OrcaRouter](https://www.orcarouter.ai) provides an OpenAI-compatible model endpoint and an adaptive `orcarouter/auto` route. Use the endpoint and model IDs shown in its [catalog](https://www.orcarouter.ai/console/catalog); free availability and quotas can change by account. The gateway does not hard-code provider-specific request logic.
+
+Set the provider endpoint and key in `gateway.local.json`:
+
+```json
+{
+  "upstreamProvider": "orcarouter",
+  "upstreamApiKey": "or-...",
+  "upstreamBaseUrl": "https://api.orcarouter.ai/v1",
+  "upstreamWireApi": "chat_completions"
+}
+```
+
+`ORCAROUTER_API_KEY`, `UPSTREAM_API_KEY`, and `UPSTREAM_BASE_URL` are equivalent environment-variable inputs. Restart after changes. Select a model in Codex; IDs are forwarded unchanged:
+
+```toml
+model_provider = "deepseek-gateway"
+model = "orcarouter/auto"
+model_reasoning_effort = "high"
+```
+
+Use `orcarouter/auto` when the router should choose the upstream. Choose an exact catalog ID when you need a predictable model or capability. Any other OrcaRouter model can be used without a gateway code change. Optional local aliases are configured with `MODEL_ALIASES_JSON`:
+
+```powershell
+$env:MODEL_ALIASES_JSON = '{"my-kimi":{"model":"kimi/kimi-k3"}}'
+```
+
+Select `my-kimi` in Codex after starting the gateway. An alias can also provide `thinking`, `reasoning_effort`, and model-specific `extra_body` values.
+
+OrcaRouter changes only the upstream URL. The same model and Codex normalization is used for DeepSeek and OrcaRouter. Set `upstreamWireApi` to `chat_completions` (default) or `responses` according to the selected route, and put model-specific parameters in `extra_body` as documented by OrcaRouter.
+
+When `upstreamProvider` is `orcarouter`, `new` and `sessions` automatically load the bundled English `model-catalog.orcarouter.json`; no `config.toml` catalog change is needed. Plain `codex` continues to use the catalog named by its own `model_catalog_json`. The bundled OrcaRouter catalog currently includes `orcarouter/auto`, `orcarouter/free`, `deepseek/deepseek-v4-flash-free`, and `qwen/qwen3.8-27b-free`; verify current availability in OrcaRouter's catalog before relying on a free route.
 
 ## Configure the Codex Provider
 
@@ -164,7 +193,7 @@ Set `codexPromptLanguage` in `~/.codex/deepseek-gateway/config/gateway.local.jso
 
 The selected catalog is the single installed model inventory: its model slugs drive the launcher, the gateway `/v1/models` endpoint, and the default same-name DeepSeek mappings.
 
-The gateway ships two model IDs, `deepseek-v4-flash` and `deepseek-v4-pro`. The packaged catalog exposes exactly three reasoning levels aligned with DeepSeek V4:
+The gateway ships `deepseek-v4-flash`, `deepseek-v4-pro`, and the native multimodal `deepseek-v4-flash-vision-exp` model. The vision-exp model follows the Flash model's Codex instructions and adds native image input. The OrcaRouter catalog includes the verified free entries `orcarouter/auto`, `orcarouter/free`, `deepseek/deepseek-v4-flash-free`, and `qwen/qwen3.8-27b-free`.
 
 | Reasoning level | Meaning | DeepSeek request |
 | --- | --- | --- |
@@ -186,7 +215,7 @@ DeepSeek's chain of thought is shown in full in the Codex TUI, and the raw `reas
 
 ## Vision (Optional)
 
-Vision is off until an API key is configured. The gateway uses a separate OpenAI-compatible vision endpoint to turn Codex image inputs into text evidence for DeepSeek. The recommended and default vision model is `kimi-k3`.
+Vision is off until an API key is configured. The gateway uses a separate OpenAI-compatible vision endpoint when the selected main model is not natively multimodal. The default vision model is `deepseek-v4-flash-vision-exp`; `kimi-k3` remains a recommended alternative.
 
 ```json
 {
@@ -195,7 +224,7 @@ Vision is off until an API key is configured. The gateway uses a separate OpenAI
 }
 ```
 
-Codex local attachments become reusable `Vision report` text on the first model request; DeepSeek receives reports instead of historical image data. `view_image` output and direct API images use the same adapter. Images and reports are not persisted.
+Codex local attachments become reusable `Vision report` text on the first request for non-native DeepSeek vision paths. Native multimodal models preserve image content. `view_image` output and direct API images use the same adapter. Images and reports are not persisted.
 
 ## Web Search (Optional)
 
@@ -263,6 +292,7 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
 
 ```json
 {
+  "upstreamProvider": "deepseek",
   "upstreamApiKey": "sk-REPLACE_ME",
   "upstreamBaseUrl": "https://api.deepseek.com",
   "upstreamWireApi": "chat_completions",
@@ -270,7 +300,7 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
   "visionEnabled": false,
   "visionApiKey": "",
   "visionBaseUrl": "https://api.moonshot.cn/v1",
-  "visionModel": "kimi-k3",
+  "visionModel": "deepseek-v4-flash-vision-exp",
   "visionReasoningEffort": "high",
   "visionTimeoutMs": 120000,
   "visionMaxImages": 16,
@@ -296,10 +326,11 @@ All settings live in `~/.codex/deepseek-gateway/config/gateway.local.json`. Copy
 }
 ```
 
-- `upstreamApiKey` — your [DeepSeek API key](https://platform.deepseek.com/api_keys) (`DEEPSEEK_API_KEY` also works).
-- `upstreamBaseUrl` — DeepSeek API endpoint; see the [DeepSeek API documentation](https://api-docs.deepseek.com/).
+- `upstreamProvider` — `deepseek` (default) or `orcarouter`; see [OrcaRouter Provider](#orcarouter-provider) for its endpoint and model rules.
+- `upstreamApiKey` — provider API key; `DEEPSEEK_API_KEY` or `ORCAROUTER_API_KEY` also works for the matching provider.
+- `upstreamBaseUrl` — provider API endpoint; see the [DeepSeek API documentation](https://api-docs.deepseek.com/) or the provider's official documentation.
 - `upstreamWireApi` — `/v1/responses` upstream protocol, `chat_completions` by default or native `responses`; `/v1/chat/completions` remains a Chat pass-through in either mode.
-- `upstreamMaxTokens` — cap on DeepSeek output tokens; `0` uses the catalog's default ~100K budget.
+- `upstreamMaxTokens` — cap on provider output tokens; `0` uses the catalog's default budget.
 - `visionEnabled`, `visionApiKey` — enable Codex image bridging and provide the vision endpoint API key (`VISION_API_KEY` or `MOONSHOT_API_KEY` also works). The example keeps this disabled until a key is configured.
 - `visionBaseUrl`, `visionModel` — OpenAI-compatible vision API base URL and model; image input uses base64 Data URLs because public image URLs are not supported.
 - `visionReasoningEffort` — vision reasoning effort, `high` by default and configurable as `low`, `high`, or `max`.

@@ -1,25 +1,23 @@
 {
   "name": "@galaxy-yearn/codex-deepseek-gateway",
-  "version": "0.2.8",
-  "description": "Local OpenAI Codex Responses API gateway for DeepSeek Chat Completions and native Responses.",
+  "version": "0.2.9",
+  "description": "Local OpenAI Codex Responses API gateway for DeepSeek and OrcaRouter.",
   "type": "module",
   "main": "src/server.js",
   "bin": {
     "codex-deepseek-gateway": "bin/codex-deepseek-gateway.js"
   },
   "files": [
-    "bin/codex-deepseek-gateway.js",
-    "config/model-catalog.json",
-    "config/model-catalog.zh.json",
-    "config/frontend-design-guidance",
-    "config/gateway.example.json",
-    "state/reasoning-cache.example.jsonl",
+    "bin",
+    "config",
     "src",
+    "state",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/gateway.e2e.test.js",
+    "test:all": "node --test"
   },
   "engines": {
     "node": ">=22"
@@ -36,7 +34,10 @@
     "openai-responses",
     "deepseek-v4",
     "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
     "deepseek-v4-pro",
+    "orcarouter",
+    "orcarouter/auto",
     "kimi",
     "kimi-k3",
     "multimodal",

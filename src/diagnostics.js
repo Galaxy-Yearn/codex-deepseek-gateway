@@ -15,11 +15,22 @@ import {
   SHUTDOWN_TOKEN_HEADER,
 } from './runtime.js';
 import { callModels, readJsonResponse } from './upstream.js';
+import { catalogFileForProvider } from './prompt-language.js';
 
 const STATUS_TIMEOUT_MS = 1500;
 const DEFAULT_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CACHE_MAX_MESSAGES = 1000;
 const MIN_CODEX_VERSION = [0, 144, 0];
+
+function providerLabel(provider) {
+  if (provider === 'orcarouter') return 'OrcaRouter';
+  if (provider === 'deepseek') return 'DeepSeek';
+  return 'upstream provider';
+}
+
+function providerCredentialLabel(provider) {
+  return `${providerLabel(provider)} API key`;
+}
 
 export function gatewayDiagnosticPaths(installDir) {
   return {
@@ -31,6 +42,7 @@ export function gatewayDiagnosticPaths(installDir) {
     server: join(installDir, 'src', 'server.js'),
     catalogEn: join(installDir, 'config', 'model-catalog.json'),
     catalogZh: join(installDir, 'config', 'model-catalog.zh.json'),
+    catalogOrcaEn: join(installDir, 'config', 'model-catalog.orcarouter.json'),
   };
 }
 
@@ -401,7 +413,7 @@ export async function inspectGatewayDoctor({
     runCheck('config.gateway', 'config', async () => {
       if (context.error) return diagnosticResult('fail', String(context.error.message || context.error), { path: paths.config }, `Fix ${paths.config}`);
       const invalid = [];
-      if (!config.upstreamApiKey) invalid.push('DeepSeek API key is missing');
+      if (!config.upstreamApiKey) invalid.push(`${providerCredentialLabel(config.upstreamProvider)} is missing`);
       try { new URL(config.upstreamBaseUrl); } catch { invalid.push('upstreamBaseUrl is invalid'); }
       if (!['chat_completions', 'responses'].includes(config.upstreamWireApi)) invalid.push('upstreamWireApi must be chat_completions or responses');
       if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) invalid.push('port must be between 1 and 65535');
@@ -460,11 +472,14 @@ export async function inspectGatewayDoctor({
       });
     }),
     runCheck('catalog.integrity', 'catalog', async () => {
-      const englishCatalog = readJson(paths.catalogEn);
+      const catalogSuffix = config?.upstreamProvider === 'orcarouter' ? 'orcarouter' : 'deepseek';
+      const englishPath = join(paths.install, 'config', catalogFileForProvider(config?.codexPromptLanguage, config?.upstreamProvider));
+      const chinesePath = join(paths.install, 'config', catalogFileForProvider('zh', config?.upstreamProvider));
+      const englishCatalog = readJson(englishPath);
       const english = catalogShape(englishCatalog);
-      const chinese = catalogShape(readJson(paths.catalogZh));
+      const chinese = catalogShape(readJson(chinesePath));
       if (!catalogsAligned(english, chinese)) {
-        return diagnosticResult('fail', 'English and Chinese catalogs are not structurally aligned', { english: [...english.keys()], chinese: [...chinese.keys()] }, 'Align model IDs, reasoning levels, and personality keys in both catalogs.');
+        return diagnosticResult('fail', 'English and Chinese catalogs are not structurally aligned', { english: [...english.keys()], chinese: [...chinese.keys()], provider: catalogSuffix }, 'Align model IDs, reasoning levels, and personality keys in both catalogs.');
       }
       const catalogModels = [...english.keys()].sort();
       const catalogAliases = modelAliasesFromCatalog(englishCatalog);
@@ -472,7 +487,7 @@ export async function inspectGatewayDoctor({
       const mappedModels = Object.keys(configuredAliases).sort();
       const missingMappings = catalogModels.filter((model) => !mappedModels.includes(model));
       const extraMappings = mappedModels.filter((model) => !catalogModels.includes(model));
-      if (missingMappings.length) return diagnosticResult('fail', `catalog models are missing mappings: ${missingMappings.join(', ')}`, { catalogModels, mappedModels }, 'Reinstall the gateway.');
+      if (missingMappings.length) return diagnosticResult('fail', `catalog models are missing mappings: ${missingMappings.join(', ')}`, { catalogModels, mappedModels, provider: catalogSuffix }, 'Reinstall the gateway.');
       const mappings = Object.fromEntries(mappedModels.map((model) => {
         const resolved = resolveModelAlias(model, { ...config, modelAliases: configuredAliases });
         return [model, { upstreamModel: resolved.upstreamModel, thinking: resolved.thinking }];
@@ -481,7 +496,7 @@ export async function inspectGatewayDoctor({
       const summary = extraMappings.length
         ? `model mappings not present in the Codex catalogs: ${extraMappings.join(', ')}`
         : `${config?.codexPromptLanguage || 'selected'} catalogs define ${catalogModels.length} aligned model mappings`;
-      return diagnosticResult(resultStatus, summary, { catalogModels, mappedModels, mappings }, extraMappings.length ? 'Add the mapped models to both catalogs or remove the overrides.' : null);
+      return diagnosticResult(resultStatus, summary, { catalogModels, mappedModels, mappings, provider: catalogSuffix }, extraMappings.length ? 'Add the mapped models to both catalogs or remove the overrides.' : null);
     }),
     runCheck('gateway.models', 'gateway', async () => {
       if (!config || !['healthy', 'degraded'].includes(status.state)) return diagnosticResult('skipped', 'gateway model endpoint was not checked because the runtime is unavailable');
@@ -509,16 +524,18 @@ export async function inspectGatewayDoctor({
           timeoutMs: config.modelsTimeoutMs,
         });
       } catch (error) {
-        return diagnosticResult('fail', `DeepSeek /models is unreachable: ${String(error?.message || error)}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs: Date.now() - startedAt }, 'Check DNS, proxy, firewall, TLS, and upstreamBaseUrl.');
+        const label = providerLabel(config.upstreamProvider);
+        return diagnosticResult('fail', `${label} /models is unreachable: ${String(error?.message || error)}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs: Date.now() - startedAt }, 'Check DNS, proxy, firewall, TLS, and upstreamBaseUrl.');
       }
       const data = await readJsonResponse(response);
       const latencyMs = Date.now() - startedAt;
-      if (!response.ok) return diagnosticResult('fail', `DeepSeek /models returned HTTP ${response.status}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, error: errorMessage(data) }, response.status === 401 || response.status === 403 ? 'Check the DeepSeek API key.' : 'Check the DeepSeek endpoint and account status.');
+      const label = providerLabel(config.upstreamProvider);
+      if (!response.ok) return diagnosticResult('fail', `${label} /models returned HTTP ${response.status}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, error: errorMessage(data) }, response.status === 401 || response.status === 403 ? `Check the ${label} API key.` : `Check the ${label} endpoint and account status.`);
       const models = Array.isArray(data?.data) ? data.data.map((model) => String(model?.id || '')).filter(Boolean).sort() : [];
       const targets = [...new Set(listModels(config).map((model) => resolveModelAlias(model.id, config).upstreamModel))].sort();
       const missing = models.length ? targets.filter((model) => !models.includes(model)) : [];
-      if (missing.length) return diagnosticResult('warning', `DeepSeek authenticated, but /models does not list: ${missing.join(', ')}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models, targets }, 'Verify the configured model mappings against the provider account.');
-      return diagnosticResult('ok', `DeepSeek authentication and /models are reachable (${latencyMs} ms)`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models });
+      if (missing.length) return diagnosticResult('warning', `${label} authenticated, but /models does not list: ${missing.join(', ')}`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models, targets }, 'Verify the configured model mappings against the provider account.');
+      return diagnosticResult('ok', `${label} authentication and /models are reachable (${latencyMs} ms)`, { upstream: safeUrl(config.upstreamBaseUrl), latencyMs, models });
     }),
     runCheck('reasoning.cache', 'cache', async () => {
       if (!config) return diagnosticResult('skipped', 'reasoning cache was not checked because config failed');
@@ -536,10 +553,10 @@ export async function inspectGatewayDoctor({
       if (tavily.enabled && !tavily.configured) missing.push('Tavily API key');
       if (firecrawl.enabled && !firecrawl.configured) missing.push('Firecrawl API key');
       const vision = { enabled: config.visionEnabled !== false, configured: Boolean(config.visionApiKey), model: config.visionModel, reasoningEffort: config.visionReasoningEffort, baseUrl: safeUrl(config.visionBaseUrl) };
-      if (vision.enabled && !vision.configured) missing.push('Kimi vision API key');
+      if (vision.enabled && !vision.configured) missing.push('visual capability API key');
       if (missing.length) return diagnosticResult('warning', `optional backend configuration is incomplete: ${missing.join(', ')}`, { tavily, firecrawl, vision, activeProbe: false }, `Configure the missing keys in ${paths.config} or disable the backend.`);
       if (!tavily.enabled && !firecrawl.enabled && !vision.enabled) return diagnosticResult('skipped', 'optional web and vision backends are disabled', { tavily, firecrawl, vision, activeProbe: false });
-      const enabled = [tavily.enabled ? 'Tavily' : '', firecrawl.enabled ? 'Firecrawl' : '', vision.enabled ? 'Kimi vision' : ''].filter(Boolean).join(' and ');
+      const enabled = [tavily.enabled ? 'Tavily' : '', firecrawl.enabled ? 'Firecrawl' : '', vision.enabled ? 'visual capability' : ''].filter(Boolean).join(' and ');
       return diagnosticResult('ok', `${enabled} credentials are configured (not actively probed)`, { tavily, firecrawl, vision, activeProbe: false });
     }),
   ]);

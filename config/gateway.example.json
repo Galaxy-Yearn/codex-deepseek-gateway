@@ -1,10 +1,12 @@
 {
+  "upstreamProvider": "deepseek",
   "upstreamApiKey": "sk-REPLACE_ME",
+  "upstreamBaseUrl": "https://api.deepseek.com",
   "upstreamWireApi": "chat_completions",
   "visionEnabled": false,
   "visionApiKey": "",
   "visionBaseUrl": "https://api.moonshot.cn/v1",
-  "visionModel": "kimi-k3",
+  "visionModel": "deepseek-v4-flash-vision-exp",
   "visionReasoningEffort": "high",
   "codexPromptLanguage": "en",
   "tavilyApiKey": "",
